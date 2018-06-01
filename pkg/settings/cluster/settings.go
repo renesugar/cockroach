@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -84,6 +85,32 @@ var version = settings.RegisterStateMachineSetting(KeyVersionSetting,
 	settings.TransformerFn(versionTransformer),
 )
 
+var preserveDowngradeVersion = settings.RegisterValidatedStringSetting(
+	"cluster.preserve_downgrade_option",
+	"disable (automatic or manual) cluster version upgrade from the specified version until reset",
+	"",
+	func(sv *settings.Values, s string) error {
+		if sv == nil || s == "" {
+			return nil
+		}
+		opaque := sv.Opaque()
+		st := opaque.(*Settings)
+		clusterVersion := st.Version.Version().MinimumVersion
+		downgradeVersion, err := roachpb.ParseVersion(s)
+		if err != nil {
+			return err
+		}
+
+		// cluster.preserve_downgrade_option can only be set to the current cluster version.
+		if downgradeVersion != clusterVersion {
+			return errors.Errorf(
+				"cannot set cluster.preserve_downgrade_option to %s (cluster version is %s)",
+				s, clusterVersion)
+		}
+		return nil
+	},
+)
+
 // InitializeVersion initializes the Version field of this setting. Before this
 // method has been called, usage of the Version field is illegal and leads to a
 // fatal error.
@@ -139,6 +166,13 @@ func (ecv *ExposedClusterVersion) Version() ClusterVersion {
 	return v
 }
 
+// HasBeenInitialized returns whether the cluster version has been initialized
+// yet and if Version can be safely called.
+func (ecv *ExposedClusterVersion) HasBeenInitialized() bool {
+	v := *ecv.baseVersion.Load().(*ClusterVersion)
+	return v != ClusterVersion{}
+}
+
 // BootstrapVersion returns the version a newly initialized cluster should have.
 func (ecv *ExposedClusterVersion) BootstrapVersion() ClusterVersion {
 	return ClusterVersion{
@@ -171,6 +205,20 @@ func (ecv *ExposedClusterVersion) IsMinSupported(versionKey VersionKey) bool {
 	return ecv.Version().IsMinSupported(versionKey)
 }
 
+// CheckVersion is like IsMinSupported but returns an appropriate error in the
+// case of a cluster version which is too low.
+func (ecv *ExposedClusterVersion) CheckVersion(versionKey VersionKey, feature string) error {
+	if !ecv.Version().IsMinSupported(versionKey) {
+		return pgerror.NewErrorf(
+			pgerror.CodeFeatureNotSupportedError,
+			"cluster version does not support %s (>= %s required)",
+			feature,
+			VersionByKey(versionKey).String(),
+		)
+	}
+	return nil
+}
+
 // MakeTestingClusterSettings returns a Settings object that has had its version
 // initialized to BinaryServerVersion.
 func MakeTestingClusterSettings() *Settings {
@@ -182,6 +230,7 @@ func MakeTestingClusterSettings() *Settings {
 func MakeTestingClusterSettingsWithVersion(minVersion, serverVersion roachpb.Version) *Settings {
 	st := MakeClusterSettings(minVersion, serverVersion)
 	cv := st.Version.BootstrapVersion()
+	cv.MinimumVersion = minVersion
 	// Initialize with all features enabled.
 	if err := st.InitializeVersion(cv); err != nil {
 		log.Fatalf(context.TODO(), "unable to initialize version: %s", err)
@@ -310,6 +359,11 @@ func versionTransformer(
 	newV := oldV
 	newV.UseVersion = minVersion
 	newV.MinimumVersion = minVersion
+
+	// Prevent cluster version upgrade until cluster.preserve_downgrade_option is reset.
+	if downgrade := preserveDowngradeVersion.Get(sv); downgrade != "" {
+		return nil, nil, errors.Errorf("cannot upgrade to %s: cluster.preserve_downgrade_option is set to %s", minVersion, downgrade)
+	}
 
 	if minVersion.Less(oldV.MinimumVersion) {
 		return nil, nil, errors.Errorf("cannot downgrade from %s to %s", oldV.MinimumVersion, minVersion)

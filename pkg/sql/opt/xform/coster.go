@@ -1,0 +1,172 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+
+package xform
+
+import (
+	"math"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+)
+
+// Coster is used by the optimizer to assign a cost to a candidate expression
+// that can provide a set of required physical properties. If a candidate
+// expression has a lower cost than any other expression in the memo group, then
+// it becomes the new best expression for the group.
+//
+// Coster is an interface so that different costing algorithms can be used by
+// the optimizer. For example, the OptSteps command uses a custom coster that
+// assigns infinite costs to some expressions in order to prevent them from
+// being part of the lowest cost tree (for debugging purposes).
+type Coster interface {
+	// ComputeCost returns the estimated cost of executing the candidate
+	// expression. The optimizer does not expect the cost to correspond to any
+	// real-world metric, but does expect costs to be comparable to one another,
+	// as well as summable.
+	ComputeCost(candidate *memo.BestExpr, props *props.Logical) memo.Cost
+}
+
+// coster encapsulates the default cost model for the optimizer. The coster
+// assigns an estimated cost to each expression in the memo so that the
+// optimizer can choose the lowest cost expression tree. The estimated cost is
+// a best-effort approximation of the actual cost of execution, based on table
+// and index statistics that are propagated throughout the logical expression
+// tree.
+type coster struct {
+	mem *memo.Memo
+}
+
+func newCoster(mem *memo.Memo) *coster {
+	return &coster{mem: mem}
+}
+
+const (
+	// These costs have been copied from the Postgres optimizer:
+	// https://github.com/postgres/postgres/blob/master/src/include/optimizer/cost.h
+	// TODO(rytaft): "How Good are Query Optimizers, Really?" says that the
+	// PostgreSQL ratio between CPU and I/O is probably unrealistic in modern
+	// systems since much of the data can be cached in memory. Consider
+	// increasing the cpuCostFactor to account for this.
+	cpuCostFactor    = 0.01
+	seqIOCostFactor  = 1
+	randIOCostFactor = 4
+)
+
+// computeCost calculates the estimated cost of the candidate best expression,
+// based on its logical properties as well as the cost of its children. Each
+// expression's cost must always be >= the total costs of its children, so that
+// branch-and-bound pruning will work properly.
+func (c *coster) ComputeCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	switch candidate.Operator() {
+	case opt.SortOp:
+		return c.computeSortCost(candidate, logical)
+
+	case opt.ScanOp:
+		return c.computeScanCost(candidate, logical)
+
+	case opt.SelectOp:
+		return c.computeSelectCost(candidate, logical)
+
+	case opt.ValuesOp:
+		return c.computeValuesCost(candidate, logical)
+
+	case opt.InnerJoinOp, opt.LeftJoinOp, opt.RightJoinOp, opt.FullJoinOp,
+		opt.SemiJoinOp, opt.AntiJoinOp, opt.InnerJoinApplyOp, opt.LeftJoinApplyOp,
+		opt.RightJoinApplyOp, opt.FullJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
+		// All join ops currently use hash join by default. In the future, we'll
+		// add physical operators for merge join.
+		return c.computeHashJoinCost(candidate, logical)
+
+	case opt.LookupJoinOp:
+		return c.computeLookupJoinCost(candidate, logical)
+
+	// TODO(rytaft): Add linear cost functions for GROUP BY, set ops, etc.
+
+	case opt.ExplainOp:
+		// Technically, the cost of an Explain operation is independent of the cost
+		// of the underlying plan. However, we want to explain the plan we would get
+		// without EXPLAIN, i.e. the lowest cost plan. So we let the default code
+		// below pass through the input plan cost.
+		fallthrough
+
+	default:
+		// By default, cost of parent is sum of child costs.
+		return c.computeChildrenCost(candidate)
+	}
+}
+
+func (c *coster) computeSortCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	rowCount := float64(logical.Relational.Stats.RowCount)
+	var cost memo.Cost
+	if rowCount > 0 {
+		// TODO(rytaft): This is the cost of a local, in-memory sort. When a
+		// certain amount of memory is used, distsql switches to a disk-based sort
+		// with a temp RocksDB store.
+		cost = memo.Cost(rowCount*math.Log2(rowCount)) * cpuCostFactor
+	}
+
+	// The sort should have some overhead even if there are very few rows.
+	if cost < cpuCostFactor {
+		cost = cpuCostFactor
+	}
+
+	return cost + c.computeChildrenCost(candidate)
+}
+
+func (c *coster) computeScanCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	return memo.Cost(logical.Relational.Stats.RowCount) * seqIOCostFactor
+}
+
+func (c *coster) computeSelectCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	// The filter has to be evaluated on each input row.
+	inputRowCount := c.mem.BestExprLogical(candidate.Child(0)).Relational.Stats.RowCount
+	cost := memo.Cost(inputRowCount) * cpuCostFactor
+	return cost + c.computeChildrenCost(candidate)
+}
+
+func (c *coster) computeValuesCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	return memo.Cost(logical.Relational.Stats.RowCount) * cpuCostFactor
+}
+
+func (c *coster) computeHashJoinCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	leftRowCount := c.mem.BestExprLogical(candidate.Child(0)).Relational.Stats.RowCount
+	rightRowCount := c.mem.BestExprLogical(candidate.Child(1)).Relational.Stats.RowCount
+
+	// A hash join must process every row from both tables once.
+	// TODO(rytaft): This is the cost of an in-memory hash join. When a certain
+	// amount of memory is used, distsql switches to a disk-based hash join with
+	// a temp RocksDB store.
+	cost := memo.Cost(leftRowCount+rightRowCount) * cpuCostFactor
+	return cost + c.computeChildrenCost(candidate)
+}
+
+func (c *coster) computeLookupJoinCost(candidate *memo.BestExpr, logical *props.Logical) memo.Cost {
+	leftCost := c.mem.BestExprCost(candidate.Child(0))
+	leftRowCount := c.mem.BestExprLogical(candidate.Child(0)).Relational.Stats.RowCount
+
+	// The rows in the left table are used to probe into an index on the right
+	// table. Since the matching rows in the right table may not all be in the
+	// same range, this counts as random I/O.
+	return leftCost + memo.Cost(leftRowCount)*(randIOCostFactor+cpuCostFactor)
+}
+
+func (c *coster) computeChildrenCost(candidate *memo.BestExpr) memo.Cost {
+	var cost memo.Cost
+	for i := 0; i < candidate.ChildCount(); i++ {
+		cost += c.mem.BestExprCost(candidate.Child(i))
+	}
+	return cost
+}

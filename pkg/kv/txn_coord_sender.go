@@ -697,18 +697,18 @@ func (tc *TxnCoordSender) tryUpdatingTxnSpans(
 			var req roachpb.Request
 			if len(u.EndKey) == 0 {
 				req = &roachpb.RefreshRequest{
-					Span:  u,
-					Write: write,
+					RequestHeader: roachpb.RequestHeaderFromSpan(u),
+					Write:         write,
 				}
 			} else {
 				req = &roachpb.RefreshRangeRequest{
-					Span:  u,
-					Write: write,
+					RequestHeader: roachpb.RequestHeaderFromSpan(u),
+					Write:         write,
 				}
 			}
 			refreshSpanBa.Add(req)
 			log.VEventf(ctx, 2, "updating span %s @%s - @%s to avoid serializable restart",
-				req.Header(), refreshTxn.OrigTimestamp, refreshTxn.Timestamp)
+				req.Header().Span(), refreshTxn.OrigTimestamp, refreshTxn.Timestamp)
 		}
 	}
 	addRefreshes(refreshReads, false)
@@ -1012,11 +1012,15 @@ func (tc *TxnCoordSender) tryAsyncAbort(ctx context.Context) {
 			// clients to specify intents.
 			resp, pErr := client.SendWrappedWith(
 				ctx, tc.wrapped, roachpb.Header{Txn: &txn}, &roachpb.EndTransactionRequest{
-					Span: roachpb.Span{
+					RequestHeader: roachpb.RequestHeader{
 						Key: txn.Key,
 					},
 					Commit:      false,
 					IntentSpans: intentSpans,
+					// Resolved intents should maintain an abort span entry to
+					// prevent concurrent requests from failing to notice the
+					// transaction was aborted.
+					Poison: true,
 				},
 			)
 			tc.mu.Lock()
@@ -1095,6 +1099,16 @@ func (tc *TxnCoordSender) heartbeat(ctx context.Context) bool {
 	// transaction record at all, we have to assume it's been aborted as well.
 	if pErr != nil {
 		log.VEventf(ctx, 2, "heartbeat failed: %s", pErr)
+
+		// If the heartbeat request arrived to find a missing transaction record
+		// then we ignore the error and continue the heartbeat loop. This is
+		// possible if the heartbeat loop was started before a BeginTxn request
+		// succeeds because of ambiguity in the first write request's response.
+		if tse, ok := pErr.GetDetail().(*roachpb.TransactionStatusError); ok &&
+			tse.Reason == roachpb.TransactionStatusError_REASON_TXN_NOT_FOUND {
+			return true
+		}
+
 		if errTxn := pErr.GetTxn(); errTxn != nil {
 			tc.mu.Lock()
 			tc.mu.meta.Txn.Update(errTxn)
@@ -1367,7 +1381,7 @@ func (tc *TxnCoordSender) resendWithTxn(
 		b := txn.NewBatch()
 		b.Header = ba.Header
 		for _, arg := range ba.Requests {
-			req := arg.GetInner()
+			req := arg.GetInner().ShallowCopy()
 			b.AddRawRequest(req)
 		}
 		err := txn.CommitInBatch(ctx, b)

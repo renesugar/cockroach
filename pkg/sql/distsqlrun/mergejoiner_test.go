@@ -702,18 +702,17 @@ func TestMergeJoiner(t *testing.T) {
 			evalCtx := tree.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := FlowCtx{
-				Ctx:      context.Background(),
 				Settings: st,
 				EvalCtx:  evalCtx,
 			}
 
 			post := PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			m, err := newMergeJoiner(&flowCtx, &ms, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &ms, leftInput, rightInput, &post, out)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			m.Run(nil /* wg */)
+			m.Run(context.Background(), nil /* wg */)
 
 			if !out.ProducerClosed {
 				t.Fatalf("output RowReceiver not closed")
@@ -810,17 +809,16 @@ func TestConsumerClosed(t *testing.T) {
 			evalCtx := tree.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := FlowCtx{
-				Ctx:      context.Background(),
 				Settings: st,
 				EvalCtx:  evalCtx,
 			}
 			post := PostProcessSpec{Projection: true, OutputColumns: outCols}
-			m, err := newMergeJoiner(&flowCtx, &spec, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			m.Run(nil /* wg */)
+			m.Run(context.Background(), nil /* wg */)
 
 			if !out.ProducerClosed {
 				t.Fatalf("output RowReceiver not closed")
@@ -835,7 +833,6 @@ func BenchmarkMergeJoiner(b *testing.B) {
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &FlowCtx{
-		Ctx:      ctx,
 		Settings: st,
 		EvalCtx:  evalCtx,
 	}
@@ -861,14 +858,14 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			rows := makeIntRows(inputSize, numCols)
 			leftInput := NewRepeatableRowSource(oneIntCol, rows)
 			rightInput := NewRepeatableRowSource(oneIntCol, rows)
-			b.SetBytes(int64(8 * inputSize * numCols))
+			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}
-				m.Run(nil)
+				m.Run(context.Background(), nil /* wg */)
 				leftInput.Reset()
 				rightInput.Reset()
 			}

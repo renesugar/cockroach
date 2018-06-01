@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -75,8 +75,10 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
+	// Disable leniency for instant expiration
+	jobs.LeniencySetting.Override(&s.ClusterSettings().SV, 0)
+
 	db := s.DB()
-	ex := &sql.InternalExecutor{ExecCfg: s.InternalExecutor().(*sql.InternalExecutor).ExecCfg}
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	nodeLiveness := jobs.NewFakeNodeLiveness(4)
 	newRegistry := func(id roachpb.NodeID) *jobs.Registry {
@@ -85,7 +87,11 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 
 		nodeID := &base.NodeIDContainer{}
 		nodeID.Reset(id)
-		r := jobs.MakeRegistry(log.AmbientContext{}, clock, db, ex, nodeID, cluster.NoSettings, jobs.FakePHS)
+		r := jobs.MakeRegistry(
+			log.AmbientContext{}, clock, db,
+			s.InternalExecutor().(sqlutil.InternalExecutor),
+			nodeID, s.ClusterSettings(), jobs.FakePHS,
+		)
 		if err := r.Start(ctx, s.Stopper(), nodeLiveness, cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)
 		}
@@ -180,13 +186,27 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		return nil
 	})
 
+	// We want to verify that simply incrementing the epoch does not
+	// result in the job being rescheduled.
 	nodeLiveness.FakeIncrementEpoch(3)
+	drainAdoptionLoop()
+	select {
+	case <-resumeCalled:
+		t.Fatal("Incrementing an epoch should not reschedule a job")
+	default:
+	}
+
+	// When we reset the liveness of the node, though, we should get
+	// a reschedule.
+	nodeLiveness.FakeSetExpiration(3, hlc.MinTimestamp)
+	drainAdoptionLoop()
 	<-resumeCalled
 	close(done)
+
 	testutils.SucceedsSoon(t, func() error {
 		lock.Lock()
 		defer lock.Unlock()
-		if e, a := 2, resumeCounts[jobMap[3]]; e > a {
+		if e, a := 1, resumeCounts[jobMap[3]]; e > a {
 			return errors.Errorf("expected resumeCount to be > %d, but got %d", e, a)
 		}
 		if e, a := 1, resumeCounts[jobMap[2]]; e > a {
@@ -197,7 +217,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 			count += ct
 		}
 
-		if e, a := 5, count; e > a {
+		if e, a := 4, count; e > a {
 			return errors.Errorf("expected total jobs to be > %d, but got %d", e, a)
 		}
 		return nil

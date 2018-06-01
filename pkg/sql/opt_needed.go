@@ -31,11 +31,16 @@ func setNeededColumns(plan planNode, needed []bool) {
 			setNeededColumns(n.sourcePlan, allColumns(n.sourcePlan))
 		}
 
+	case *distSQLWrapper:
+		setNeededColumns(n.plan, allColumns(n.plan))
+
 	case *explainDistSQLNode:
 		setNeededColumns(n.plan, allColumns(n.plan))
 
 	case *showTraceNode:
-		setNeededColumns(n.plan, allColumns(n.plan))
+		if n.plan != nil {
+			setNeededColumns(n.plan, allColumns(n.plan))
+		}
 
 	case *showTraceReplicaNode:
 		setNeededColumns(n.plan, allColumns(n.plan))
@@ -47,6 +52,9 @@ func setNeededColumns(plan planNode, needed []bool) {
 
 	case *limitNode:
 		setNeededColumns(n.plan, needed)
+
+	case *spoolNode:
+		setNeededColumns(n.source, needed)
 
 	case *indexJoinNode:
 		// Currently all the needed result columns are provided by the
@@ -168,28 +176,23 @@ func setNeededColumns(plan planNode, needed []bool) {
 		setNeededColumns(n.plan, allColumns(n.plan))
 
 	case *deleteNode:
-		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *updateNode:
-		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *insertNode:
 		// TODO(knz): This can be optimized by omitting the columns that
 		// are not part of the primary key, do not participate in
 		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *upsertNode:
 		// TODO(knz): This can be optimized by omitting the columns that
-		// are not part of the primary key, do not participate in
-		// foreign key relations and that are not needed for RETURNING.
-		setNeededColumns(n.run.rows, allColumns(n.run.rows))
+		// are not part of the primary key or the conflicting index, do
+		// not participate in foreign key relations and that are not
+		// needed for RETURNING.
+		setNeededColumns(n.source, allColumns(n.source))
 
 	case *splitNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
@@ -197,12 +200,27 @@ func setNeededColumns(plan planNode, needed []bool) {
 	case *testingRelocateNode:
 		setNeededColumns(n.rows, allColumns(n.rows))
 
+	case *rowCountNode:
+		// The sub-node is a DELETE, INSERT, UPDATE etc. and will decide which columns it needs.
+		setNeededColumns(n.source, nil)
+
+	case *serializeNode:
+		// The sub-node is a DELETE, INSERT, UPDATE etc. and will decide which columns it needs.
+		setNeededColumns(n.source, nil)
+
+	case *cancelQueriesNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *cancelSessionsNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
+	case *controlJobsNode:
+		setNeededColumns(n.rows, allColumns(n.rows))
+
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
-	case *controlJobNode:
 	case *scrubNode:
 	case *createDatabaseNode:
 	case *createIndexNode:

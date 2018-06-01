@@ -93,6 +93,9 @@ func grantRolePlanHook(
 		return nil, err
 	}
 
+	// NOTE: membership manipulation involving the "public" pseudo-role fails with
+	// "role public does not exist". This matches postgres behavior.
+
 	// Check roles: these have to be roles.
 	for _, r := range grant.Roles {
 		if isRole, ok := users[string(r)]; !ok || !isRole {
@@ -157,14 +160,11 @@ func grantRolePlanHook(
 		memberStmt += ` DO NOTHING`
 	}
 
-	internalExecutor := sql.InternalExecutor{ExecCfg: p.ExecCfg()}
 	var rowsAffected int
 	for _, r := range grant.Roles {
 		for _, m := range grant.Members {
-			affected, err := internalExecutor.ExecuteStatementInTransaction(
-				ctx,
-				"grant-role",
-				p.Txn(),
+			affected, err := p.ExecCfg().InternalExecutor.Exec(
+				ctx, "grant-role", nil, /* txn */
 				memberStmt,
 				r, m, grant.AdminOption,
 			)
@@ -245,7 +245,6 @@ func revokeRolePlanHook(
 		memberStmt = `DELETE FROM system.role_members WHERE "role" = $1 AND "member" = $2`
 	}
 
-	internalExecutor := sql.InternalExecutor{ExecCfg: p.ExecCfg()}
 	var rowsAffected int
 	for _, r := range revoke.Roles {
 		for _, m := range revoke.Members {
@@ -255,10 +254,8 @@ func revokeRolePlanHook(
 					"user %s cannot be removed from role %s or lose the ADMIN OPTION",
 					security.RootUser, sqlbase.AdminRole)
 			}
-			affected, err := internalExecutor.ExecuteStatementInTransaction(
-				ctx,
-				"revoke-role",
-				p.Txn(),
+			affected, err := p.ExecCfg().InternalExecutor.Exec(
+				ctx, "revoke-role", nil, /* stmt */
 				memberStmt,
 				r, m,
 			)

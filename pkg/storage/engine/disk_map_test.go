@@ -34,7 +34,7 @@ func TestRocksDBMap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st))
+	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestRocksDBMapSandbox(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st))
+	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestRocksDBMapSandbox(t *testing.T) {
 			diskMaps[j].Close(ctx)
 			numKeysRemaining := 0
 			func() {
-				i := tempEngine.NewIterator(false)
+				i := tempEngine.NewIterator(IterOptions{})
 				defer i.Close()
 				for i.Seek(NilKey); ; i.Next() {
 					if ok, err := i.Valid(); err != nil {
@@ -228,7 +228,7 @@ func TestRocksDBStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st))
+	tempEngine, err := NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func BenchmarkRocksDBMapWrite(b *testing.B) {
 		}
 	}()
 	ctx := context.Background()
-	tempEngine, err := NewTempEngine(base.TempStorageConfig{Path: dir})
+	tempEngine, err := NewTempEngine(base.TempStorageConfig{Path: dir}, base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func BenchmarkRocksDBMapIteration(b *testing.B) {
 			b.Fatal(err)
 		}
 	}()
-	tempEngine, err := NewTempEngine(base.TempStorageConfig{Path: dir})
+	tempEngine, err := NewTempEngine(base.TempStorageConfig{Path: dir}, base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
 	}

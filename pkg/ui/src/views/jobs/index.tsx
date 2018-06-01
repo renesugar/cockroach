@@ -2,6 +2,7 @@ import _ from "lodash";
 import moment from "moment";
 import { Line } from "rc-progress";
 import React from "react";
+import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 
 import * as protos from "src/js/protos";
@@ -110,13 +111,7 @@ class JobStatusCell extends React.Component<{ job: Job }, {}> {
   }
 }
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const JobsSortedTable = SortedTable as new () => SortedTable<Job>;
+class JobsSortedTable extends SortedTable<Job> {}
 
 const jobsTableColumns: ColumnDescriptor<Job>[] = [
   {
@@ -176,21 +171,6 @@ const titleTooltip = (
 );
 
 class JobsTable extends React.Component<JobsTableProps, {}> {
-  static title() {
-    return (
-      <div>
-        Jobs
-        <div className="section-heading__tooltip">
-          <ToolTipWrapper text={titleTooltip}>
-            <div className="section-heading__tooltip-hover-area">
-              <div className="section-heading__info-icon">i</div>
-            </div>
-          </ToolTipWrapper>
-        </div>
-      </div>
-    );
-  }
-
   refresh(props = this.props) {
     props.refreshJobs(new JobsRequest({
       status: props.status,
@@ -240,6 +220,21 @@ class JobsTable extends React.Component<JobsTableProps, {}> {
   render() {
     const data = this.props.jobs && this.props.jobs.length > 0 && this.props.jobs;
     return <div className="jobs-page">
+      <Helmet>
+        <title>Jobs</title>
+      </Helmet>
+      <section className="section">
+        <h1>
+          Jobs
+          <div className="section-heading__tooltip">
+            <ToolTipWrapper text={titleTooltip}>
+              <div className="section-heading__tooltip-hover-area">
+                <div className="section-heading__info-icon">i</div>
+              </div>
+            </ToolTipWrapper>
+          </div>
+        </h1>
+      </section>
       <div>
         <PageConfig>
           <PageConfigItem>

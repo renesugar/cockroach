@@ -15,16 +15,18 @@
 package optbuilder
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 
-	"bytes"
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // scope is used for the build process and maintains the variables that have
@@ -33,18 +35,27 @@ import (
 //
 // See builder.go for more details.
 type scope struct {
-	builder      *Builder
-	parent       *scope
-	cols         []columnProps
-	groupby      groupby
-	ordering     opt.Ordering
-	presentation opt.Presentation
+	builder       *Builder
+	parent        *scope
+	cols          []scopeColumn
+	groupby       groupby
+	physicalProps props.Physical
+
+	// group is the memo.GroupID of the relational operator built with this scope.
+	group memo.GroupID
+
+	// Desired number of columns for subqueries found during name resolution and
+	// type checking. This only applies to the top-level subqueries that are
+	// anchored directly to a relational expression.
+	columns int
 }
 
-// groupByStrSet is a set of stringified GROUP BY expressions.
-type groupByStrSet map[string]struct{}
+// groupByStrSet is a set of stringified GROUP BY expressions that map to the
+// grouping column in an aggOutScope scope that projects that expression.
+type groupByStrSet map[string]*scopeColumn
 
-// exists is the 0-byte value of each element in groupByStrSet.
+// exists is a 0-byte dummy value used in a map that's being used to track
+// whether keys exist (i.e. where only the key matters).
 var exists = struct{}{}
 
 // inGroupingContext returns true when the aggInScope is not nil. This is the
@@ -68,16 +79,71 @@ func (s *scope) replace() *scope {
 }
 
 // appendColumns adds newly bound variables to this scope.
+// The groups in the new columns are reset to 0.
 func (s *scope) appendColumns(src *scope) {
+	l := len(s.cols)
 	s.cols = append(s.cols, src.cols...)
+	// We want to reset the groups, as these become pass-through columns in the
+	// new scope.
+	for i := l; i < len(s.cols); i++ {
+		s.cols[i].group = 0
+	}
+}
+
+// appendColumn adds a new column to the scope with an optional new label.
+// It returns a pointer to the new column.  The group in the new column is reset
+// to 0.
+func (s *scope) appendColumn(col *scopeColumn, label string) *scopeColumn {
+	s.cols = append(s.cols, *col)
+	newCol := &s.cols[len(s.cols)-1]
+	// We want to reset the group, as this becomes a pass-through column in the
+	// new scope.
+	newCol.group = 0
+	if label != "" {
+		newCol.name = tree.Name(label)
+	}
+	return newCol
+}
+
+// setPresentation sets s.physicalProps.Presentation (if not already set).
+func (s *scope) setPresentation() {
+	if s.physicalProps.Presentation != nil {
+		return
+	}
+	presentation := make(props.Presentation, 0, len(s.cols))
+	for i := range s.cols {
+		col := &s.cols[i]
+		if !col.hidden {
+			presentation = append(presentation, opt.LabeledColumn{Label: string(col.name), ID: col.id})
+		}
+	}
+	s.physicalProps.Presentation = presentation
+}
+
+// walkExprTree walks the given expression and performs name resolution,
+// replaces unresolved column names with columnProps, and replaces subqueries
+// with typed subquery structs.
+func (s *scope) walkExprTree(expr tree.Expr) tree.Expr {
+	// TODO(peter): The caller should specify the desired number of columns. This
+	// is needed when a subquery is used by an UPDATE statement.
+	// TODO(andy): shouldn't this be part of the desired type rather than yet
+	// another parameter?
+	s.columns = 1
+
+	expr, _ = tree.WalkExpr(s, expr)
+	s.builder.semaCtx.IVarContainer = s
+	return expr
 }
 
 // resolveType converts the given expr to a tree.TypedExpr. As part of the
-// conversion, it performs name resolution and replaces unresolved column names
-// with columnProps.
+// conversion, it performs name resolution, replaces unresolved column names
+// with columnProps, and replaces subqueries with typed subquery structs.
+//
+// The desired type is a suggestion, but resolveType does not throw an error if
+// the resolved type turns out to be different from desired (in contrast to
+// resolveAndRequireType, which panics with a builderError).
 func (s *scope) resolveType(expr tree.Expr, desired types.T) tree.TypedExpr {
-	expr, _ = tree.WalkExpr(s, expr)
-	s.builder.semaCtx.IVarContainer = s
+	expr = s.walkExprTree(expr)
 	texpr, err := tree.TypeCheck(expr, s.builder.semaCtx, desired)
 	if err != nil {
 		panic(builderError{err})
@@ -86,12 +152,53 @@ func (s *scope) resolveType(expr tree.Expr, desired types.T) tree.TypedExpr {
 	return texpr
 }
 
-// hasColumn returns true if the given column index is found within this scope.
-func (s *scope) hasColumn(index opt.ColumnIndex) bool {
-	for curr := s; curr != nil; curr = curr.parent {
+// resolveAndRequireType converts the given expr to a tree.TypedExpr. As part
+// of the conversion, it performs name resolution, replaces unresolved
+// column names with columnProps, and replaces subqueries with typed subquery
+// structs.
+//
+// If the resolved type does not match the desired type, resolveAndRequireType
+// panics with a builderError (in contrast to resolveType, which returns the
+// typed expression with no error).
+//
+// typingContext is a string used for error reporting in case the resolved
+// type and desired type do not match. It shows the context in which
+// this function was called (e.g., "LIMIT", "OFFSET").
+func (s *scope) resolveAndRequireType(
+	expr tree.Expr, desired types.T, typingContext string,
+) tree.TypedExpr {
+	expr = s.walkExprTree(expr)
+	texpr, err := tree.TypeCheckAndRequire(expr, s.builder.semaCtx, desired, typingContext)
+	if err != nil {
+		panic(builderError{err})
+	}
+
+	return texpr
+}
+
+// isOuterColumn returns true if the given column is not present in the current
+// scope (it may or may not be present in an ancestor scope).
+func (s *scope) isOuterColumn(id opt.ColumnID) bool {
+	for i := range s.cols {
+		col := &s.cols[i]
+		if col.id == id {
+			return false
+		}
+	}
+
+	return true
+}
+
+// hasColumn returns true if the given column id is found within this scope.
+func (s *scope) hasColumn(id opt.ColumnID) bool {
+	// We only allow hidden columns in the current scope. Hidden columns
+	// in parent scopes are not accessible.
+	allowHidden := true
+
+	for curr := s; curr != nil; curr, allowHidden = curr.parent, false {
 		for i := range curr.cols {
 			col := &curr.cols[i]
-			if col.index == index {
+			if col.id == id && (allowHidden || !col.hidden) {
 				return true
 			}
 		}
@@ -107,16 +214,55 @@ func (s *scope) hasSameColumns(other *scope) bool {
 		return false
 	}
 	for i := range s.cols {
-		if s.cols[i].index != other.cols[i].index {
+		if s.cols[i].id != other.cols[i].id {
 			return false
 		}
 	}
 	return true
 }
 
+// removeHiddenCols removes hidden columns from the scope.
+func (s *scope) removeHiddenCols() {
+	n := 0
+	for i := range s.cols {
+		if !s.cols[i].hidden {
+			if n != i {
+				s.cols[n] = s.cols[i]
+			}
+			n++
+		}
+	}
+	s.cols = s.cols[:n]
+}
+
+// setTableAlias qualifies the names of all columns in this scope with the
+// given alias name, as if they were part of a table with that name. If the
+// alias is the empty string, then setTableAlias removes any existing column
+// qualifications, as if the columns were part of an "anonymous" table.
+func (s *scope) setTableAlias(alias tree.Name) {
+	tn := tree.MakeUnqualifiedTableName(alias)
+	for i := range s.cols {
+		s.cols[i].table = tn
+	}
+}
+
+// findExistingCol finds the given expression among the bound variables
+// in this scope. Returns nil if the expression is not found.
+func (s *scope) findExistingCol(expr tree.TypedExpr) *scopeColumn {
+	exprStr := symbolicExprStr(expr)
+	for i := range s.cols {
+		col := &s.cols[i]
+		if expr == col || exprStr == col.getExprStr() {
+			return col
+		}
+	}
+
+	return nil
+}
+
 // getAggregateCols returns the columns in this scope corresponding
 // to aggregate functions.
-func (s *scope) getAggregateCols() []columnProps {
+func (s *scope) getAggregateCols() []scopeColumn {
 	// Aggregates are always clustered at the end of the column list, in the
 	// same order as s.groupby.aggs.
 	return s.cols[len(s.cols)-len(s.groupby.aggs):]
@@ -124,7 +270,7 @@ func (s *scope) getAggregateCols() []columnProps {
 
 // findAggregate finds the given aggregate among the bound variables
 // in this scope. Returns nil if the aggregate is not found.
-func (s *scope) findAggregate(agg aggregateInfo) *columnProps {
+func (s *scope) findAggregate(agg aggregateInfo) *scopeColumn {
 	for i, a := range s.groupby.aggs {
 		// Find an existing aggregate that has the same function and the same
 		// arguments.
@@ -147,28 +293,13 @@ func (s *scope) findAggregate(agg aggregateInfo) *columnProps {
 	return nil
 }
 
-// findGrouping finds the given grouping expression among the bound variables
-// in the groupingsScope. Returns nil if the grouping is not found.
-func (s *scope) findGrouping(grouping opt.GroupID) *columnProps {
-	for i, g := range s.groupby.groupings {
-		if g == grouping {
-			// Grouping already exists, so return information about the
-			// existing column that computes it. The first columns in aggInScope
-			// are always listed in the same order as s.groupby.groupings.
-			return &s.groupby.aggInScope.cols[i]
-		}
-	}
-
-	return nil
-}
-
 // startAggFunc is called when the builder starts building an aggregate
 // function. It is used to disallow nested aggregates and ensure that aggregate
 // functions are only used in a groupings scope.
 func (s *scope) startAggFunc() (aggInScope *scope, aggOutScope *scope) {
 	for curr := s; curr != nil; curr = curr.parent {
 		if curr.groupby.inAgg {
-			panic(errorf("aggregate function cannot be nested within another aggregate function"))
+			panic(builderError{sqlbase.NewAggInAggError()})
 		}
 
 		if curr.groupby.aggInScope != nil {
@@ -178,7 +309,7 @@ func (s *scope) startAggFunc() (aggInScope *scope, aggOutScope *scope) {
 		}
 	}
 
-	panic(errorf("aggregate function is not allowed in this context"))
+	panic(fmt.Errorf("aggregate function is not allowed in this context"))
 }
 
 // endAggFunc is called when the builder finishes building an aggregate
@@ -188,14 +319,14 @@ func (s *scope) startAggFunc() (aggInScope *scope, aggOutScope *scope) {
 // added.
 func (s *scope) endAggFunc() {
 	if !s.groupby.inAgg {
-		panic(errorf("mismatched calls to start/end aggFunc"))
+		panic(fmt.Errorf("mismatched calls to start/end aggFunc"))
 	}
 	s.groupby.inAgg = false
 }
 
 // scope implements the tree.Visitor interface so that it can walk through
 // a tree.Expr tree, perform name resolution, and replace unresolved column
-// names with a columnProps. The info stored in columnProps is necessary for
+// names with a scopeColumn. The info stored in scopeColumn is necessary for
 // Builder.buildScalar to construct a "variable" memo expression.
 var _ tree.Visitor = &scope{}
 
@@ -203,18 +334,18 @@ var _ tree.Visitor = &scope{}
 func (*scope) ColumnSourceMeta() {}
 
 // ColumnSourceMeta implements the tree.ColumnSourceMeta interface.
-func (*columnProps) ColumnSourceMeta() {}
+func (*scopeColumn) ColumnSourceMeta() {}
 
 // ColumnResolutionResult implements the tree.ColumnResolutionResult interface.
-func (*columnProps) ColumnResolutionResult() {}
+func (*scopeColumn) ColumnResolutionResult() {}
 
 // FindSourceProvidingColumn is part of the tree.ColumnItemResolver interface.
 func (s *scope) FindSourceProvidingColumn(
 	_ context.Context, colName tree.Name,
 ) (prefix *tree.TableName, srcMeta tree.ColumnSourceMeta, colHint int, err error) {
-	var candidateFromAnonSource *columnProps
-	var candidateWithPrefix *columnProps
-	var hiddenCandidate *columnProps
+	var candidateFromAnonSource *scopeColumn
+	var candidateWithPrefix *scopeColumn
+	var hiddenCandidate *scopeColumn
 	var moreThanOneCandidateFromAnonSource bool
 	var moreThanOneCandidateWithPrefix bool
 	var moreThanOneHiddenCandidate bool
@@ -262,13 +393,13 @@ func (s *scope) FindSourceProvidingColumn(
 			)
 		}
 		if candidateFromAnonSource != nil {
-			return &candidateFromAnonSource.table, candidateFromAnonSource, int(candidateFromAnonSource.index), nil
+			return &candidateFromAnonSource.table, candidateFromAnonSource, int(candidateFromAnonSource.id), nil
 		}
 
 		// Else if a single named source exists with a matching non-hidden column,
 		// use that.
 		if candidateWithPrefix != nil && !moreThanOneCandidateWithPrefix {
-			return &candidateWithPrefix.table, candidateWithPrefix, int(candidateWithPrefix.index), nil
+			return &candidateWithPrefix.table, candidateWithPrefix, int(candidateWithPrefix.id), nil
 		}
 		if moreThanOneCandidateWithPrefix || moreThanOneHiddenCandidate {
 			return nil, nil, -1, s.newAmbiguousColumnError(
@@ -279,12 +410,11 @@ func (s *scope) FindSourceProvidingColumn(
 		// One last option: if a single source exists with a matching hidden
 		// column, use that.
 		if hiddenCandidate != nil {
-			return &hiddenCandidate.table, hiddenCandidate, int(hiddenCandidate.index), nil
+			return &hiddenCandidate.table, hiddenCandidate, int(hiddenCandidate.id), nil
 		}
 	}
 
-	return nil, nil, -1, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-		"column name %q not found", tree.ErrString(&colName))
+	return nil, nil, -1, sqlbase.NewUndefinedColumnError(tree.ErrString(&colName))
 }
 
 // FindSourceMatchingName is part of the tree.ColumnItemResolver interface.
@@ -296,28 +426,35 @@ func (s *scope) FindSourceMatchingName(
 	srcMeta tree.ColumnSourceMeta,
 	err error,
 ) {
-	sources := make(map[tree.TableName]struct{})
-	for _, col := range s.cols {
-		sources[col.table] = exists
-	}
-
-	found := false
+	// If multiple sources match tn in the same scope, we return an error
+	// due to ambiguity. If no sources match in the current scope, we
+	// search the parent scope. If the source is not found in any of the
+	// ancestor scopes, we return an error.
 	var source tree.TableName
-	for src := range sources {
-		if !sourceNameMatches(src, tn) {
-			continue
+	for ; s != nil; s = s.parent {
+		sources := make(map[tree.TableName]struct{})
+		for _, col := range s.cols {
+			sources[col.table] = exists
 		}
+
+		found := false
+		for src := range sources {
+			if !sourceNameMatches(src, tn) {
+				continue
+			}
+			if found {
+				return tree.MoreThanOne, nil, s, newAmbiguousSourceError(&tn)
+			}
+			found = true
+			source = src
+		}
+
 		if found {
-			return tree.MoreThanOne, nil, s, newAmbiguousSourceError(&tn)
+			return tree.ExactlyOne, &source, s, nil
 		}
-		found = true
-		source = src
 	}
 
-	if !found {
-		return tree.NoResults, nil, s, nil
-	}
-	return tree.ExactlyOne, &source, s, nil
+	return tree.NoResults, nil, s, nil
 }
 
 // sourceNameMatches checks whether a request for table name toFind
@@ -331,11 +468,11 @@ func sourceNameMatches(srcName tree.TableName, toFind tree.TableName) bool {
 		return false
 	}
 	if toFind.ExplicitSchema {
-		if !srcName.ExplicitSchema || srcName.SchemaName != toFind.SchemaName {
+		if srcName.SchemaName != toFind.SchemaName {
 			return false
 		}
 		if toFind.ExplicitCatalog {
-			if !srcName.ExplicitCatalog || srcName.CatalogName != toFind.CatalogName {
+			if srcName.CatalogName != toFind.CatalogName {
 				return false
 			}
 		}
@@ -353,20 +490,19 @@ func (s *scope) Resolve(
 ) (tree.ColumnResolutionResult, error) {
 	if colHint >= 0 {
 		// Column was found by FindSourceProvidingColumn above.
-		return srcMeta.(*columnProps), nil
+		return srcMeta.(*scopeColumn), nil
 	}
 
 	// Otherwise, a table is known but not the column yet.
 	inScope := srcMeta.(*scope)
 	for i := range inScope.cols {
-		col := &s.cols[i]
-		if col.name == colName && sourceNameMatches(col.table, *prefix) {
+		col := &inScope.cols[i]
+		if col.name == colName && sourceNameMatches(*prefix, col.table) {
 			return col, nil
 		}
 	}
 
-	return nil, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-		"column name %q not found", tree.ErrString(tree.NewColumnItem(prefix, colName)))
+	return nil, sqlbase.NewUndefinedColumnError(tree.ErrString(tree.NewColumnItem(prefix, colName)))
 }
 
 func makeUntypedTuple(texprs []tree.TypedExpr) *tree.Tuple {
@@ -410,13 +546,17 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 		if err != nil {
 			panic(builderError{err})
 		}
-		return false, colI.(*columnProps)
+		return false, colI.(*scopeColumn)
 
 	case *tree.FuncExpr:
 		def, err := t.Func.Resolve(s.builder.semaCtx.SearchPath)
 		if err != nil {
 			panic(builderError{err})
 		}
+		if isGenerator(def) {
+			panic(unimplementedf("generator functions are not supported"))
+		}
+
 		if len(t.Exprs) != 1 {
 			break
 		}
@@ -458,10 +598,82 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 			// Similar to the work done in PR #17833.
 		}
 
-		// TODO(rytaft): Implement subquery replacement.
+	case *tree.ArrayFlatten:
+		if s.builder.AllowUnsupportedExpr {
+			// TODO(rytaft): Temporary fix for #24171 and #24170.
+			break
+		}
+
+		// TODO(peter): the ARRAY flatten operator requires a single column from
+		// the subquery.
+		if sub, ok := t.Subquery.(*tree.Subquery); ok {
+			// Copy the ArrayFlatten expression so that the tree isn't mutated.
+			copy := *t
+			copy.Subquery = s.replaceSubquery(sub, true /* multi-row */, 1 /* desired-columns */)
+			expr = &copy
+		}
+
+	case *tree.ComparisonExpr:
+		if s.builder.AllowUnsupportedExpr {
+			// TODO(rytaft): Temporary fix for #24171 and #24170.
+			break
+		}
+
+		switch t.Operator {
+		case tree.In, tree.NotIn, tree.Any, tree.Some, tree.All:
+			if sub, ok := t.Right.(*tree.Subquery); ok {
+				// Copy the Comparison expression so that the tree isn't mutated.
+				copy := *t
+				copy.Right = s.replaceSubquery(sub, true /* multi-row */, -1 /* desired-columns */)
+				expr = &copy
+			}
+		}
+
+	case *tree.Subquery:
+		if s.builder.AllowUnsupportedExpr {
+			// TODO(rytaft): Temporary fix for #24171, #24170 and #24225.
+			return false, expr
+		}
+
+		if t.Exists {
+			expr = s.replaceSubquery(t, true /* multi-row */, -1 /* desired-columns */)
+		} else {
+			expr = s.replaceSubquery(t, false /* multi-row */, s.columns /* desired-columns */)
+		}
 	}
 
+	// Reset the desired number of columns since if the subquery is a child of
+	// any other expression, type checking will verify the number of columns.
+	s.columns = -1
 	return true, expr
+}
+
+// Replace a raw subquery node with a typed subquery. multiRow specifies
+// whether the subquery is occurring in a single-row or multi-row
+// context. desiredColumns specifies the desired number of columns for the
+// subquery. Specifying -1 for desiredColumns allows the subquery to return any
+// number of columns and is used when the normal type checking machinery will
+// verify that the correct number of columns is returned.
+func (s *scope) replaceSubquery(sub *tree.Subquery, multiRow bool, desiredColumns int) *subquery {
+	outScope := s.builder.buildStmt(sub.Select, s)
+	if desiredColumns > 0 && len(outScope.cols) != desiredColumns {
+		n := len(outScope.cols)
+		switch desiredColumns {
+		case 1:
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"subquery must return only one column, found %d", n)})
+		default:
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"subquery must return %d columns, found %d", desiredColumns, n)})
+		}
+	}
+
+	return &subquery{
+		cols:     outScope.cols,
+		group:    outScope.group,
+		multiRow: multiRow,
+		expr:     sub,
+	}
 }
 
 // VisitPost is part of the Visitor interface.
@@ -481,6 +693,14 @@ func (s *scope) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, erro
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarResolvedType(idx int) types.T {
+	if idx >= len(s.cols) {
+		if len(s.cols) == 0 {
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+				"column reference @%d not allowed in this context", idx+1)})
+		}
+		panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+			"invalid column ordinal: @%d", idx+1)})
+	}
 	return s.cols[idx].typ
 }
 
@@ -511,7 +731,9 @@ func (s *scope) newAmbiguousColumnError(
 		if col.name == *n && (allowHidden || !col.hidden) {
 			if col.table.TableName == "" && !col.hidden {
 				if moreThanOneCandidateFromAnonSource {
+					// Only print first anonymous source, since other(s) are identical.
 					fmtCandidate(col.table)
+					break
 				}
 			} else if !col.hidden {
 				if moreThanOneCandidateWithPrefix && !moreThanOneCandidateFromAnonSource {

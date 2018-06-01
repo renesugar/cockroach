@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
 
 ## This test file contains various complex queries that ORMs issue during
 ## startup or general use.
@@ -21,15 +21,16 @@ id   bigint  NULL  false  20  -1
 name text    NULL  false  25  -1
 
 
-## 12115
-query TT
-SELECT t.typname enum_name, array_agg(e.enumlabel ORDER BY enumsortorder) enum_value
-    FROM pg_type t
-    JOIN pg_enum e ON t.oid = e.enumtypid
-    JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-    WHERE n.nspname = 'public'
-    GROUP BY 1
-----
+# #12115
+# Skipped until #25148 is solved
+#query TT
+#SELECT t.typname enum_name, array_agg(e.enumlabel ORDER BY enumsortorder) enum_value
+#    FROM pg_type t
+#    JOIN pg_enum e ON t.oid = e.enumtypid
+#    JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+#    WHERE n.nspname = 'public'
+#    GROUP BY 1
+#----
 
 
 ## 12207
@@ -69,7 +70,7 @@ ORDER BY i.relname
 ----
 name              primary  unique  indkey  column_indexes  column_names   definition
 customers_id_idx  false    false   2       {1,2}           {"name","id"}  CREATE INDEX customers_id_idx ON test.public.customers (id ASC)
-primary           true     true    1       {1,2}           {"name","id"}  CREATE UNIQUE INDEX "primary" ON test.public.customers ("name" ASC)
+primary           true     true    1       {1,2}           {"name","id"}  CREATE UNIQUE INDEX "primary" ON test.public.customers (name ASC)
 
 
 query TT colnames

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // expandPlan finalizes type checking of placeholders and expands
@@ -29,7 +30,9 @@ import (
 // fails.
 func (p *planner) expandPlan(ctx context.Context, plan planNode) (planNode, error) {
 	var err error
-	plan, err = doExpandPlan(ctx, p, noParams, plan)
+	topParams := noParamsBase
+	topParams.atTop = true
+	plan, err = doExpandPlan(ctx, p, topParams, plan)
 	if err != nil {
 		return plan, err
 	}
@@ -49,52 +52,125 @@ func (p *planner) expandPlan(ctx context.Context, plan planNode) (planNode, erro
 type expandParameters struct {
 	numRowsHint     int64
 	desiredOrdering sqlbase.ColumnOrdering
+
+	// spooledResults is set to true if one of the parents of the
+	// current plan either already provides spooling (e.g. upsertNode)
+	// or has required spooling (which means doExpandPlan will
+	// eventually add a spool). This is used to elide the insertion of a
+	// spool.
+	spooledResults bool
+
+	// atTop is set to true on the top-level call to doExpandPlan. Further
+	// recursive call set it to false. Used to elide the insertion of a spool
+	// for top-level nodes.
+	atTop bool
 }
 
-var noParams = expandParameters{numRowsHint: math.MaxInt64, desiredOrdering: nil}
+var noParamsBase = expandParameters{numRowsHint: math.MaxInt64, desiredOrdering: nil}
 
 // doExpandPlan is the algorithm that supports expandPlan().
 func doExpandPlan(
 	ctx context.Context, p *planner, params expandParameters, plan planNode,
 ) (planNode, error) {
+	// atTop remembers we're at the top level.
+	atTop := params.atTop
+
+	// needSpool will indicate at the end of the recursion whether
+	// a new spool stage is needed.
+	needSpool := false
+
+	// Determine what to do.
+	if _, ok := plan.(planNodeRequireSpool); ok {
+		// parentSpooled indicates that a parent node has already
+		// established the results will be spooled (i.e. accumulated at the
+		// start of execution).
+		parentSpooled := params.spooledResults
+
+		// At the top level, we ignore the spool requirement. If a parent
+		// is already spooled, we don't need to add a spool.
+		if !params.atTop && !parentSpooled {
+			// If the node requires a spool but we are already spooled, we
+			// won't need a new spool.
+			needSpool = true
+			// Although we're not spooled yet, needSpool will ensure we
+			// become spooled. Tell this to the children nodes.
+			params.spooledResults = true
+		}
+	} else if _, ok := plan.(planNodeSpooled); ok {
+		// Propagate this knowledge to the children nodes.
+		params.spooledResults = true
+	}
+	params.atTop = false
+	// Every recursion using noParams still wants to know about the
+	// current spooling status.
+	noParams := noParamsBase
+	noParams.spooledResults = params.spooledResults
+
 	var err error
 	switch n := plan.(type) {
 	case *createTableNode:
 		n.sourcePlan, err = doExpandPlan(ctx, p, noParams, n.sourcePlan)
 
 	case *updateNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *insertNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *upsertNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
 
 	case *deleteNode:
-		n.run.rows, err = doExpandPlan(ctx, p, noParams, n.run.rows)
+		n.source, err = doExpandPlan(ctx, p, noParams, n.source)
+
+	case *rowCountNode:
+		var newPlan planNode
+		newPlan, err = doExpandPlan(ctx, p, noParams, n.source)
+		n.source = newPlan.(batchedPlanNode)
+
+	case *serializeNode:
+		var newPlan planNode
+		newPlan, err = doExpandPlan(ctx, p, noParams, n.source)
+		n.source = newPlan.(batchedPlanNode)
 
 	case *explainDistSQLNode:
-		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
+		// EXPLAIN only shows the structure of the plan, and wants to do
+		// so "as if" plan was at the top level w.r.t spool semantics.
+		explainParams := noParamsBase
+		explainParams.atTop = true
+		n.plan, err = doExpandPlan(ctx, p, explainParams, n.plan)
+
+	case *showTraceNode:
+		// SHOW TRACE only shows the execution trace of the plan, and wants to do
+		// so "as if" plan was at the top level w.r.t spool semantics.
+		showTraceParams := noParamsBase
+		showTraceParams.atTop = true
+		n.plan, err = doExpandPlan(ctx, p, showTraceParams, n.plan)
 		if err != nil {
 			return plan, err
 		}
-
-	case *showTraceNode:
-		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
-		if err != nil {
-			return plan, err
+		// Check if we can use distSQL for the wrapped plan and this is not a kv
+		// trace. distSQL does not handle kv tracing because this option is not
+		// plumbed down to the tableReader level.
+		// TODO(asubiotto): Handle kv tracing in distSQL.
+		if ok, _ := p.prepareForDistSQLSupportCheck(ctx, false /* returnError */); ok {
+			if useDistSQL, err := shouldUseDistSQL(
+				ctx, p.SessionData().DistSQLMode, p.ExecCfg().DistSQLPlanner, n.plan,
+			); useDistSQL && err == nil && !n.kvTracingEnabled {
+				n.plan = p.newDistSQLWrapper(n.plan, n.stmtType)
+			}
 		}
 
 	case *showTraceReplicaNode:
 		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
-		if err != nil {
-			return plan, err
-		}
 
 	case *explainPlanNode:
+		// EXPLAIN only shows the structure of the plan, and wants to do
+		// so "as if" plan was at the top level w.r.t spool semantics.
+		explainParams := noParamsBase
+		explainParams.atTop = true
 		if n.expanded {
-			n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
+			n.plan, err = doExpandPlan(ctx, p, explainParams, n.plan)
 			if err != nil {
 				return plan, err
 			}
@@ -124,7 +200,7 @@ func doExpandPlan(
 		n.left, err = doExpandPlan(ctx, p, params, n.left)
 
 	case *filterNode:
-		n.source.plan, err = doExpandPlan(ctx, p, params, n.source.plan)
+		plan, err = expandFilterNode(ctx, p, params, n)
 
 	case *joinNode:
 		n.left.plan, err = doExpandPlan(ctx, p, noParams, n.left.plan)
@@ -182,6 +258,37 @@ func doExpandPlan(
 			}
 		}
 
+		// Project the props of the GROUP BY columns, as they're retained as-is.
+		groupColProjMap := make([]int, len(n.funcs))
+		for i := range n.funcs {
+			if groupingCol, ok := n.aggIsGroupingColumn(i); ok {
+				groupColProjMap[i] = groupingCol
+			} else {
+				groupColProjMap[i] = -1
+			}
+		}
+		childProps := planPhysicalProps(n.plan)
+		n.props = childProps.project(groupColProjMap)
+
+		// The GROUP BY columns form a weak key.
+		var groupColSet util.FastIntSet
+		for i, c := range groupColProjMap {
+			if c == -1 {
+				continue
+			}
+			groupColSet.Add(i)
+		}
+		if !groupColSet.Empty() {
+			n.props.addWeakKey(groupColSet)
+		}
+
+		groupColProps := planPhysicalProps(n.plan)
+		groupColProps = groupColProps.project(n.groupCols)
+		n.orderedGroupCols = make([]int, len(groupColProps.ordering))
+		for i, o := range groupColProps.ordering {
+			n.orderedGroupCols[i] = o.ColIdx
+		}
+
 	case *windowNode:
 		n.plan, err = doExpandPlan(ctx, p, noParams, n.plan)
 
@@ -231,14 +338,21 @@ func doExpandPlan(
 	case *testingRelocateNode:
 		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
 
+	case *cancelQueriesNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *cancelSessionsNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
+	case *controlJobsNode:
+		n.rows, err = doExpandPlan(ctx, p, noParams, n.rows)
+
 	case *valuesNode:
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
 	case *scrubNode:
-	case *controlJobNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -254,6 +368,12 @@ func doExpandPlan(
 	case *zeroNode:
 	case *unaryNode:
 	case *hookFnNode:
+		for i := range n.subplans {
+			n.subplans[i], err = doExpandPlan(ctx, p, noParams, n.subplans[i])
+			if err != nil {
+				break
+			}
+		}
 	case *valueGenerator:
 	case *sequenceSelectNode:
 	case *setVarNode:
@@ -268,6 +388,24 @@ func doExpandPlan(
 	default:
 		panic(fmt.Sprintf("unhandled node type: %T", plan))
 	}
+
+	if atTop || needSpool {
+		// Peel whatever spooling layers we have added prior to some elision above.
+		for {
+			if s, ok := plan.(*spoolNode); ok {
+				plan = s.source
+			} else {
+				break
+			}
+		}
+	}
+	// If we need a spool, add it now.
+	if needSpool {
+		// The parent of this node does not provide spooling yet, but
+		// spooling is required. Add it.
+		plan = p.makeSpool(plan)
+	}
+
 	return plan, err
 }
 
@@ -282,6 +420,24 @@ func elideDoubleSort(parent, source *sortNode) {
 	}
 }
 
+func expandFilterNode(
+	ctx context.Context, p *planner, params expandParameters, n *filterNode,
+) (planNode, error) {
+	var err error
+	n.source.plan, err = doExpandPlan(ctx, p, params, n.source.plan)
+	if err != nil {
+		return n, err
+	}
+
+	// If there's a spool, pull it up.
+	if spool, ok := n.source.plan.(*spoolNode); ok {
+		n.source.plan = spool.source
+		return p.makeSpool(n), nil
+	}
+
+	return n, nil
+}
+
 func expandDistinctNode(
 	ctx context.Context, p *planner, params expandParameters, d *distinctNode,
 ) (planNode, error) {
@@ -291,6 +447,13 @@ func expandDistinctNode(
 	d.plan, err = doExpandPlan(ctx, p, params, d.plan)
 	if err != nil {
 		return d, err
+	}
+
+	// If there's a spool, we'll pull it up before returning below.
+	respool := func(plan planNode) planNode { return plan }
+	if spool, ok := d.plan.(*spoolNode); ok {
+		respool = p.makeSpool
+		d.plan = spool.source
 	}
 
 	// We use the physical properties of the distinctNode but projected
@@ -304,7 +467,7 @@ func expandDistinctNode(
 		// Since distinctNode does not project columns, this is fine
 		// (it has a parent renderNode).
 		if k.SubsetOf(distinctOnPp.notNullCols) {
-			return d.plan, nil
+			return respool(d.plan), nil
 		}
 	}
 
@@ -331,7 +494,7 @@ func expandDistinctNode(
 		}
 	}
 
-	return d, nil
+	return respool(d), nil
 }
 
 func expandScanNode(
@@ -368,6 +531,13 @@ func expandRenderNode(
 	r.source.plan, err = doExpandPlan(ctx, p, params, r.source.plan)
 	if err != nil {
 		return r, err
+	}
+
+	// If there's a spool, we'll pull it up before returning below.
+	respool := func(plan planNode) planNode { return plan }
+	if spool, ok := r.source.plan.(*spoolNode); ok {
+		respool = p.makeSpool
+		r.source.plan = spool.source
 	}
 
 	// Elide the render node if it renders its source as-is.
@@ -409,12 +579,12 @@ func expandRenderNode(
 					mutSourceCols[i].Name = col.Name
 				}
 			}
-			return r.source.plan, nil
+			return respool(r.source.plan), nil
 		}
 	}
 
 	p.computePhysicalPropsForRender(r, planPhysicalProps(r.source.plan))
-	return r, nil
+	return respool(r), nil
 }
 
 // translateOrdering modifies a desired ordering on the output of the
@@ -456,6 +626,27 @@ func translateOrdering(desiredDown sqlbase.ColumnOrdering, r *renderNode) sqlbas
 	return desiredUp
 }
 
+func translateGroupOrdering(
+	desiredDown sqlbase.ColumnOrdering, g *groupNode,
+) sqlbase.ColumnOrdering {
+	var desiredUp sqlbase.ColumnOrdering
+
+	for _, colOrder := range desiredDown {
+		groupingCol, ok := g.aggIsGroupingColumn(colOrder.ColIdx)
+		if !ok {
+			// We cannot maintain the rest of the ordering since it uses a
+			// non-identity aggregate function.
+			break
+		}
+		// For identity (i.e., GROUP BY) columns, we can propagate the ordering.
+		desiredUp = append(desiredUp, sqlbase.ColumnOrderInfo{
+			ColIdx: groupingCol, Direction: colOrder.Direction,
+		})
+	}
+
+	return desiredUp
+}
+
 // simplifyOrderings reduces the Ordering() guarantee of each node in the plan
 // to that which is actually used by the parent(s). It also performs sortNode
 // elision when possible.
@@ -476,16 +667,25 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 		n.sourcePlan = p.simplifyOrderings(n.sourcePlan, nil)
 
 	case *updateNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *insertNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *upsertNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
 
 	case *deleteNode:
-		n.run.rows = p.simplifyOrderings(n.run.rows, nil)
+		n.source = p.simplifyOrderings(n.source, nil)
+
+	case *rowCountNode:
+		n.source = p.simplifyOrderings(n.source, nil).(batchedPlanNode)
+
+	case *serializeNode:
+		n.source = p.simplifyOrderings(n.source, nil).(batchedPlanNode)
+
+	case *distSQLWrapper:
+		n.plan = p.simplifyOrderings(n.plan, nil)
 
 	case *explainDistSQLNode:
 		n.plan = p.simplifyOrderings(n.plan, nil)
@@ -540,12 +740,17 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *limitNode:
 		n.plan = p.simplifyOrderings(n.plan, usefulOrdering)
 
+	case *spoolNode:
+		n.source = p.simplifyOrderings(n.source, usefulOrdering)
+
 	case *groupNode:
 		if n.needOnlyOneRow {
 			n.plan = p.simplifyOrderings(n.plan, n.desiredOrdering)
 		} else {
-			n.plan = p.simplifyOrderings(n.plan, nil)
+			// Keep only the ordering required by the groupNode.
+			n.plan = p.simplifyOrderings(n.plan, translateGroupOrdering(n.props.ordering, n))
 		}
+		n.props.trim(usefulOrdering)
 
 	case *windowNode:
 		n.plan = p.simplifyOrderings(n.plan, nil)
@@ -622,14 +827,21 @@ func (p *planner) simplifyOrderings(plan planNode, usefulOrdering sqlbase.Column
 	case *testingRelocateNode:
 		n.rows = p.simplifyOrderings(n.rows, nil)
 
+	case *cancelQueriesNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *cancelSessionsNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
+	case *controlJobsNode:
+		n.rows = p.simplifyOrderings(n.rows, nil)
+
 	case *valuesNode:
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
 	case *scrubNode:
-	case *controlJobNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:

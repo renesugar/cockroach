@@ -1,0 +1,26 @@
+# LogicTest: distsql-opt
+
+# Tests that verify we retrieve the stats correctly. Note that we can't create
+# statistics if distsql mode is OFF.
+
+statement ok
+CREATE TABLE a (u INT, v INT, INDEX (u) STORING (v), INDEX (v) STORING (u));
+
+# Create a new table to avoid depending on the asynchronous stat cache
+# invalidation.
+statement ok
+CREATE TABLE b (u INT, v INT, INDEX (u) STORING (v), INDEX (v) STORING (u));
+INSERT INTO b VALUES (1, 1), (1, 2), (1, 3), (1, 4), (2, 4), (2, 5), (2, 6), (2, 7)
+
+statement ok
+CREATE STATISTICS u ON u FROM b;
+CREATE STATISTICS v ON v FROM b
+
+# Verify we scan index v which has the more selective constraint.
+query TTTTT
+EXPLAIN (VERBOSE) SELECT * FROM b WHERE u = 1 AND v = 1
+----
+scan  ·       ·          (u, v)  ·
+·     table   b@b_v_idx  ·       ·
+·     spans   /1-/2      ·       ·
+·     filter  u = 1      ·       ·

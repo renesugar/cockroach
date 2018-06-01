@@ -833,8 +833,7 @@ func (v *extractWindowFuncsVisitor) VisitPre(expr tree.Expr) (recurse bool, newE
 		case t.IsWindowFunctionApplication():
 			// Check if a parent node above this window function is an aggregate.
 			if len(v.aggregatesSeen) > 0 {
-				v.err = errors.Errorf("aggregate function calls cannot contain window function "+
-					"call %s()", &t.Func)
+				v.err = sqlbase.NewWindowInAggError()
 				return false, expr
 			}
 
@@ -855,6 +854,7 @@ func (v *extractWindowFuncsVisitor) VisitPre(expr tree.Expr) (recurse bool, newE
 			v.windowFnCount++
 			v.n.funcs = append(v.n.funcs, f)
 			return false, f
+
 		case t.GetAggregateConstructor() != nil:
 			// If we see an aggregation that is not used in a window function, we save it
 			// in the visitor's seen aggregate set. The aggregate function will remain in

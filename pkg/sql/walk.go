@@ -188,6 +188,10 @@ func (v *planVisitor) visit(plan planNode) {
 				jType = "right outer"
 			case sqlbase.FullOuterJoin:
 				jType = "full outer"
+			case sqlbase.LeftSemiJoin:
+				jType = "semi"
+			case sqlbase.LeftAntiJoin:
+				jType = "anti"
 			}
 			v.observer.attr(name, "type", jType)
 
@@ -288,8 +292,8 @@ func (v *planVisitor) visit(plan planNode) {
 			inputCols := planColumns(n.plan)
 			for i, agg := range n.funcs {
 				var buf bytes.Buffer
-				if agg.isIdentAggregate() {
-					buf.WriteString(inputCols[agg.argRenderIdx].Name)
+				if groupingCol, ok := n.aggIsGroupingColumn(i); ok {
+					buf.WriteString(inputCols[groupingCol].Name)
 				} else {
 					fmt.Fprintf(&buf, "%s(", agg.funcName)
 					if agg.argRenderIdx != noRenderIdx {
@@ -355,9 +359,9 @@ func (v *planVisitor) visit(plan planNode) {
 	case *insertNode:
 		if v.observer.attr != nil {
 			var buf bytes.Buffer
-			buf.WriteString(n.tableDesc.Name)
+			buf.WriteString(n.run.ti.tableDesc().Name)
 			buf.WriteByte('(')
-			for i, col := range n.insertCols {
+			for i, col := range n.run.insertCols {
 				if i > 0 {
 					buf.WriteString(", ")
 				}
@@ -368,24 +372,21 @@ func (v *planVisitor) visit(plan planNode) {
 		}
 
 		if v.observer.expr != nil {
-			for i, dexpr := range n.defaultExprs {
+			for i, dexpr := range n.run.defaultExprs {
 				v.expr(name, "default", i, dexpr)
 			}
-			for i, cexpr := range n.checkHelper.Exprs {
+			for i, cexpr := range n.run.checkHelper.Exprs {
 				v.expr(name, "check", i, cexpr)
 			}
-			for i, rexpr := range n.rh.exprs {
-				v.expr(name, "returning", i, rexpr)
-			}
 		}
-		v.visit(n.run.rows)
+		v.visit(n.source)
 
 	case *upsertNode:
 		if v.observer.attr != nil {
 			var buf bytes.Buffer
-			buf.WriteString(n.tableDesc.Name)
+			buf.WriteString(n.run.tw.tableDesc().Name)
 			buf.WriteByte('(')
-			for i, col := range n.insertCols {
+			for i, col := range n.run.insertCols {
 				if i > 0 {
 					buf.WriteString(", ")
 				}
@@ -396,27 +397,24 @@ func (v *planVisitor) visit(plan planNode) {
 		}
 
 		if v.observer.expr != nil {
-			for i, dexpr := range n.defaultExprs {
+			for i, dexpr := range n.run.defaultExprs {
 				v.expr(name, "default", i, dexpr)
 			}
-			for i, cexpr := range n.checkHelper.Exprs {
+			for i, cexpr := range n.run.checkHelper.Exprs {
 				v.expr(name, "check", i, cexpr)
 			}
-			for i, rexpr := range n.rh.exprs {
-				v.expr(name, "returning", i, rexpr)
-			}
-			n.tw.walkExprs(func(d string, i int, e tree.TypedExpr) {
+			n.run.tw.walkExprs(func(d string, i int, e tree.TypedExpr) {
 				v.expr(name, d, i, e)
 			})
 		}
-		v.visit(n.run.rows)
+		v.visit(n.source)
 
 	case *updateNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "table", n.tableDesc.Name)
-			if len(n.tw.ru.UpdateCols) > 0 {
+			v.observer.attr(name, "table", n.run.tu.tableDesc().Name)
+			if len(n.run.tu.ru.UpdateCols) > 0 {
 				var buf bytes.Buffer
-				for i, col := range n.tw.ru.UpdateCols {
+				for i, col := range n.run.tu.ru.UpdateCols {
 					if i > 0 {
 						buf.WriteString(", ")
 					}
@@ -426,28 +424,28 @@ func (v *planVisitor) visit(plan planNode) {
 			}
 		}
 		if v.observer.expr != nil {
-			for i, rexpr := range n.rh.exprs {
-				v.expr(name, "returning", i, rexpr)
+			for i, cexpr := range n.run.computeExprs {
+				v.expr(name, "computed", i, cexpr)
 			}
-			n.tw.walkExprs(func(d string, i int, e tree.TypedExpr) {
-				v.expr(name, d, i, e)
-			})
+			for i, cexpr := range n.run.checkHelper.Exprs {
+				v.expr(name, "check", i, cexpr)
+			}
 		}
-		v.visit(n.run.rows)
+		// An updater has no sub-expressions, so nothing special to do here.
+		v.visit(n.source)
 
 	case *deleteNode:
 		if v.observer.attr != nil {
-			v.observer.attr(name, "from", n.tableDesc.Name)
+			v.observer.attr(name, "from", n.run.td.tableDesc().Name)
 		}
-		if v.observer.expr != nil {
-			for i, rexpr := range n.rh.exprs {
-				v.expr(name, "returning", i, rexpr)
-			}
-			n.tw.walkExprs(func(d string, i int, e tree.TypedExpr) {
-				v.expr(name, d, i, e)
-			})
-		}
-		v.visit(n.run.rows)
+		// A deleter has no sub-expressions, so nothing special to do here.
+		v.visit(n.source)
+
+	case *serializeNode:
+		v.visit(n.source)
+
+	case *rowCountNode:
+		v.visit(n.source)
 
 	case *createTableNode:
 		if n.n.As() {
@@ -479,14 +477,25 @@ func (v *planVisitor) visit(plan planNode) {
 			v.visit(n.plan)
 		}
 
+	case *distSQLWrapper:
+		v.visit(n.plan)
+
 	case *explainDistSQLNode:
 		v.visit(n.plan)
 
 	case *ordinalityNode:
 		v.visit(n.source)
 
+	case *spoolNode:
+		if n.hardLimit > 0 && v.observer.attr != nil {
+			v.observer.attr(name, "limit", fmt.Sprintf("%d", n.hardLimit))
+		}
+		v.visit(n.source)
+
 	case *showTraceNode:
-		v.visit(n.plan)
+		if n.plan != nil {
+			v.visit(n.plan)
+		}
 
 	case *showTraceReplicaNode:
 		v.visit(n.plan)
@@ -497,15 +506,14 @@ func (v *planVisitor) visit(plan planNode) {
 		}
 		v.visit(n.plan)
 
-	case *cancelQueryNode:
-		if v.observer.expr != nil {
-			v.expr(name, "queryID", -1, n.queryID)
-		}
+	case *cancelQueriesNode:
+		v.visit(n.rows)
 
-	case *controlJobNode:
-		if v.observer.expr != nil {
-			v.expr(name, "jobID", -1, n.jobID)
-		}
+	case *cancelSessionsNode:
+		v.visit(n.rows)
+
+	case *controlJobsNode:
+		v.visit(n.rows)
 	}
 }
 
@@ -555,12 +563,13 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterTableNode{}):           "alter table",
 	reflect.TypeOf(&alterSequenceNode{}):        "alter sequence",
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
-	reflect.TypeOf(&cancelQueryNode{}):          "cancel query",
-	reflect.TypeOf(&controlJobNode{}):           "control job",
+	reflect.TypeOf(&cancelQueriesNode{}):        "cancel queries",
+	reflect.TypeOf(&cancelSessionsNode{}):       "cancel sessions",
+	reflect.TypeOf(&controlJobsNode{}):          "control jobs",
 	reflect.TypeOf(&createDatabaseNode{}):       "create database",
 	reflect.TypeOf(&createIndexNode{}):          "create index",
 	reflect.TypeOf(&createTableNode{}):          "create table",
-	reflect.TypeOf(&CreateUserNode{}):           "create user | role",
+	reflect.TypeOf(&CreateUserNode{}):           "create user/role",
 	reflect.TypeOf(&createViewNode{}):           "create view",
 	reflect.TypeOf(&createSequenceNode{}):       "create sequence",
 	reflect.TypeOf(&createStatsNode{}):          "create statistics",
@@ -572,11 +581,12 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&dropTableNode{}):            "drop table",
 	reflect.TypeOf(&dropViewNode{}):             "drop view",
 	reflect.TypeOf(&dropSequenceNode{}):         "drop sequence",
-	reflect.TypeOf(&DropUserNode{}):             "drop user | role",
-	reflect.TypeOf(&explainDistSQLNode{}):       "explain dist_sql",
+	reflect.TypeOf(&DropUserNode{}):             "drop user/role",
+	reflect.TypeOf(&distSQLWrapper{}):           "distsql query",
+	reflect.TypeOf(&explainDistSQLNode{}):       "explain distsql",
 	reflect.TypeOf(&explainPlanNode{}):          "explain plan",
 	reflect.TypeOf(&showTraceNode{}):            "show trace for",
-	reflect.TypeOf(&showTraceReplicaNode{}):     "show trace for",
+	reflect.TypeOf(&showTraceReplicaNode{}):     "replica trace",
 	reflect.TypeOf(&filterNode{}):               "filter",
 	reflect.TypeOf(&groupNode{}):                "group",
 	reflect.TypeOf(&unaryNode{}):                "emptyrow",
@@ -588,10 +598,12 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&ordinalityNode{}):           "ordinality",
 	reflect.TypeOf(&testingRelocateNode{}):      "testingRelocate",
 	reflect.TypeOf(&renderNode{}):               "render",
+	reflect.TypeOf(&rowCountNode{}):             "count",
 	reflect.TypeOf(&scanNode{}):                 "scan",
 	reflect.TypeOf(&scatterNode{}):              "scatter",
 	reflect.TypeOf(&scrubNode{}):                "scrub",
 	reflect.TypeOf(&sequenceSelectNode{}):       "sequence select",
+	reflect.TypeOf(&serializeNode{}):            "run",
 	reflect.TypeOf(&setVarNode{}):               "set",
 	reflect.TypeOf(&setClusterSettingNode{}):    "set cluster setting",
 	reflect.TypeOf(&setZoneConfigNode{}):        "configure zone",
@@ -600,6 +612,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&showFingerprintsNode{}):     "showFingerprints",
 	reflect.TypeOf(&sortNode{}):                 "sort",
 	reflect.TypeOf(&splitNode{}):                "split",
+	reflect.TypeOf(&spoolNode{}):                "spool",
 	reflect.TypeOf(&unionNode{}):                "union",
 	reflect.TypeOf(&updateNode{}):               "update",
 	reflect.TypeOf(&upsertNode{}):               "upsert",

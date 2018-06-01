@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
 
 statement ok
 CREATE TABLE other (b INT PRIMARY KEY)
@@ -11,13 +11,6 @@ CREATE TABLE t (a INT PRIMARY KEY CHECK(a > 0), f INT REFERENCES other, INDEX (f
 
 statement ok
 INSERT INTO t VALUES (1, 9)
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-fetched: /t/primary/1/f -> /9
-output row: [1 9]
 
 statement error syntax error at or near "*"
 ALTER TABLE t RENAME TO t.*
@@ -35,13 +28,6 @@ b     INT  true  NULL    {}
 
 statement ok
 ALTER TABLE t ADD CONSTRAINT foo UNIQUE (b)
-
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT b FROM t@foo]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-fetched: /t/foo/NULL -> /1
-output row: [NULL]
 
 query TTTTRT
 SELECT type, description, username, status, fraction_completed, error
@@ -89,7 +75,7 @@ ORDER BY created DESC
 LIMIT 2
 ----
 SCHEMA CHANGE  ROLL BACK ALTER TABLE test.public.t ADD CONSTRAINT bar UNIQUE (c)  root  succeeded  1.00  ·
-SCHEMA CHANGE  ALTER TABLE test.public.t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.10  duplicate key value (c)=(1) violates unique constraint "bar"
+SCHEMA CHANGE  ALTER TABLE test.public.t ADD CONSTRAINT bar UNIQUE (c)            root  failed     0.00  duplicate key value (c)=(1) violates unique constraint "bar"
 
 query IIII colnames,rowsort
 SELECT * FROM t
@@ -208,30 +194,15 @@ t      primary  true    1    a       ASC        false    false
 t      t_f_idx  false   1    f       ASC        false    false
 t      t_f_idx  false   2    a       ASC        false    true
 
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
-----
-fetched: /t/primary/1/f -> /9
-output row: [1 9 NULL NULL]
-fetched: /t/primary/2/f/b/c -> /9/1/1
-output row: [2 9 1 1]
-fetched: /t/primary/3/f/b/c -> /9/2/1
-output row: [3 9 2 1]
-
 statement ok
 ALTER TABLE t DROP b, DROP c
 
-query T
-SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t]
- WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+query II rowsort
+SELECT * FROM t
 ----
-fetched: /t/primary/1/f -> /9
-output row: [1 9]
-fetched: /t/primary/2/f -> /9
-output row: [2 9]
-fetched: /t/primary/3/f -> /9
-output row: [3 9]
+1  9
+2  9
+3  9
 
 statement ok
 ALTER TABLE t ADD d INT UNIQUE
@@ -561,7 +532,7 @@ ALTER TABLE add_default ADD g INT DEFAULT nextval('initial_seq')
 statement error cannot backfill such evaluated expression
 ALTER TABLE add_default ADD g OID DEFAULT 'foo'::regclass::oid
 
-statement error cannot backfill such evaluated expression
+statement error cannot access virtual schema in anonymous database
 ALTER TABLE add_default ADD g INT DEFAULT 'foo'::regtype::INT
 
 # Multiple columns can be added at once with heterogeneous DEFAULT usage
@@ -593,6 +564,11 @@ statement ok
 INSERT INTO privs VALUES (1)
 
 user testuser
+
+query T
+SHOW DATABASE
+----
+test
 
 statement error user testuser does not have CREATE privilege on relation privs
 ALTER TABLE privs ADD c INT
@@ -645,22 +621,6 @@ ALTER TABLE privsview ADD d INT
 statement error pgcode 42809 "privsview" is not a table
 ALTER TABLE privsview SPLIT AT VALUES (42)
 
-statement ok
-CREATE TABLE s (k1 INT, k2 INT, v INT, PRIMARY KEY (k1,k2))
-
-# Verify limits and orderings are propagated correctly to the select.
-query TITTTTT colnames
-EXPLAIN (METADATA) ALTER TABLE s SPLIT AT SELECT k1,k2 FROM s ORDER BY k1 LIMIT 3
-----
-Tree                 Level  Type    Field  Description  Columns               Ordering
-split                0      split   ·      ·            (key, pretty)         ·
- └── limit           1      limit   ·      ·            (k1, k2)              k1!=NULL; k2!=NULL; key(k1,k2); +k1
-      └── render     2      render  ·      ·            (k1, k2)              k1!=NULL; k2!=NULL; key(k1,k2); +k1
-           └── scan  3      scan    ·      ·            (k1, k2, v[omitted])  k1!=NULL; k2!=NULL; key(k1,k2); +k1
-·                    3      ·       table  s@primary    ·                     ·
-·                    3      ·       spans  ALL          ·                     ·
-·                    3      ·       limit  3            ·                     ·
-
 # Verify that impure defaults are evaluated separately on each row
 # (#14352)
 statement ok
@@ -698,6 +658,41 @@ SELECT * from default_err_test ORDER BY foo
 bar
 baz
 foo
+
+# Create a table with a computed column that we'll de-compute
+statement ok
+CREATE TABLE decomputed_column (a INT PRIMARY KEY, b INT AS ( a + 1 ) STORED)
+
+statement ok
+INSERT INTO decomputed_column VALUES (1), (2)
+
+statement error cannot write directly to computed column
+INSERT INTO decomputed_column VALUES (3, NULL), (4, 99)
+
+statement ok
+ALTER TABLE decomputed_column ALTER COLUMN b DROP STORED
+
+# Verify that the computation is dropped and that we can mutate the column
+statement ok
+INSERT INTO decomputed_column VALUES (3, NULL), (4, 99)
+
+query II
+select a, b from decomputed_column order by a
+----
+1 2
+2 3
+3 NULL
+4 99
+
+query TT
+show create table decomputed_column
+----
+decomputed_column  CREATE TABLE decomputed_column (
+                   a INT NOT NULL,
+                   b INT NULL,
+                   CONSTRAINT "primary" PRIMARY KEY (a ASC),
+                   FAMILY "primary" (a, b)
+)
 
 # Verify that auditing can be enabled by root, and cannot be disabled by non-root.
 

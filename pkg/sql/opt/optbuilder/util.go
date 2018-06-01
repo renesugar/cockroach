@@ -18,9 +18,12 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // expandStar expands expr into a list of columns if expr
@@ -33,20 +36,10 @@ func (b *Builder) expandStar(expr tree.Expr, inScope *scope) (exprs []tree.Typed
 
 	switch t := expr.(type) {
 	case *tree.AllColumnsSelector:
-		tn, err := tree.NormalizeTableName(&t.TableName)
+		src, _, err := t.Resolve(b.ctx, inScope)
 		if err != nil {
 			panic(builderError{err})
 		}
-
-		numRes, src, _, err := inScope.FindSourceMatchingName(b.ctx, tn)
-		if err != nil {
-			panic(builderError{err})
-		}
-		if numRes == tree.NoResults {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"no data source named %q", tree.ErrString(&tn))})
-		}
-
 		for i := range inScope.cols {
 			col := inScope.cols[i]
 			if col.table == *src && !col.hidden {
@@ -102,58 +95,47 @@ func (b *Builder) expandStarAndResolveType(
 //        the AS keyword).
 // typ    The type of the column.
 // expr   The expression this column refers to (if any).
+// group  The memo group ID of this column/expression (if any). This parameter
+//        is optional and can be set later in the returned scopeColumn.
 //
 // The new column is returned as a columnProps object.
 func (b *Builder) synthesizeColumn(
-	scope *scope, label string, typ types.T, expr tree.TypedExpr,
-) *columnProps {
+	scope *scope, label string, typ types.T, expr tree.TypedExpr, group memo.GroupID,
+) *scopeColumn {
 	if label == "" {
 		label = fmt.Sprintf("column%d", len(b.colMap))
 	}
 
 	name := tree.Name(label)
-	colIndex := b.factory.Metadata().AddColumn(label, typ)
-	col := columnProps{
+	colID := b.factory.Metadata().AddColumn(label, typ)
+	col := scopeColumn{
 		origName: name,
 		name:     name,
 		typ:      typ,
-		index:    colIndex,
+		id:       colID,
 		expr:     expr,
+		group:    group,
 	}
 	b.colMap = append(b.colMap, col)
 	scope.cols = append(scope.cols, col)
 	return &scope.cols[len(scope.cols)-1]
 }
 
-// constructList invokes the factory to create one of the operators that contain
-// a list of groups: ProjectionsOp and AggregationsOp.
-func (b *Builder) constructList(
-	op opt.Operator, items []opt.GroupID, cols []columnProps,
-) opt.GroupID {
-	colList := make(opt.ColList, len(cols))
+func (b *Builder) synthesizeResultColumns(scope *scope, cols sqlbase.ResultColumns) {
 	for i := range cols {
-		colList[i] = cols[i].index
+		c := b.synthesizeColumn(scope, cols[i].Name, cols[i].Typ, nil /* expr */, 0 /* group */)
+		if cols[i].Hidden {
+			c.hidden = true
+		}
 	}
-
-	list := b.factory.InternList(items)
-	private := b.factory.InternPrivate(&colList)
-
-	switch op {
-	case opt.ProjectionsOp:
-		return b.factory.ConstructProjections(list, private)
-	case opt.AggregationsOp:
-		return b.factory.ConstructAggregations(list, private)
-	}
-
-	panic(fmt.Sprintf("unexpected operator: %s", op))
 }
 
 // colIndex takes an expression that refers to a column using an integer,
 // verifies it refers to a valid target in the SELECT list, and returns the
 // corresponding column index. For example:
 //    SELECT a from T ORDER by 1
-// Here "1" refers to the first item in the SELECT list, "a". The returned index
-// is 0.
+// Here "1" refers to the first item in the SELECT list, "a". The returned
+// index is 0.
 func colIndex(numOriginalCols int, expr tree.Expr, context string) int {
 	ord := int64(-1)
 	switch i := expr.(type) {
@@ -165,20 +147,30 @@ func colIndex(numOriginalCols int, expr tree.Expr, context string) int {
 			}
 			ord = val
 		} else {
-			panic(errorf("non-integer constant in %s: %s", context, expr))
+			panic(builderError{pgerror.NewErrorf(
+				pgerror.CodeSyntaxError,
+				"non-integer constant in %s: %s", context, expr,
+			)})
 		}
 	case *tree.DInt:
 		if *i >= 0 {
 			ord = int64(*i)
 		}
 	case *tree.StrVal:
-		panic(errorf("non-integer constant in %s: %s", context, expr))
+		panic(builderError{pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)})
 	case tree.Datum:
-		panic(errorf("non-integer constant in %s: %s", context, expr))
+		panic(builderError{pgerror.NewErrorf(
+			pgerror.CodeSyntaxError, "non-integer constant in %s: %s", context, expr,
+		)})
 	}
 	if ord != -1 {
 		if ord < 1 || ord > int64(numOriginalCols) {
-			panic(errorf("%s position %s is not in select list", context, expr))
+			panic(builderError{pgerror.NewErrorf(
+				pgerror.CodeInvalidColumnReferenceError,
+				"%s position %s is not in select list", context, expr,
+			)})
 		}
 		ord--
 	}
@@ -216,9 +208,8 @@ func colIdxByProjectionAlias(expr tree.Expr, op string, scope *scope) int {
 						// `SELECT b, * FROM t ORDER BY b`. Otherwise, reject with an
 						// ambiguity error.
 						if scope.cols[j].getExprStr() != scope.cols[index].getExprStr() {
-							panic(builderError{pgerror.NewErrorf(
-								pgerror.CodeAmbiguousAliasError, "%s \"%s\" is ambiguous", op, target,
-							)})
+							panic(builderError{pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+								"%s \"%s\" is ambiguous", op, target)})
 						}
 						// Use the index of the first matching column.
 						continue
@@ -276,18 +267,18 @@ func symbolicExprStr(expr tree.Expr) string {
 	return tree.AsStringWithFlags(expr, tree.FmtCheckEquivalence)
 }
 
-func colsToColList(cols []columnProps) opt.ColList {
+func colsToColList(cols []scopeColumn) opt.ColList {
 	colList := make(opt.ColList, len(cols))
 	for i := range cols {
-		colList[i] = cols[i].index
+		colList[i] = cols[i].id
 	}
 	return colList
 }
 
-func findColByIndex(cols []columnProps, colIndex opt.ColumnIndex) *columnProps {
+func findColByIndex(cols []scopeColumn, id opt.ColumnID) *scopeColumn {
 	for i := range cols {
 		col := &cols[i]
-		if col.index == colIndex {
+		if col.id == id {
 			return col
 		}
 	}
@@ -295,11 +286,16 @@ func findColByIndex(cols []columnProps, colIndex opt.ColumnIndex) *columnProps {
 	return nil
 }
 
-func makePresentation(cols []columnProps) opt.Presentation {
-	presentation := make(opt.Presentation, len(cols))
-	for i := range cols {
-		col := &cols[i]
-		presentation[i] = opt.LabeledColumn{Label: string(col.name), Index: col.index}
+func (b *Builder) assertNoAggregationOrWindowing(expr tree.Expr, op string) {
+	exprTransformCtx := transform.ExprTransformContext{}
+	if exprTransformCtx.AggregateInExpr(expr, b.semaCtx.SearchPath) {
+		panic(builderError{
+			pgerror.NewErrorf(pgerror.CodeGroupingError, "aggregate functions are not allowed in %s", op),
+		})
 	}
-	return presentation
+	if exprTransformCtx.WindowFuncInExpr(expr) {
+		panic(builderError{
+			pgerror.NewErrorf(pgerror.CodeWindowingError, "window functions are not allowed in %s", op),
+		})
+	}
 }

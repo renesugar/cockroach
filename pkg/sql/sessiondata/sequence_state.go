@@ -43,6 +43,18 @@ func NewSequenceState() *SequenceState {
 	return &ss
 }
 
+// copy performs a deep copy of SequenceState.
+func (ss *SequenceState) copy() *SequenceState {
+	cp := NewSequenceState()
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	for k, v := range ss.mu.latestValues {
+		cp.mu.latestValues[k] = v
+	}
+	cp.mu.lastSequenceIncremented = ss.mu.lastSequenceIncremented
+	return ss
+}
+
 // NextVal ever called returns true if a sequence has ever been incremented on
 // this session.
 func (ss *SequenceState) nextValEverCalledLocked() bool {
@@ -54,6 +66,14 @@ func (ss *SequenceState) RecordValue(seqID uint32, val int64) {
 	ss.mu.Lock()
 	ss.mu.lastSequenceIncremented = seqID
 	ss.mu.latestValues[seqID] = val
+	ss.mu.Unlock()
+}
+
+// SetLastSequenceIncremented sets the id of the last incremented sequence.
+// Usually this id is set through RecordValue().
+func (ss *SequenceState) SetLastSequenceIncremented(seqID uint32) {
+	ss.mu.Lock()
+	ss.mu.lastSequenceIncremented = seqID
 	ss.mu.Unlock()
 }
 
@@ -81,4 +101,17 @@ func (ss *SequenceState) GetLastValueByID(seqID uint32) (int64, bool) {
 
 	val, ok := ss.mu.latestValues[seqID]
 	return val, ok
+}
+
+// Export returns a copy of the SequenceState's state - the latestValues and
+// lastSequenceIncremented.
+// lastSequenceIncremented is only defined if latestValues is non-empty.
+func (ss *SequenceState) Export() (map[uint32]int64, uint32) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	res := make(map[uint32]int64, len(ss.mu.latestValues))
+	for k, v := range ss.mu.latestValues {
+		res[k] = v
+	}
+	return res, ss.mu.lastSequenceIncremented
 }

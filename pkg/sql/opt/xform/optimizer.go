@@ -18,32 +18,22 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"golang.org/x/tools/container/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
-//go:generate optgen -out rule_name.og.go rulenames ../ops/*.opt rules/*.opt
+// MatchedRuleFunc defines the callback function for the NotifyOnMatchedRule
+// event supported by the optimizer. See the comment in factory.go for more
+// details.
+type MatchedRuleFunc = norm.MatchedRuleFunc
 
-//go:generate stringer -output=rule_name_string.go -type=RuleName rule_name.og.go
-
-// OptimizeSteps is passed to NewOptimizer, and specifies the maximum number
-// of normalization and exploration transformations that will be applied by the
-// optimizer. This can be used to effectively disable the optimizer (if set to
-// zero), to debug the optimizer (by disabling optimizations past a certain
-// point), or to limit the running time of the optimizer.
-type OptimizeSteps int
-
-const (
-	// OptimizeNone instructs the optimizer to suppress all transformations.
-	// The unaltered input expression tree will become the output expression
-	// tree. This effectively disables the optimizer.
-	OptimizeNone = OptimizeSteps(0)
-
-	// OptimizeAll instructs the optimizer to continue applying transformations
-	// until the best plan has been found. There is no limit to the number of
-	// steps that the optimizer will take to get there.
-	OptimizeAll = OptimizeSteps(intsets.MaxInt)
-)
+// AppliedRuleFunc defines the callback function for the NotifyOnAppliedRule
+// event supported by the optimizer. See the comment in factory.go for more
+// details.
+type AppliedRuleFunc = norm.AppliedRuleFunc
 
 // Optimizer transforms an input expression tree into the logically equivalent
 // output expression tree with the lowest possible execution cost.
@@ -56,45 +46,121 @@ const (
 // expression must provide. The optimizer will return an ExprView over the
 // output expression tree with the lowest cost.
 type Optimizer struct {
-	f   *factory
-	mem *memo
+	evalCtx  *tree.EvalContext
+	f        *norm.Factory
+	mem      *memo.Memo
+	coster   Coster
+	explorer explorer
+
+	// stateMap allocates temporary storage that's used to speed up optimization.
+	// This state could be discarded once optimization is complete.
+	stateMap   map[optStateKey]*optState
+	stateAlloc optStateAlloc
+
+	// matchedRule is the callback function that is invoked each time an
+	// optimization rule (Normalize or Explore) has been matched by the optimizer.
+	// It can be set via a call to the NotifyOnMatchedRule method.
+	matchedRule MatchedRuleFunc
+
+	// appliedRule is the callback function which is invoked each time an
+	// optimization rule (Normalize or Explore) has been applied by the optimizer.
+	// It can be set via a call to the NotifyOnAppliedRule method.
+	appliedRule AppliedRuleFunc
 }
 
-// NewOptimizer constructs an instance of the optimizer. The maxSteps parameter
-// limits the number of normalization and exploration transformations that will
-// be applied by the optimizer. If maxSteps is zero, then the unaltered input
-// expression tree becomes the output expression tree (because no transforms
-// are applied).
-func NewOptimizer(evalCtx *tree.EvalContext, maxSteps OptimizeSteps) *Optimizer {
-	f := newFactory(evalCtx, maxSteps)
-	return &Optimizer{f: f, mem: f.mem}
+// NewOptimizer constructs an instance of the optimizer.
+func NewOptimizer(evalCtx *tree.EvalContext) *Optimizer {
+	f := norm.NewFactory(evalCtx)
+	o := &Optimizer{
+		evalCtx:  evalCtx,
+		f:        f,
+		mem:      f.Memo(),
+		coster:   newCoster(f.Memo()),
+		stateMap: make(map[optStateKey]*optState),
+	}
+	o.explorer.init(o)
+	return o
 }
 
 // Factory returns a factory interface that the caller uses to construct an
 // input expression tree. The root of the resulting tree can be passed to the
 // Optimize method in order to find the lowest cost plan.
-func (o *Optimizer) Factory() opt.Factory {
+func (o *Optimizer) Factory() *norm.Factory {
 	return o.f
 }
 
-// LastRuleName returns the last rule that was triggered by the optimizer. This
-// is useful for single-stepping through optimizer rule applications.
-func (o *Optimizer) LastRuleName() RuleName {
-	return o.f.lastRuleName
+// Coster returns the coster instance that the optimizer is currently using to
+// estimate the cost of executing portions of the expression tree. When a new
+// optimizer is constructed, it creates a default coster that will be used
+// unless it is overridden with a call to SetCoster.
+func (o *Optimizer) Coster() Coster {
+	return o.coster
+}
+
+// SetCoster overrides the default coster. The optimizer will now use the given
+// coster to estimate the cost of expression execution.
+func (o *Optimizer) SetCoster(coster Coster) {
+	o.coster = coster
+}
+
+// DisableOptimizations disables all transformation rules, including normalize
+// and explore rules. The unaltered input expression tree becomes the output
+// expression tree (because no transforms are applied).
+func (o *Optimizer) DisableOptimizations() {
+	o.NotifyOnMatchedRule(func(opt.RuleName) bool { return false })
+}
+
+// NotifyOnMatchedRule sets a callback function which is invoked each time an
+// optimization rule (Normalize or Explore) has been matched by the optimizer.
+// If matchedRule is nil, then no notifications are sent, and all rules are
+// applied by default. In addition, callers can invoke the DisableOptimizations
+// convenience method to disable all rules.
+func (o *Optimizer) NotifyOnMatchedRule(matchedRule MatchedRuleFunc) {
+	o.matchedRule = matchedRule
+
+	// Also pass through the call to the factory so that normalization rules
+	// make same callback.
+	o.f.NotifyOnMatchedRule(matchedRule)
+}
+
+// NotifyOnAppliedRule sets a callback function which is invoked each time an
+// optimization rule (Normalize or Explore) has been applied by the optimizer.
+// If appliedRule is nil, then no further notifications are sent.
+func (o *Optimizer) NotifyOnAppliedRule(appliedRule AppliedRuleFunc) {
+	o.appliedRule = appliedRule
+
+	// Also pass through the call to the factory so that normalization rules
+	// make same callback.
+	o.f.NotifyOnAppliedRule(appliedRule)
+}
+
+// Memo returns the memo structure that the optimizer is using to optimize.
+func (o *Optimizer) Memo() *memo.Memo {
+	return o.mem
 }
 
 // Optimize returns the expression which satisfies the required physical
 // properties at the lowest possible execution cost, but is still logically
 // equivalent to the given expression. If there is a cost "tie", then any one
 // of the qualifying lowest cost expressions may be selected by the optimizer.
-func (o *Optimizer) Optimize(root opt.GroupID, requiredProps *opt.PhysicalProps) ExprView {
-	mgrp := o.mem.lookupGroup(root)
-	required := o.mem.internPhysicalProps(requiredProps)
-	best := o.optimizeGroup(mgrp, required)
-	if best.op == opt.UnknownOp {
-		panic("optimization step returned invalid result")
+func (o *Optimizer) Optimize(root memo.GroupID, requiredProps *props.Physical) memo.ExprView {
+	required := o.mem.InternPhysicalProps(requiredProps)
+	state := o.optimizeGroup(root, required)
+
+	// Validate the resulting operator.
+	ev := memo.MakeExprView(o.mem, state.best)
+	if ev.Operator() == opt.UnknownOp {
+		panic("optimization failed: result cannot be Unknown")
 	}
-	return makeExprView(o.mem, root, required)
+
+	// Validate that outer columns did not change.
+	if ev.IsRelational() && !ev.Logical().Relational.OuterCols.Empty() {
+		format := "top-level relational expression cannot have outer columns: %s"
+		panic(fmt.Sprintf(format, ev.Logical().Relational.OuterCols))
+	}
+
+	o.mem.SetRoot(ev)
+	return ev
 }
 
 // optimizeGroup enumerates expression trees rooted in the given memo group and
@@ -132,7 +198,7 @@ func (o *Optimizer) Optimize(root opt.GroupID, requiredProps *opt.PhysicalProps)
 // recursively invoking optimizeGroup on the same group #1, but this time
 // without the ordering requirement. The Scan operator is capable of meeting
 // these reduced requirements, so it is costed and added as the current lowest
-// cost expression (bestExpr) for that group for that set of properties (i.e.
+// cost expression (BestExpr) for that group for that set of properties (i.e.
 // the empty set).
 //
 //   memo
@@ -240,111 +306,111 @@ func (o *Optimizer) Optimize(root opt.GroupID, requiredProps *opt.PhysicalProps)
 //              ├── variable: a.x [type=int]
 //              └── const: 1 [type=int]
 //
-func (o *Optimizer) optimizeGroup(mgrp *memoGroup, required opt.PhysicalPropsID) *bestExpr {
+func (o *Optimizer) optimizeGroup(group memo.GroupID, required memo.PhysicalPropsID) *optState {
 	// If this group is already fully optimized, then return the already
 	// prepared best expression (won't ever get better than this).
-	best := mgrp.ensureBestExpr(required)
-	if best.fullyOptimized {
-		return best
+	state := o.ensureOptState(group, required)
+	if state.fullyOptimized {
+		return state
 	}
 
-	groupFullyOptimized := true
+	// Iterate until the group has been fully optimized.
+	for {
+		fullyOptimized := true
 
-	for i := range mgrp.exprs {
-		eid := exprID(i)
+		for i := 0; i < o.mem.ExprCount(group); i++ {
+			eid := memo.ExprID{Group: group, Expr: memo.ExprOrdinal(i)}
 
-		// If this expression has already been fully optimized for the given
-		// required properties, then skip it, since it won't get better.
-		if best.isExprFullyOptimized(eid) {
-			continue
+			// If this expression has already been fully optimized for the given
+			// required properties, then skip it, since it won't get better.
+			if state.isExprFullyOptimized(eid) {
+				continue
+			}
+
+			// Optimize the expression with respect to the required properties.
+			state = o.optimizeExpr(eid, required)
+
+			// If any of the expressions have not yet been fully optimized, then
+			// the group is not yet fully optimized.
+			if !state.isExprFullyOptimized(eid) {
+				fullyOptimized = false
+			}
 		}
 
-		// Optimize the expression with respect to the required properties.
-		best = o.optimizeExpr(mgrp, eid, required)
+		// Now generate new expressions that are logically equivalent to other
+		// expressions in this group.
+		if !o.explorer.exploreGroup(group).fullyExplored {
+			fullyOptimized = false
+		}
 
-		// If any of the expressions have not yet been fully optimized, then
-		// the group is not yet fully optimized.
-		if !best.isExprFullyOptimized(eid) {
-			groupFullyOptimized = false
+		if fullyOptimized {
+			// If exploration and costing of this group for the given required
+			// properties is complete, then skip it in all future optimization
+			// passes.
+			state.fullyOptimized = true
+			break
 		}
 	}
 
-	if groupFullyOptimized {
-		// If exploration and costing of this group for the given required
-		// properties is complete, then skip it in all future optimization
-		// passes.
-		best.fullyOptimized = true
-	}
-
-	return best
+	return state
 }
 
 // optimizeExpr determines whether the given expression can provide the
 // required properties. If so, it recursively optimizes the expression's child
 // groups and computes the cost of the expression. In addition, optimizeExpr
 // calls enforceProps to check whether enforcers can provide the required
-// properties at a lower cost. The best expression is saved in the bestExpr map
-// in the memo group and returned.
-func (o *Optimizer) optimizeExpr(
-	mgrp *memoGroup, eid exprID, required opt.PhysicalPropsID,
-) (best *bestExpr) {
-	// Create an ExprView for convenient access to the expression. Don't
-	// use makeExprView to do this, because the bestExpr map isn't yet fully
-	// populated (that's what the optimizer is trying to do!).
-	ev := ExprView{
-		mem:      o.mem,
-		loc:      memoLoc{group: mgrp.id, expr: eid},
-		op:       mgrp.lookupExpr(eid).op,
-		required: required,
-	}
-
-	fullyOptimized := true
+// properties at a lower cost. The lowest cost expression is saved to the memo
+// group.
+func (o *Optimizer) optimizeExpr(eid memo.ExprID, required memo.PhysicalPropsID) *optState {
+	// Compute the cost for enforcers to provide the required properties. This
+	// may be lower than the expression providing the properties itself. For
+	// example, it might be better to sort the results of a hash join than to
+	// use the results of a merge join that are already sorted, but at the cost
+	// of requiring one of the merge join children to be sorted.
+	fullyOptimized := o.enforceProps(eid, required)
 
 	// If the expression cannot provide the required properties, then don't
 	// continue. But what if the expression is able to provide a subset of the
 	// properties? That case is taken care of by enforceProps, which will
 	// recursively optimize the group with property subsets and then add
 	// enforcers to provide the remainder.
-	if o.mem.physPropsFactory.canProvide(ev, required) {
-		for child := 0; child < ev.ChildCount(); child++ {
-			childGroup := o.mem.lookupGroup(ev.ChildGroup(child))
+	physPropsFactory := &physicalPropsBuilder{mem: o.mem}
+	if physPropsFactory.canProvide(eid, required) {
+		e := o.mem.Expr(eid)
+		candidateBest := memo.MakeBestExpr(e.Operator(), eid, required)
+		for child := 0; child < e.ChildCount(); child++ {
+			childGroup := e.ChildGroup(o.mem, child)
 
 			// Given required parent properties, get the properties required from
 			// the nth child.
-			childRequired := o.mem.physPropsFactory.constructChildProps(ev, child)
+			childRequired := physPropsFactory.buildChildProps(eid, required, child)
 
 			// Recursively optimize the child group with respect to that set of
 			// properties.
-			bestChild := o.optimizeGroup(childGroup, childRequired)
+			childState := o.optimizeGroup(childGroup, childRequired)
+
+			// Remember best child in BestExpr in case this becomes the lowest
+			// cost expression.
+			candidateBest.AddChild(childState.best)
 
 			// If any child expression is not fully optimized, then the parent
 			// expression is also not fully optimized.
-			if !bestChild.isFullyOptimized() {
+			if !childState.fullyOptimized {
 				fullyOptimized = false
 			}
 		}
 
 		// Check whether this is the new lowest cost expression.
-		// TODO(andyk): Actually run the costing function in the future.
-		best = mgrp.lookupBestExpr(ev.required)
-		best.ratchetCost(ev)
+		o.ratchetCost(&candidateBest)
 	}
-
-	// Compute the cost for enforcers to provide the required properties. This
-	// may be lower than the expression providing the properties itself. For
-	// example, it might be better to sort the results of a hash join than to
-	// use the results of a merge join that are already sorted, but at the cost
-	// of requiring one of the merge join children to be sorted.
-	fullyOptimized = o.enforceProps(ev) && fullyOptimized
 
 	// Get the lowest cost expression after considering enforcers, and mark it
 	// as fully optimized if all the combinations have been considered.
-	best = mgrp.lookupBestExpr(required)
+	state := o.lookupOptState(eid.Group, required)
 	if fullyOptimized {
-		best.markExprAsFullyOptimized(eid)
+		state.markExprAsFullyOptimized(eid)
 	}
-
-	return best
+	return state
 }
 
 // enforceProps costs an expression where one of the physical properties has
@@ -360,10 +426,12 @@ func (o *Optimizer) optimizeExpr(
 // Note that enforceProps will recursively optimize this same group, but with
 // one less required physical property. The recursive call will eventually make
 // its way back here, at which point another physical property will be stripped
-// off, and so on. Afterwards, the group will have computed a bestExpr for each
+// off, and so on. Afterwards, the group will have computed a BestExpr for each
 // sublist of physical properties, from all down to none.
-func (o *Optimizer) enforceProps(ev ExprView) (fullyOptimized bool) {
-	props := ev.Physical()
+func (o *Optimizer) enforceProps(
+	eid memo.ExprID, required memo.PhysicalPropsID,
+) (fullyOptimized bool) {
+	props := o.mem.LookupPhysicalProps(required)
 	innerProps := *props
 
 	// Ignore the Presentation property, since any relational or enforcer
@@ -383,31 +451,143 @@ func (o *Optimizer) enforceProps(ev ExprView) (fullyOptimized bool) {
 		if innerProps.Defined() {
 			panic(fmt.Sprintf("unhandled physical property: %v", innerProps))
 		}
-		return
+		return true
 	}
 
 	// Recursively optimize the same group, but now with respect to the "inner"
 	// properties (which are a sublist of the required properties).
-	mgrp := o.mem.lookupGroup(ev.loc.group)
-	innerRequired := o.mem.internPhysicalProps(&innerProps)
-	innerBest := o.optimizeGroup(mgrp, innerRequired)
-	fullyOptimized = innerBest.isFullyOptimized()
+	innerRequired := o.mem.InternPhysicalProps(&innerProps)
+	innerState := o.optimizeGroup(eid.Group, innerRequired)
+	fullyOptimized = innerState.fullyOptimized
 
 	// Check whether this is the new lowest cost expression with the enforcer
-	// added. Note that the enforcer is not in the group's exprs slice, so its
-	// memoLoc.expr field is 0.
-	// TODO(andyk): Actually run the costing function in the future.
-	enforcer := ExprView{
-		mem:      o.mem,
-		loc:      memoLoc{group: ev.loc.group},
-		op:       enforcerOp,
-		required: ev.required,
-	}
-
-	best := mgrp.lookupBestExpr(ev.required)
-	best.ratchetCost(enforcer)
+	// added.
+	candidateBest := memo.MakeBestExpr(enforcerOp, eid, required)
+	candidateBest.AddChild(innerState.best)
+	o.ratchetCost(&candidateBest)
 
 	// Enforcer expression is fully optimized if its input expression is fully
 	// optimized.
 	return fullyOptimized
+}
+
+// ratchetCost computes the cost of the candidate expression, and then checks
+// whether it's lower than the cost of the existing best expression in the
+// group. If so, then the candidate becomes the new lowest cost expression.
+func (o *Optimizer) ratchetCost(candidate *memo.BestExpr) {
+	group := candidate.Group()
+	cost := o.coster.ComputeCost(candidate, o.mem.GroupProperties(group))
+	candidate.SetCost(cost)
+	state := o.lookupOptState(group, candidate.Required())
+	if state.best == memo.UnknownBestExprID {
+		// Lazily allocate the best expression only when it's needed.
+		state.best = o.mem.EnsureBestExpr(group, candidate.Required())
+	}
+	o.mem.RatchetBestExpr(state.best, candidate)
+}
+
+// lookupOptState looks up the state associated with the given group and
+// properties. If no state exists yet, then lookupOptState returns nil.
+func (o *Optimizer) lookupOptState(group memo.GroupID, required memo.PhysicalPropsID) *optState {
+	return o.stateMap[optStateKey{group: group, required: required}]
+}
+
+// ensureOptState looks up the state associated with the given group and
+// properties. If none is associated yet, then ensureOptState allocates new
+// state and returns it.
+func (o *Optimizer) ensureOptState(group memo.GroupID, required memo.PhysicalPropsID) *optState {
+	key := optStateKey{group: group, required: required}
+	state, ok := o.stateMap[key]
+	if !ok {
+		state = o.stateAlloc.allocate()
+		o.stateMap[key] = state
+	}
+	return state
+}
+
+// optStateKey associates optState with a group that is being optimized with
+// respect to a set of physical properties.
+type optStateKey struct {
+	group    memo.GroupID
+	required memo.PhysicalPropsID
+}
+
+// optState is temporary storage that's associated with each group that's
+// optimized (or same group with different sets of physical properties). The
+// optimizer stores various flags and other state here that allows it to do
+// quicker lookups and short-circuit already traversed parts of the expression
+// tree.
+type optState struct {
+	// best identifies the lowest cost expression in the memo group for a given
+	// set of physical properties.
+	best memo.BestExprID
+
+	// fullyOptimized is set to true once the lowest cost expression has been
+	// found for a memo group, with respect to the required properties. A lower
+	// cost expression will never be found, no matter how many additional
+	// optimization passes are made.
+	fullyOptimized bool
+
+	// fullyOptimizedExprs contains the set of expression ids (exprIDs) that
+	// have been fully optimized for the required properties. These never need
+	// to be recosted, no matter how many additional optimization passes are
+	// made.
+	fullyOptimizedExprs util.FastIntSet
+
+	// explore is used by the explorer to store intermediate state so that
+	// redundant work is minimized.
+	explore exploreState
+}
+
+// isExprFullyOptimized returns true if the given expression has been fully
+// optimized for the required properties. The expression never needs to be
+// recosted, no matter how many additional optimization passes are made.
+func (os *optState) isExprFullyOptimized(eid memo.ExprID) bool {
+	return os.fullyOptimizedExprs.Contains(int(eid.Expr))
+}
+
+// markExprAsFullyOptimized marks the given expression as fully optimized for
+// the required properties. The expression never needs to be recosted, no
+// matter how many additional optimization passes are made.
+func (os *optState) markExprAsFullyOptimized(eid memo.ExprID) {
+	if os.fullyOptimized {
+		panic("best expression is already fully optimized")
+	}
+	if os.isExprFullyOptimized(eid) {
+		panic("memo expression is already fully optimized for required physical properties")
+	}
+	os.fullyOptimizedExprs.Add(int(eid.Expr))
+}
+
+// initialPageSize is the number of structs that fit into the first page to be
+// allocated. Each subsequent page doubles in size, up to maxPageSize.
+const initialPageSize = 4
+
+// maxPageSize is the number of structs that fit into the maximum page to be
+// allocated.
+const maxPageSize = 1024
+
+// optStateAlloc alloctates pages of optState structs. Each page is twice the
+// size of the previous, up to a maximum size. This is preferable to a slice
+// of optState structs because pointers are not invalidated when a resize
+// occurs, and because there's no need to retain a stable index.
+type optStateAlloc struct {
+	page []optState
+}
+
+// allocate returns a pointer to a new, empty optState struct. The pointer is
+// stable, meaning that its location won't change as other optState structs are
+// allocated.
+func (a optStateAlloc) allocate() *optState {
+	if a.page == nil {
+		a.page = make([]optState, 0, initialPageSize)
+	} else if len(a.page) == cap(a.page) {
+		newSize := len(a.page) * 2
+		if newSize > maxPageSize {
+			newSize = maxPageSize
+		}
+		a.page = make([]optState, 0, newSize)
+	}
+	a.page = a.page[:len(a.page)+1]
+	return &a.page[len(a.page)-1]
 }

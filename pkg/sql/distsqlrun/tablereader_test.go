@@ -17,6 +17,7 @@ package distsqlrun
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"testing"
 
@@ -25,10 +26,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/gogo/protobuf/types"
+	opentracing "github.com/opentracing/opentracing-go"
 )
 
 func TestTableReader(t *testing.T) {
@@ -115,56 +121,58 @@ func TestTableReader(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			for _, rowSource := range []bool{false, true} {
-				t.Run(fmt.Sprintf("row-source=%t", rowSource), func(t *testing.T) {
-					ts := c.spec
-					ts.Table = *td
+			testutils.RunTrueAndFalse(t, "row-source", func(t *testing.T, rowSource bool) {
+				ts := c.spec
+				ts.Table = *td
 
-					evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
-					defer evalCtx.Stop(context.Background())
-					flowCtx := FlowCtx{
-						Ctx:      context.Background(),
-						EvalCtx:  evalCtx,
-						Settings: s.ClusterSettings(),
-						txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
-						nodeID:   s.NodeID(),
-					}
+				evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
+				defer evalCtx.Stop(context.Background())
+				flowCtx := FlowCtx{
+					EvalCtx:  evalCtx,
+					Settings: s.ClusterSettings(),
+					txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+					nodeID:   s.NodeID(),
+				}
 
-					tr, err := newTableReader(&flowCtx, &ts, &c.post, nil /* output */)
-					if err != nil {
-						t.Fatal(err)
-					}
+				var out RowReceiver
+				var buf *RowBuffer
+				if !rowSource {
+					buf = &RowBuffer{}
+					out = buf
+				}
+				tr, err := newTableReader(&flowCtx, 0 /* processorID */, &ts, &c.post, out)
+				if err != nil {
+					t.Fatal(err)
+				}
 
-					var out RowSource
-					if rowSource {
-						out = tr
-					} else {
-						buf := &RowBuffer{}
-						Run(context.Background(), tr, buf)
-						if !buf.ProducerClosed {
-							t.Fatalf("output RowReceiver not closed")
-						}
-						out = buf
+				var results RowSource
+				if rowSource {
+					tr.Start(context.Background())
+					results = tr
+				} else {
+					tr.Run(context.Background(), nil /* wg */)
+					if !buf.ProducerClosed {
+						t.Fatalf("output RowReceiver not closed")
 					}
+					buf.Start(context.Background())
+					results = buf
+				}
 
-					var res sqlbase.EncDatumRows
-					for {
-						row, meta := out.Next()
-						if meta != nil {
-							if meta.TxnMeta == nil {
-								t.Fatalf("unexpected metadata: %+v", meta)
-							}
-						}
-						if row == nil {
-							break
-						}
-						res = append(res, row)
+				var res sqlbase.EncDatumRows
+				for {
+					row, meta := results.Next()
+					if meta != nil && meta.TxnMeta == nil {
+						t.Fatalf("unexpected metadata: %+v", meta)
 					}
-					if result := res.String(tr.OutputTypes()); result != c.expected {
-						t.Errorf("invalid results: %s, expected %s'", result, c.expected)
+					if row == nil {
+						break
 					}
-				})
-			}
+					res = append(res, row)
+				}
+				if result := res.String(tr.OutputTypes()); result != c.expected {
+					t.Errorf("invalid results: %s, expected %s'", result, c.expected)
+				}
+			})
 		})
 	}
 }
@@ -204,7 +212,6 @@ ALTER TABLE t TESTING_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[3], 3
 	defer evalCtx.Stop(context.Background())
 	nodeID := tc.Server(0).NodeID()
 	flowCtx := FlowCtx{
-		Ctx:      context.Background(),
 		EvalCtx:  evalCtx,
 		Settings: st,
 		txn:      client.NewTxn(tc.Server(0).DB(), nodeID, client.RootTxn),
@@ -219,108 +226,229 @@ ALTER TABLE t TESTING_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[3], 3
 		OutputColumns: []uint32{0},
 	}
 
-	for _, rowSource := range []bool{false, true} {
-		t.Run(fmt.Sprintf("row-source=%t", rowSource), func(t *testing.T) {
-			tr, err := newTableReader(&flowCtx, &spec, &post, nil /* output */)
-			if err != nil {
-				t.Fatal(err)
-			}
+	testutils.RunTrueAndFalse(t, "row-source", func(t *testing.T, rowSource bool) {
+		var out RowReceiver
+		var buf *RowBuffer
+		if !rowSource {
+			buf = &RowBuffer{}
+			out = buf
+		}
+		tr, err := newTableReader(&flowCtx, 0 /* processorID */, &spec, &post, out)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			var out RowSource
-			if rowSource {
-				out = tr
-			} else {
-				buf := &RowBuffer{}
-				Run(context.Background(), tr, buf)
-				if !buf.ProducerClosed {
-					t.Fatalf("output RowReceiver not closed")
-				}
-				out = buf
+		var results RowSource
+		if rowSource {
+			tr.Start(context.Background())
+			results = tr
+		} else {
+			tr.Run(context.Background(), nil /* wg */)
+			if !buf.ProducerClosed {
+				t.Fatalf("output RowReceiver not closed")
 			}
+			buf.Start(context.Background())
+			results = buf
+		}
 
-			var res sqlbase.EncDatumRows
-			var metas []*ProducerMetadata
-			for {
-				row, meta := out.Next()
-				if meta != nil {
-					metas = append(metas, meta)
-					continue
-				}
-				if row == nil {
-					break
-				}
-				res = append(res, row)
+		var res sqlbase.EncDatumRows
+		var metas []*ProducerMetadata
+		for {
+			row, meta := results.Next()
+			if meta != nil {
+				metas = append(metas, meta)
+				continue
 			}
+			if row == nil {
+				break
+			}
+			res = append(res, row)
+		}
 
-			if len(res) != 3 {
-				t.Fatalf("expected 3 rows, got: %d", len(res))
+		if len(res) != 3 {
+			t.Fatalf("expected 3 rows, got: %d", len(res))
+		}
+		var misplannedRanges []roachpb.RangeInfo
+		for _, m := range metas {
+			if len(m.Ranges) > 0 {
+				misplannedRanges = m.Ranges
+			} else if m.TxnMeta == nil {
+				t.Fatalf("expected only txn meta or misplanned ranges, got: %+v", metas)
 			}
-			var misplannedRanges []roachpb.RangeInfo
-			for _, m := range metas {
-				if len(m.Ranges) > 0 {
-					misplannedRanges = m.Ranges
-				} else if m.TxnMeta == nil {
-					t.Fatalf("expected only txn meta or misplanned ranges, got: %+v", metas)
-				}
-			}
-			if len(misplannedRanges) != 2 {
-				t.Fatalf("expected 2 misplanned ranges, got: %+v", misplannedRanges)
-			}
-			// The metadata about misplanned ranges can come in any order (it depends on
-			// the order in which parallel sub-batches complete after having been split by
-			// DistSender).
-			sort.Slice(misplannedRanges, func(i, j int) bool {
-				return misplannedRanges[i].Lease.Replica.NodeID < misplannedRanges[j].Lease.Replica.NodeID
-			})
-			if misplannedRanges[0].Lease.Replica.NodeID != 2 ||
-				misplannedRanges[1].Lease.Replica.NodeID != 3 {
-				t.Fatalf("expected misplanned ranges from nodes 2 and 3, got: %+v", metas[0])
-			}
+		}
+		if len(misplannedRanges) != 2 {
+			t.Fatalf("expected 2 misplanned ranges, got: %+v", misplannedRanges)
+		}
+		// The metadata about misplanned ranges can come in any order (it depends on
+		// the order in which parallel sub-batches complete after having been split by
+		// DistSender).
+		sort.Slice(misplannedRanges, func(i, j int) bool {
+			return misplannedRanges[i].Lease.Replica.NodeID < misplannedRanges[j].Lease.Replica.NodeID
 		})
-	}
+		if misplannedRanges[0].Lease.Replica.NodeID != 2 ||
+			misplannedRanges[1].Lease.Replica.NodeID != 3 {
+			t.Fatalf("expected misplanned ranges from nodes 2 and 3, got: %+v", metas[0])
+		}
+	})
 }
 
-func BenchmarkTableReader(b *testing.B) {
-	s, sqlDB, kvDB := serverutils.StartServer(b, base.TestServerArgs{})
+// Test that a scan with a limit doesn't touch more ranges than necessary (i.e.
+// we properly set the limit on the underlying RowFetcher/KVFetcher).
+func TestLimitScans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		UseDatabase: "test",
+	})
 	defer s.Stopper().Stop(context.Background())
 
-	sqlutils.CreateTable(
-		b, sqlDB, "t",
-		"k INT PRIMARY KEY, v INT",
-		10000,
-		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(42)),
-	)
+	sqlutils.CreateTable(t, sqlDB, "t",
+		"num INT PRIMARY KEY",
+		100, /* numRows */
+		sqlutils.ToRowFn(sqlutils.RowIdxFn))
+
+	if _, err := sqlDB.Exec("ALTER TABLE t SPLIT AT VALUES (5)"); err != nil {
+		t.Fatal(err)
+	}
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	flowCtx := FlowCtx{
-		Ctx:      context.Background(),
 		EvalCtx:  evalCtx,
 		Settings: s.ClusterSettings(),
-		txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+		txn:      client.NewTxn(kvDB, s.NodeID(), client.RootTxn),
 		nodeID:   s.NodeID(),
 	}
 	spec := TableReaderSpec{
 		Table: *tableDesc,
 		Spans: []TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan()}},
 	}
-	post := PostProcessSpec{}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		tr, err := newTableReader(&flowCtx, &spec, &post, nil /* output */)
-		if err != nil {
-			b.Fatal(err)
+	// We're going to ask for 3 rows, all contained in the first range.
+	const limit = 3
+	post := PostProcessSpec{Limit: limit}
+
+	tr, err := newTableReader(&flowCtx, 0 /* processorID */, &spec, &post, nil /* output */)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now we're going to run the tableReader and trace it.
+	tracer := tracing.NewTracer()
+	sp := tracer.StartSpan("root", tracing.Recordable)
+	tracing.StartRecording(sp, tracing.SnowballRecording)
+	ctx := opentracing.ContextWithSpan(context.Background(), sp)
+
+	tr.Start(ctx)
+	rows := 0
+	for {
+		row, meta := tr.Next()
+		if row != nil {
+			rows++
 		}
-		for {
-			row, meta := tr.Next()
-			if meta != nil {
-				b.Fatalf("unexpected metadata: %+v", meta)
-			}
-			if row == nil {
-				break
+
+		// Simulate what the DistSQLReceiver does and ingest the trace.
+		if meta != nil && len(meta.TraceData) > 0 {
+			if err := tracing.ImportRemoteSpans(sp, meta.TraceData); err != nil {
+				t.Fatal(err)
 			}
 		}
+
+		if row == nil && meta == nil {
+			break
+		}
+	}
+	if rows != limit {
+		t.Fatalf("expected %d rows, got: %d", limit, rows)
+	}
+
+	// We're now going to count how many distinct scans we've done. This regex is
+	// specific so that we don't count range resolving requests, and we dedupe
+	// scans from the same key as the DistSender retries scans when it detects
+	// splits.
+	re := regexp.MustCompile(fmt.Sprintf(`querying next range at /Table/%d/1(\S.*)?`, tableDesc.ID))
+	spans := tracing.GetRecording(sp)
+	ranges := make(map[string]struct{})
+	for _, span := range spans {
+		if span.Operation == tableReaderProcName {
+			// Verify that stat collection lines up with results.
+			trs := TableReaderStats{}
+			if err := types.UnmarshalAny(span.Stats, &trs); err != nil {
+				t.Fatal(err)
+			}
+			if trs.InputStats.NumRows != limit {
+				t.Fatalf("read %d rows, but stats only counted: %d", limit, trs.InputStats.NumRows)
+			}
+		}
+		for _, l := range span.Logs {
+			for _, f := range l.Fields {
+				match := re.FindStringSubmatch(f.Value)
+				if match == nil {
+					continue
+				}
+				ranges[match[1]] = struct{}{}
+			}
+		}
+	}
+	if len(ranges) != 1 {
+		t.Fatalf("expected one ranges scanned, got: %d (%+v)", len(ranges), ranges)
+	}
+}
+
+func BenchmarkTableReader(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	logScope := log.Scope(b)
+	defer logScope.Close(b)
+
+	s, sqlDB, kvDB := serverutils.StartServer(b, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	evalCtx := tree.MakeTestingEvalContext(s.ClusterSettings())
+	defer evalCtx.Stop(context.Background())
+
+	flowCtx := FlowCtx{
+		EvalCtx:  evalCtx,
+		Settings: s.ClusterSettings(),
+		txn:      client.NewTxn(s.DB(), s.NodeID(), client.RootTxn),
+		nodeID:   s.NodeID(),
+	}
+
+	const numCols = 2
+	for _, numRows := range []int{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+		tableName := fmt.Sprintf("t%d", numRows)
+		sqlutils.CreateTable(
+			b, sqlDB, tableName,
+			"k INT PRIMARY KEY, v INT",
+			numRows,
+			sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(42)),
+		)
+		tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", tableName)
+		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
+			spec := TableReaderSpec{
+				Table: *tableDesc,
+				Spans: []TableReaderSpan{{Span: tableDesc.PrimaryIndexSpan()}},
+			}
+			post := PostProcessSpec{}
+
+			b.SetBytes(int64(numRows * numCols * 8))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				tr, err := newTableReader(&flowCtx, 0 /* processorID */, &spec, &post, nil /* output */)
+				if err != nil {
+					b.Fatal(err)
+				}
+				tr.Start(context.Background())
+				for {
+					row, meta := tr.Next()
+					if meta != nil && meta.TxnMeta == nil {
+						b.Fatalf("unexpected metadata: %+v", meta)
+					}
+					if row == nil {
+						break
+					}
+				}
+			}
+		})
 	}
 }

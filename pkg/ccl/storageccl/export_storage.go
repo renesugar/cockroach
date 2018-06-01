@@ -104,6 +104,14 @@ func ExportStorageConfFromURI(path string) (roachpb.ExportStorage, error) {
 			return conf, errors.Errorf("s3 uri missing %q parameter", S3SecretParam)
 		}
 		conf.S3Config.Prefix = strings.TrimLeft(conf.S3Config.Prefix, "/")
+		// AWS secrets often contain + characters, which must be escaped when
+		// included in a query string; otherwise, they represent a space character.
+		// More than a few users have been bitten by this.
+		//
+		// Luckily, AWS secrets are base64-encoded data and thus will never actually
+		// contain spaces. We can convert any space characters we see to +
+		// characters to recover the original secret.
+		conf.S3Config.Secret = strings.Replace(conf.S3Config.Secret, " ", "+", -1)
 	case "gs":
 		conf.Provider = roachpb.ExportStorageProvider_GoogleCloud
 		conf.GoogleCloudConfig = &roachpb.ExportStorage_GCS{
@@ -230,7 +238,7 @@ var (
 	timeoutSetting = settings.RegisterDurationSetting(
 		cloudStorageTimeout,
 		"the timeout for import/export storage operations",
-		30*time.Minute)
+		10*time.Minute)
 )
 
 type localFileStorage struct {
@@ -655,14 +663,15 @@ func makeGCSStorage(
 }
 
 func (g *gcsStorage) WriteFile(ctx context.Context, basename string, content io.ReadSeeker) error {
-	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&g.settings.SV))
-	defer cancel()
 	const maxAttempts = 3
 	err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxAttempts, func() error {
+		// Set the timeout within the retry loop.
+		deadlineCtx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&g.settings.SV))
+		defer cancel()
 		if _, err := content.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(ctx)
+		w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(deadlineCtx)
 		if _, err := io.Copy(w, content); err != nil {
 			_ = w.Close()
 			return err
@@ -737,8 +746,6 @@ func (s *azureStorage) Conf() roachpb.ExportStorage {
 func (s *azureStorage) WriteFile(
 	ctx context.Context, basename string, content io.ReadSeeker,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
-	defer cancel()
 	name := path.Join(s.prefix, basename)
 	// A blob in Azure is composed of an ordered list of blocks. To create a
 	// blob, we must first create an empty block blob (i.e., a blob backed
@@ -754,7 +761,7 @@ func (s *azureStorage) WriteFile(
 
 	blob := s.container.GetBlobReference(name)
 
-	writeFile := func() error {
+	writeFile := func(ctx context.Context) error {
 		if err := retry.WithMaxAttempts(ctx, base.DefaultRetryOptions(), maxAttempts, func() error {
 			return blob.CreateBlockBlob(nil)
 		}); err != nil {
@@ -806,7 +813,10 @@ func (s *azureStorage) WriteFile(
 		if _, err := content.Seek(0, io.SeekStart); err != nil {
 			return errors.Wrap(err, "seek")
 		}
-		return writeFile()
+		// Set the timeout within the retry loop.
+		deadlineCtx, cancel := context.WithTimeout(ctx, timeoutSetting.Get(&s.settings.SV))
+		defer cancel()
+		return writeFile(deadlineCtx)
 	})
 	return errors.Wrap(err, "write file")
 }

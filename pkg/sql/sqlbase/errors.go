@@ -121,15 +121,6 @@ func IsCCLRequiredError(err error) bool {
 	return errHasCode(err, CodeCCLRequired)
 }
 
-// IsPermanentSchemaChangeError returns true if the error results in
-// a permanent failure of a schema change.
-func IsPermanentSchemaChangeError(err error) bool {
-	return errHasCode(err, pgerror.CodeNotNullViolationError) ||
-		errHasCode(err, pgerror.CodeUniqueViolationError) ||
-		errHasCode(err, pgerror.CodeInvalidSchemaDefinitionError) ||
-		errHasCode(err, CodeCCLRequired)
-}
-
 // NewUndefinedDatabaseError creates an error that represents a missing database.
 func NewUndefinedDatabaseError(name string) error {
 	// Postgres will return an UndefinedTable error on queries that go to a "relation"
@@ -206,6 +197,19 @@ func NewWindowingError(in string) error {
 	return pgerror.NewErrorf(pgerror.CodeWindowingError, "window functions are not allowed in %s", in)
 }
 
+// NewWindowInAggError creates an error for the case when a window function is
+// nested within an aggregate function.
+func NewWindowInAggError() error {
+	return pgerror.NewErrorf(pgerror.CodeGroupingError,
+		"aggregate function calls cannot contain window function calls")
+}
+
+// NewAggInAggError creates an error for the case when an aggregate function is
+// contained within another aggregate function.
+func NewAggInAggError() error {
+	return pgerror.NewErrorf(pgerror.CodeGroupingError, "aggregate function calls cannot be nested")
+}
+
 // NewStatementCompletionUnknownError creates an error with the corresponding pg
 // code. This is used to inform the client that it's unknown whether a statement
 // succeeded or not. Of particular interest to clients is when this error is
@@ -224,11 +228,11 @@ func NewStatementCompletionUnknownError(err error) error {
 }
 
 // QueryCanceledError is an error representing query cancellation.
-var QueryCanceledError error = pgerror.NewErrorf(
+var QueryCanceledError = pgerror.NewErrorf(
 	pgerror.CodeQueryCanceledError, "query execution canceled")
 
 // QueryTimeoutError is an error representing a query timeout.
-var QueryTimeoutError error = pgerror.NewErrorf(
+var QueryTimeoutError = pgerror.NewErrorf(
 	pgerror.CodeQueryCanceledError, "query execution canceled due to statement timeout")
 
 // IsQueryCanceledError checks whether this is a query canceled error.
@@ -236,9 +240,13 @@ func IsQueryCanceledError(err error) bool {
 	return errHasCode(err, pgerror.CodeQueryCanceledError)
 }
 
-func errHasCode(err error, code string) bool {
+func errHasCode(err error, code ...string) bool {
 	if pgErr, ok := pgerror.GetPGCause(err); ok {
-		return pgErr.Code == code
+		for _, c := range code {
+			if pgErr.Code == c {
+				return true
+			}
+		}
 	}
 	return false
 }

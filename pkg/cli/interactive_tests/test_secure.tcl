@@ -69,9 +69,21 @@ send "\\q\r"
 eexpect $prompt
 end_test
 
+start_test "Can create users without passwords."
+send "$argv user set testuser --certs-dir=$certs_dir\r"
+eexpect $prompt
+end_test
+
+start_test "Passwords are not requested when a certificate for the user exists"
+send "$argv sql --user=testuser --certs-dir=$certs_dir\r"
+eexpect "testuser@"
+send "\\q\r"
+eexpect $prompt
+end_test
+
 start_test "Check that root cannot use password."
 # Run as root but with a non-existent certs directory.
-send "$argv sql --certs-dir=non-existent-dir\r"
+send "$argv sql --url='postgresql://root@localhost:26257?sslmode=verify-full'\r"
 eexpect "Error: connections with user root must use a client certificate"
 eexpect "Failed running \"sql\""
 end_test

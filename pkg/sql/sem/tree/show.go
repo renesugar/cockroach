@@ -318,7 +318,7 @@ func (node *ShowRoles) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ROLES")
 }
 
-// ShowRanges represents a SHOW TESTING_RANGES statement.
+// ShowRanges represents a SHOW EXPERIMENTAL_RANGES statement.
 // Only one of Table and Index can be set.
 type ShowRanges struct {
 	Table *NormalizableTableName
@@ -327,7 +327,7 @@ type ShowRanges struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowRanges) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW TESTING_RANGES FROM ")
+	ctx.WriteString("SHOW EXPERIMENTAL_RANGES FROM ")
 	if node.Index != nil {
 		ctx.WriteString("INDEX ")
 		ctx.FormatNode(node.Index)
@@ -350,12 +350,17 @@ func (node *ShowFingerprints) Format(ctx *FmtCtx) {
 
 // ShowTableStats represents a SHOW STATISTICS FOR TABLE statement.
 type ShowTableStats struct {
-	Table NormalizableTableName
+	Table     NormalizableTableName
+	UsingJSON bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTableStats) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW STATISTICS FOR TABLE ")
+	ctx.WriteString("SHOW STATISTICS ")
+	if node.UsingJSON {
+		ctx.WriteString("USING JSON ")
+	}
+	ctx.WriteString("FOR TABLE ")
 	ctx.FormatNode(&node.Table)
 }
 

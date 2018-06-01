@@ -131,27 +131,53 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *ordinalityNode:
 		p.applyLimit(n.source, numRows, soft)
 
+	case *spoolNode:
+		if !soft {
+			n.hardLimit = numRows
+		}
+		p.applyLimit(n.source, numRows, soft)
+
 	case *delayedNode:
 		if n.plan != nil {
 			p.applyLimit(n.plan, numRows, soft)
 		}
 
+	case *rowCountNode:
+		p.setUnlimited(n.source)
+	case *serializeNode:
+		p.setUnlimited(n.source)
 	case *deleteNode:
-		p.setUnlimited(n.run.rows)
+		// A limit does not propagate into a mutation. When there is a
+		// surrounding query, the mutation must run to completion even if
+		// the surrounding query only uses parts of its results.
+		p.setUnlimited(n.source)
 	case *updateNode:
-		p.setUnlimited(n.run.rows)
+		// A limit does not propagate into a mutation. When there is a
+		// surrounding query, the mutation must run to completion even if
+		// the surrounding query only uses parts of its results.
+		p.setUnlimited(n.source)
 	case *insertNode:
-		p.setUnlimited(n.run.rows)
+		// A limit does not propagate into a mutation. When there is a
+		// surrounding query, the mutation must run to completion even if
+		// the surrounding query only uses parts of its results.
+		p.setUnlimited(n.source)
 	case *upsertNode:
-		p.setUnlimited(n.run.rows)
+		// A limit does not propagate into a mutation. When there is a
+		// surrounding query, the mutation must run to completion even if
+		// the surrounding query only uses parts of its results.
+		p.setUnlimited(n.source)
 	case *createTableNode:
 		if n.sourcePlan != nil {
 			p.applyLimit(n.sourcePlan, numRows, soft)
 		}
+	case *distSQLWrapper:
+		p.applyLimit(n.plan, numRows, soft)
 	case *explainDistSQLNode:
 		p.setUnlimited(n.plan)
 	case *showTraceNode:
-		p.setUnlimited(n.plan)
+		if n.plan != nil {
+			p.setUnlimited(n.plan)
+		}
 	case *showTraceReplicaNode:
 		p.setUnlimited(n.plan)
 	case *explainPlanNode:
@@ -165,14 +191,21 @@ func (p *planner) applyLimit(plan planNode, numRows int64, soft bool) {
 	case *testingRelocateNode:
 		p.setUnlimited(n.rows)
 
+	case *cancelQueriesNode:
+		p.setUnlimited(n.rows)
+
+	case *cancelSessionsNode:
+		p.setUnlimited(n.rows)
+
+	case *controlJobsNode:
+		p.setUnlimited(n.rows)
+
 	case *valuesNode:
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
 	case *scrubNode:
-	case *controlJobNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:

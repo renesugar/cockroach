@@ -18,7 +18,14 @@ import (
 	"strings"
 )
 
-// PgCatalogName is the name of the pg_catalog system database.
+// PgDatabaseName is the name of the default postgres system database.
+const PgDatabaseName = "postgres"
+
+// DefaultDatabaseName is the name ofthe default CockroachDB database used
+// for connections without a current db set.
+const DefaultDatabaseName = "defaultdb"
+
+// PgCatalogName is the name of the pg_catalog system schema.
 const PgCatalogName = "pg_catalog"
 
 // SearchPath represents a list of namespaces to search builtins in.
@@ -41,16 +48,6 @@ func MakeSearchPath(paths []string) SearchPath {
 		paths:             paths,
 		containsPgCatalog: containsPgCatalog,
 	}
-}
-
-// FirstSpecified returns true and the first element if the list of
-// specified items is non-empty, or false and an empty string
-// otherwise.  Used by current_schema().
-func (s SearchPath) FirstSpecified() (bool, string) {
-	if len(s.paths) == 0 {
-		return false, ""
-	}
-	return true, s.paths[0]
 }
 
 // Iter returns an iterator through the search path. We must include the

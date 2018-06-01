@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -50,6 +51,7 @@ import (
 var (
 	errIntOutOfRange   = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "integer out of range")
 	errFloatOutOfRange = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "float out of range")
+	errDecOutOfRange   = pgerror.NewError(pgerror.CodeNumericValueOutOfRangeError, "decimal out of range")
 
 	// ErrDivByZero is reported on a division by zero.
 	ErrDivByZero = pgerror.NewError(pgerror.CodeDivisionByZeroError, "division by zero")
@@ -203,7 +205,7 @@ func (op BinOp) params() TypeList {
 }
 
 func (op BinOp) matchParams(l, r types.T) bool {
-	return op.params().matchAt(l, 0) && op.params().matchAt(r, 1)
+	return op.params().MatchAt(l, 0) && op.params().MatchAt(r, 1)
 }
 
 func (op BinOp) returnType() ReturnTyper {
@@ -344,17 +346,6 @@ func (o binOpOverload) lookupImpl(left, right types.T) (BinOp, bool) {
 	return BinOp{}, false
 }
 
-// AddWithOverflow returns a+b. If ok is false, a+b overflowed.
-func AddWithOverflow(a, b int64) (r int64, ok bool) {
-	if b > 0 && a > math.MaxInt64-b {
-		return 0, false
-	}
-	if b < 0 && a < math.MinInt64-b {
-		return 0, false
-	}
-	return a + b, true
-}
-
 // getJSONPath is used for the #> and #>> operators.
 func getJSONPath(j DJSON, ary DArray) (Datum, error) {
 	// TODO(justin): this is slightly annoying because we have to allocate
@@ -437,7 +428,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Int,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				a, b := MustBeDInt(left), MustBeDInt(right)
-				r, ok := AddWithOverflow(int64(a), int64(b))
+				r, ok := arith.AddWithOverflow(int64(a), int64(b))
 				if !ok {
 					return nil, errIntOutOfRange
 				}
@@ -542,6 +533,64 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				t := timeofday.TimeOfDay(*right.(*DTime))
 				return MakeDTime(t.Add(left.(*DInterval).Duration)), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.Date,
+			RightType:  types.TimeTZ,
+			ReturnType: types.TimestampTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				d := MakeDTimestampTZFromDate(right.(*DTimeTZ).Location, left.(*DDate))
+				t := time.Duration(right.(*DTimeTZ).TimeOfDay) * time.Microsecond
+				return MakeDTimestampTZ(d.Add(t), time.Microsecond), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Date,
+			ReturnType: types.TimestampTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				d := MakeDTimestampTZFromDate(left.(*DTimeTZ).Location, right.(*DDate))
+				t := time.Duration(left.(*DTimeTZ).TimeOfDay) * time.Microsecond
+				return MakeDTimestampTZ(d.Add(t), time.Microsecond), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Interval,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := left.(*DTimeTZ).TimeOfDay
+				return MakeDTimeTZ(t.Add(right.(*DInterval).Duration), left.(*DTimeTZ).Location), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.Interval,
+			RightType:  types.TimeTZ,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := right.(*DTimeTZ).TimeOfDay
+				return MakeDTimeTZ(t.Add(left.(*DInterval).Duration), right.(*DTimeTZ).Location), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Time,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t1 := left.(*DTimeTZ).TimeOfDay
+				t2 := timeofday.TimeOfDay(*right.(*DTime))
+				return MakeDTimeTZ(timeofday.FromInt(int64(t1+t2)), left.(*DTimeTZ).Location), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.Time,
+			RightType:  types.TimeTZ,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t1 := right.(*DTimeTZ).TimeOfDay
+				t2 := timeofday.TimeOfDay(*left.(*DTime))
+				return MakeDTimeTZ(timeofday.FromInt(int64(t1+t2)), right.(*DTimeTZ).Location), nil
 			},
 		},
 		BinOp{
@@ -730,6 +779,26 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			},
 		},
 		BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Time,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t1 := left.(*DTimeTZ).TimeOfDay
+				t2 := timeofday.TimeOfDay(*right.(*DTime))
+				diff := timeofday.FromInt(int64(t1 - t2))
+				return MakeDTimeTZ(diff, left.(*DTimeTZ).Location), nil
+			},
+		},
+		BinOp{
+			LeftType:   types.TimeTZ,
+			RightType:  types.Interval,
+			ReturnType: types.TimeTZ,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				t := left.(*DTimeTZ).TimeOfDay
+				return MakeDTimeTZ(t.Add(right.(*DInterval).Duration.Mul(-1)), left.(*DTimeTZ).Location), nil
+			},
+		},
+		BinOp{
 			LeftType:   types.Timestamp,
 			RightType:  types.Timestamp,
 			ReturnType: types.Interval,
@@ -814,7 +883,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			RightType:  types.String,
 			ReturnType: types.JSON,
 			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
-				j, _, err := left.(*DJSON).JSON.RemoveKey(string(MustBeDString(right)))
+				j, _, err := left.(*DJSON).JSON.RemoveString(string(MustBeDString(right)))
 				if err != nil {
 					return nil, err
 				}
@@ -829,6 +898,24 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				j, _, err := left.(*DJSON).JSON.RemoveIndex(int(MustBeDInt(right)))
 				if err != nil {
 					return nil, err
+				}
+				return &DJSON{j}, nil
+			},
+		},
+		BinOp{
+			LeftType:   types.JSON,
+			RightType:  types.TArray{Typ: types.String},
+			ReturnType: types.JSON,
+			fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
+				j := left.(*DJSON).JSON
+				arr := *MustBeDArray(right)
+
+				for _, str := range arr.Array {
+					var err error
+					j, _, err = j.RemoveString(string(MustBeDString(str)))
+					if err != nil {
+						return nil, err
+					}
 				}
 				return &DJSON{j}, nil
 			},
@@ -1504,7 +1591,7 @@ func (op CmpOp) params() TypeList {
 }
 
 func (op CmpOp) matchParams(l, r types.T) bool {
-	return op.params().matchAt(l, 0) && op.params().matchAt(r, 1)
+	return op.params().MatchAt(l, 0) && op.params().MatchAt(r, 1)
 }
 
 var cmpOpReturnType = FixedReturnType(types.Bool)
@@ -1599,6 +1686,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeEqFn(types.Oid, types.Oid),
 		makeEqFn(types.String, types.String),
 		makeEqFn(types.Time, types.Time),
+		makeEqFn(types.TimeTZ, types.TimeTZ),
 		makeEqFn(types.Timestamp, types.Timestamp),
 		makeEqFn(types.TimestampTZ, types.TimestampTZ),
 		makeEqFn(types.UUID, types.UUID),
@@ -1616,6 +1704,8 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeEqFn(types.Timestamp, types.TimestampTZ),
 		makeEqFn(types.TimestampTZ, types.Date),
 		makeEqFn(types.TimestampTZ, types.Timestamp),
+		makeEqFn(types.TimeTZ, types.Time),
+		makeEqFn(types.Time, types.TimeTZ),
 
 		// Tuple comparison.
 		CmpOp{
@@ -1641,6 +1731,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLtFn(types.Oid, types.Oid),
 		makeLtFn(types.String, types.String),
 		makeLtFn(types.Time, types.Time),
+		makeLtFn(types.TimeTZ, types.TimeTZ),
 		makeLtFn(types.Timestamp, types.Timestamp),
 		makeLtFn(types.TimestampTZ, types.TimestampTZ),
 		makeLtFn(types.UUID, types.UUID),
@@ -1658,6 +1749,8 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLtFn(types.Timestamp, types.TimestampTZ),
 		makeLtFn(types.TimestampTZ, types.Date),
 		makeLtFn(types.TimestampTZ, types.Timestamp),
+		makeLtFn(types.TimeTZ, types.Time),
+		makeLtFn(types.Time, types.TimeTZ),
 
 		// Tuple comparison.
 		CmpOp{
@@ -1683,6 +1776,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLeFn(types.Oid, types.Oid),
 		makeLeFn(types.String, types.String),
 		makeLeFn(types.Time, types.Time),
+		makeLeFn(types.TimeTZ, types.TimeTZ),
 		makeLeFn(types.Timestamp, types.Timestamp),
 		makeLeFn(types.TimestampTZ, types.TimestampTZ),
 		makeLeFn(types.UUID, types.UUID),
@@ -1700,6 +1794,8 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeLeFn(types.Timestamp, types.TimestampTZ),
 		makeLeFn(types.TimestampTZ, types.Date),
 		makeLeFn(types.TimestampTZ, types.Timestamp),
+		makeLeFn(types.TimeTZ, types.Time),
+		makeLeFn(types.Time, types.TimeTZ),
 
 		// Tuple comparison.
 		CmpOp{
@@ -1734,6 +1830,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeIsFn(types.Oid, types.Oid),
 		makeIsFn(types.String, types.String),
 		makeIsFn(types.Time, types.Time),
+		makeIsFn(types.TimeTZ, types.TimeTZ),
 		makeIsFn(types.Timestamp, types.Timestamp),
 		makeIsFn(types.TimestampTZ, types.TimestampTZ),
 		makeIsFn(types.UUID, types.UUID),
@@ -1751,6 +1848,8 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeIsFn(types.Timestamp, types.TimestampTZ),
 		makeIsFn(types.TimestampTZ, types.Date),
 		makeIsFn(types.TimestampTZ, types.Timestamp),
+		makeIsFn(types.TimeTZ, types.Time),
+		makeIsFn(types.Time, types.TimeTZ),
 
 		// Tuple comparison.
 		CmpOp{
@@ -1780,6 +1879,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 		makeEvalTupleIn(types.Oid),
 		makeEvalTupleIn(types.String),
 		makeEvalTupleIn(types.Time),
+		makeEvalTupleIn(types.TimeTZ),
 		makeEvalTupleIn(types.Timestamp),
 		makeEvalTupleIn(types.TimestampTZ),
 		makeEvalTupleIn(types.UUID),
@@ -2201,20 +2301,31 @@ type EvalDatabase interface {
 	// sets it on the returned TableName.
 	// It returns an error if the table doesn't exist.
 	ResolveTableName(ctx context.Context, tn *TableName) error
+
+	// LookupSchema looks up the schema with the given name in the given
+	// database.
+	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
 }
 
 // EvalPlanner is a limited planner that can be used from EvalContext.
 type EvalPlanner interface {
 	EvalDatabase
-	// QueryRow executes a SQL query string where exactly 1 result row is
-	// expected and returns that row.
-	QueryRow(ctx context.Context, sql string, args ...interface{}) (Datums, error)
-
 	// ParseType parses a column type.
 	ParseType(sql string) (coltypes.CastTargetType, error)
 
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *Subquery) (Datum, error)
+}
+
+// SessionBoundInternalExecutor is a subset of sqlutil.InternalExecutor used by
+// this sem/tree package which can't even import sqlutil. Executor used through
+// this interface are always "session-bound" - they inherit session variables
+// from a parent session.
+type SessionBoundInternalExecutor interface {
+	// QueryRow is part of the sqlutil.InternalExecutor interface.
+	QueryRow(
+		ctx context.Context, opName string, txn *client.Txn, stmt string, qargs ...interface{},
+	) (Datums, error)
 }
 
 // SequenceOperators is used for various sql related functions that can
@@ -2238,20 +2349,29 @@ type SequenceOperators interface {
 }
 
 // CtxProvider is anything that can return a Context.
+//
+// TODO(andrei): I think this whole CtxProvider business might not be needed any
+// more. I think it was needed back in the day to indirect dereferencing a
+// context to a session, whose context used to change willy-nilly when entering
+// and exiting a transaction. More recently, the points where that context
+// changes are clear; uses of an EvalContext don't straddle context changes, so
+// we should bind EvalCtx.Ctx to a context.Context directly.
 type CtxProvider interface {
 	// Ctx returns this provider's context.
 	Ctx() context.Context
 }
 
-// backgroundCtxProvider returns the background context.
-type backgroundCtxProvider struct{}
-
-// Ctx implements CtxProvider.
-func (s backgroundCtxProvider) Ctx() context.Context {
-	return context.Background()
+// FixedCtxProvider returns a given Context.
+type FixedCtxProvider struct {
+	context.Context
 }
 
-var _ CtxProvider = backgroundCtxProvider{}
+// Ctx implements CtxProvider.
+func (s FixedCtxProvider) Ctx() context.Context {
+	return s.Context
+}
+
+var _ CtxProvider = FixedCtxProvider{}
 
 // EvalContextTestingKnobs contains test knobs.
 type EvalContextTestingKnobs struct {
@@ -2293,9 +2413,6 @@ type EvalContext struct {
 	// Session variables. This is a read-only copy of the values owned by the
 	// Session.
 	SessionData *sessiondata.SessionData
-	// ApplicationName is a session variable, but it is not part of SessionData.
-	// See its definition in Session for details.
-	ApplicationName string
 	// TxnState is a string representation of the current transactional state.
 	TxnState string
 	// TxnReadOnly specifies if the current transaction is read-only.
@@ -2335,6 +2452,13 @@ type EvalContext struct {
 	// and also at the time of writing, EvalContexts are initialized with the
 	// planner and not mutated.
 	CtxProvider CtxProvider
+
+	// InternalExecutor gives access to an executor to be used for running
+	// "internal" statements. It may seem bizarre that "expression evaluation" may
+	// need to run a statement, and yet many builting function do it.
+	// Note that the executor will be "session-bound" - it will inherit session
+	// variables from a parent session.
+	InternalExecutor SessionBoundInternalExecutor
 
 	Planner EvalPlanner
 
@@ -2385,7 +2509,7 @@ func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 	)
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = &monitor
-	ctx.CtxProvider = backgroundCtxProvider{}
+	ctx.CtxProvider = FixedCtxProvider{context.TODO()}
 	acc := monitor.MakeBoundAccount()
 	ctx.ActiveMemAcc = &acc
 	now := timeutil.Now()
@@ -2466,6 +2590,17 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 	// field appears as fractional part.
 	res.Decimal.Exponent = -10
 	return &res
+}
+
+// GetTxnTime retrieves the current transaction time as per
+// the evaluation context. The time is guaranteed to be nonzero.
+func (ctx *EvalContext) GetTxnTime() *DTimeTZ {
+	// TODO(knz): a zero timestamp should never be read, even during
+	// Prepare. This will need to be addressed.
+	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
+		panic("zero transaction timestamp in EvalContext")
+	}
+	return MakeDTimeTZ(timeofday.FromTime(ctx.TxnTimestamp), ctx.TxnTimestamp.Location())
 }
 
 // GetTxnTimestamp retrieves the current transaction timestamp as per
@@ -2668,8 +2803,9 @@ func queryOidWithJoin(
 	default:
 		panic(fmt.Sprintf("invalid argument to OID cast: %s", d))
 	}
-	results, err := ctx.Planner.QueryRow(
-		ctx.Ctx(),
+	results, err := ctx.InternalExecutor.QueryRow(
+		ctx.Ctx(), "queryOidWithJoin",
+		ctx.Txn,
 		fmt.Sprintf(
 			"SELECT %s.oid, %s FROM pg_catalog.%s %s WHERE %s = $1 %s",
 			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
@@ -2781,7 +2917,11 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DDate:
 			res = NewDInt(DInt(int64(*v)))
 		case *DInterval:
-			res = NewDInt(DInt(v.Nanos / 1000000000))
+			iv, ok := v.AsInt64()
+			if !ok {
+				return nil, errIntOutOfRange
+			}
+			res = NewDInt(DInt(iv))
 		case *DOid:
 			res = &v.DInt
 		}
@@ -2819,8 +2959,7 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		case *DDate:
 			return NewDFloat(DFloat(float64(*v))), nil
 		case *DInterval:
-			micros := v.Nanos / 1000
-			return NewDFloat(DFloat(float64(micros) / 1e6)), nil
+			return NewDFloat(DFloat(v.AsFloat64())), nil
 		}
 
 	case *coltypes.TDecimal:
@@ -2863,9 +3002,8 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			val.Add(val, big.NewInt(int64(micros)))
 			dd.Exponent = -6
 		case *DInterval:
-			val := &dd.Coeff
-			val.SetInt64(v.Nanos / 1000)
-			dd.Exponent = -6
+			v.AsBigInt(&dd.Coeff)
+			dd.Exponent = -9
 		default:
 			unset = true
 		}
@@ -2882,7 +3020,7 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		switch t := d.(type) {
 		case *DBool, *DInt, *DFloat, *DDecimal, dNull:
 			s = d.String()
-		case *DTimestamp, *DTimestampTZ, *DDate, *DTime:
+		case *DTimestamp, *DTimestampTZ, *DDate, *DTime, *DTimeTZ:
 			s = AsStringWithFlags(d, FmtBareStrings)
 		case *DInterval:
 			// When converting an interval to string, we need a string representation
@@ -2904,6 +3042,8 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			s = buf.String()
 		case *DOid:
 			s = t.name
+		case *DJSON:
+			s = t.JSON.String()
 		}
 		switch c := t.(type) {
 		case *coltypes.TString:
@@ -2980,12 +3120,28 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 			return ParseDTime(d.Contents)
 		case *DTime:
 			return d, nil
+		case *DTimeTZ:
+			return MakeDTime(d.TimeOfDay), nil
 		case *DTimestamp:
 			return MakeDTime(timeofday.FromTime(d.Time)), nil
 		case *DTimestampTZ:
 			return MakeDTime(timeofday.FromTime(d.Time)), nil
 		case *DInterval:
 			return MakeDTime(timeofday.Min.Add(d.Duration)), nil
+		}
+
+	case *coltypes.TTimeTZ:
+		switch d := d.(type) {
+		case *DString:
+			return ParseDTimeTZ(string(*d), ctx.GetLocation())
+		case *DCollatedString:
+			return ParseDTimeTZ(d.Contents, ctx.GetLocation())
+		case *DTime:
+			return MakeDTimeTZ(timeofday.TimeOfDay(*d), ctx.GetLocation()), nil
+		case *DTimeTZ:
+			return d, nil
+		case *DTimestampTZ:
+			return MakeDTimeTZ(timeofday.FromTime(d.Time), d.Time.Location()), nil
 		}
 
 	case *coltypes.TTimestamp:
@@ -3026,17 +3182,35 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 		}
 
 	case *coltypes.TInterval:
-		// TODO(knz): Interval from float, decimal.
 		switch v := d.(type) {
 		case *DString:
 			return ParseDInterval(string(*v))
 		case *DCollatedString:
 			return ParseDInterval(v.Contents)
 		case *DInt:
-			// An integer duration represents a duration in microseconds.
-			return &DInterval{Duration: duration.Duration{Nanos: int64(*v) * 1000}}, nil
+			return &DInterval{Duration: duration.FromInt64(int64(*v))}, nil
+		case *DFloat:
+			return &DInterval{Duration: duration.FromFloat64(float64(*v))}, nil
 		case *DTime:
 			return &DInterval{Duration: duration.Duration{Nanos: int64(*v) * 1000}}, nil
+		case *DDecimal:
+			d := ctx.getTmpDec()
+			dnanos := v.Decimal
+			dnanos.Exponent += 9
+			// We need HighPrecisionCtx because duration values can contain
+			// upward of 35 decimal digits and DecimalCtx only provides 25.
+			_, err := HighPrecisionCtx.Quantize(d, &dnanos, 0)
+			if err != nil {
+				return nil, err
+			}
+			if dnanos.Negative {
+				d.Coeff.Neg(&d.Coeff)
+			}
+			dv, ok := duration.FromBigInt(&d.Coeff)
+			if !ok {
+				return nil, errDecOutOfRange
+			}
+			return &DInterval{Duration: dv}, nil
 		case *DInterval:
 			return d, nil
 		}
@@ -3238,6 +3412,13 @@ func (expr *CollateExpr) Eval(ctx *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (expr *ColumnAccessExpr) Eval(ctx *EvalContext) (Datum, error) {
+	return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
+		"programmer error: column access expressions must be replaced before evaluation",
+	)
+}
+
+// Eval implements the TypedExpr interface.
 func (expr *CoalesceExpr) Eval(ctx *EvalContext) (Datum, error) {
 	for _, e := range expr.Exprs {
 		d, err := e.(TypedExpr).Eval(ctx)
@@ -3336,6 +3517,35 @@ func ensureExpectedType(exp types.T, d Datum) error {
 		return errors.Errorf("expected return type %q, got: %q", exp, d.ResolvedType())
 	}
 	return nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IfErrExpr) Eval(ctx *EvalContext) (Datum, error) {
+	cond, evalErr := expr.Cond.(TypedExpr).Eval(ctx)
+	if evalErr == nil {
+		if expr.Else == nil {
+			return DBoolFalse, nil
+		}
+		return cond, nil
+	}
+	if expr.ErrCode != nil {
+		errpat, err := expr.ErrCode.(TypedExpr).Eval(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if errpat == DNull {
+			return nil, evalErr
+		}
+		errpatStr := string(MustBeDString(errpat))
+		pqErr, ok := pgerror.GetPGCause(evalErr)
+		if !ok || pqErr.Code != errpatStr {
+			return nil, evalErr
+		}
+	}
+	if expr.Else == nil {
+		return DBoolTrue, nil
+	}
+	return expr.Else.(TypedExpr).Eval(ctx)
 }
 
 // Eval implements the TypedExpr interface.
@@ -3592,6 +3802,11 @@ func (t *DTime) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (t *DTimeTZ) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
 func (t *DFloat) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -3675,7 +3890,8 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	e, ok := ctx.Placeholders.Value(t.Name)
 	if !ok {
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "missing value for placeholder %s", t.Name)
+		return nil, pgerror.NewErrorf(pgerror.CodeUndefinedParameterError,
+			"no value provided for placeholder: $%s", t.Name)
 	}
 	// Placeholder expressions cannot contain other placeholders, so we do
 	// not need to recurse.
@@ -3757,6 +3973,22 @@ func foldComparisonExpr(
 	return op, left, right, false, false
 }
 
+// hasUnescapedSuffix returns true if the ending byte is suffix and s has an
+// even number of escapeTokens preceding suffix. Otherwise hasUnescapedSuffix
+// will return false.
+func hasUnescapedSuffix(s string, suffix byte, escapeToken string) bool {
+	if s[len(s)-1] == suffix {
+		var count int
+		idx := len(s) - len(escapeToken) - 1
+		for idx >= 0 && s[idx:idx+len(escapeToken)] == escapeToken {
+			count++
+			idx -= len(escapeToken)
+		}
+		return count%2 == 0
+	}
+	return false
+}
+
 // Simplifies LIKE/ILIKE expressions that do not need full regular expressions to
 // evaluate the condition. For example, when the expression is just checking to see
 // if a string starts with a given pattern.
@@ -3779,13 +4011,14 @@ func optimizedLikeFunc(pattern string, caseInsensitive bool) (func(string) bool,
 		}
 	default:
 		if !strings.ContainsAny(pattern[1:len(pattern)-1], "_%") {
-			// Cases like "something\%" are not optimized, but this does not affect correctness.
-			anyEnd := pattern[len(pattern)-1] == '%' && pattern[len(pattern)-2] != '\\'
+			// Patterns with even number of `\` preceding the ending `%` will have
+			// anyEnd set to true. Otherwise anyEnd will be set to false.
+			anyEnd := hasUnescapedSuffix(pattern, '%', `\`)
 			anyStart := pattern[0] == '%'
 
-			// singleAnyEnd and anyEnd are mutually exclusive
-			// (similarly with Start).
-			singleAnyEnd := pattern[len(pattern)-1] == '_' && pattern[len(pattern)-2] != '\\'
+			// Patterns with even number of `\` preceding the ending `_` will have
+			// singleAnyEnd set to true. Otherwise singleAnyEnd will be set to false.
+			singleAnyEnd := hasUnescapedSuffix(pattern, '_', `\`)
 			singleAnyStart := pattern[0] == '_'
 
 			// Since we've already checked for escaped characters

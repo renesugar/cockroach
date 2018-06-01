@@ -1,5 +1,6 @@
 import React from "react";
-import { RouterState, Link } from "react-router";
+import { Helmet } from "react-helmet";
+import { Link, RouterState } from "react-router";
 import { connect } from "react-redux";
 
 import "./sqlhighlight.styl";
@@ -17,13 +18,7 @@ import { SortSetting } from "src/views/shared/components/sortabletable";
 import { SortedTable } from "src/views/shared/components/sortedtable";
 import * as hljs from "highlight.js";
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-export const GrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties>;
+class GrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.TableDetailsResponse.Grant$Properties> {}
 
 const databaseTableGrantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "tableDetails/sort_setting/grants", (s) => s.localSettings,
@@ -77,17 +72,26 @@ class TableMain extends React.Component<TableMainProps, {}> {
     hljs.highlightBlock(this.createStmtNode);
   }
 
+  componentDidUpdate() {
+    hljs.highlightBlock(this.createStmtNode);
+  }
+
   render() {
     const { tableInfo, grantsSortSetting } = this.props;
 
+    const title = this.props.params[databaseNameAttr] + "." + this.props.params[tableNameAttr];
+
     if (tableInfo) {
       return <div>
-        <section className="section parent-link">
-          <Link to="/databases/tables">&lt; Back to Databases</Link>
-        </section>
+        <Helmet>
+          <title>{`${title} Table | Databases`}</title>
+        </Helmet>
         <section className="section">
+          <section className="section parent-link">
+            <Link to="/databases/tables">&lt; Back to Databases</Link>
+          </section>
           <div className="database-summary-title">
-            <h2>{ this.props.params[tableNameAttr] }</h2>
+            <h2>{ title }</h2>
           </div>
           <div className="content l-columns">
             <div className="l-columns__left">
@@ -139,7 +143,7 @@ class TableMain extends React.Component<TableMainProps, {}> {
  *         SELECTORS
  */
 
-function tableInfo(state: AdminUIState, props: RouterState): TableInfo {
+function selectTableInfo(state: AdminUIState, props: RouterState): TableInfo {
   const db = props.params[databaseNameAttr];
   const table = props.params[tableNameAttr];
   const details = state.cachedData.tableDetails[generateTableID(db, table)];
@@ -151,7 +155,7 @@ function tableInfo(state: AdminUIState, props: RouterState): TableInfo {
 const tableMainConnected = connect(
   (state: AdminUIState, ownProps: RouterState) => {
     return {
-      tableInfo: tableInfo(state, ownProps),
+      tableInfo: selectTableInfo(state, ownProps),
       grantsSortSetting: databaseTableGrantsSortSetting.selector(state),
     };
   },

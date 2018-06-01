@@ -1,4 +1,4 @@
-# LogicTest: default distsql
+# LogicTest: default opt distsql distsql-opt distsql-metadata
 
 query error database "crdb_internal" does not exist
 ALTER DATABASE crdb_internal RENAME TO not_crdb_internal
@@ -19,6 +19,7 @@ cluster_sessions
 cluster_settings
 create_statements
 forward_dependencies
+gossip_alerts
 gossip_liveness
 gossip_nodes
 index_columns
@@ -27,6 +28,7 @@ kv_node_status
 kv_store_status
 leases
 node_build_info
+node_metrics
 node_queries
 node_runtime_info
 node_sessions
@@ -146,25 +148,25 @@ SELECT * FROM crdb_internal.cluster_queries WHERE node_id < 0
 ----
 query_id  node_id  username  start  query  client_address  application_name  distributed  phase
 
-query ITTTTTTTT colnames
+query ITTTTTTTTT colnames
 SELECT * FROM crdb_internal.node_sessions WHERE node_id < 0
 ----
-node_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
+node_id  session_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
 
-query ITTTTTTTT colnames
+query ITTTTTTTTT colnames
 SELECT * FROM crdb_internal.cluster_sessions WHERE node_id < 0
 ----
-node_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
+node_id  session_id  username  client_address  application_name  active_queries  last_active_query  session_start  oldest_query_start  kv_txn
 
 query TTTT colnames
 SELECT * FROM crdb_internal.builtin_functions WHERE function = ''
 ----
 function  signature  category  details
 
-query ITTITTTT colnames
+query ITTITTTTTTT colnames
 SELECT * FROM crdb_internal.create_statements WHERE database_name = ''
 ----
-database_id  database_name  schema_name descriptor_id  descriptor_type  descriptor_name  create_statement  state
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name  create_statement  state  create_nofks  alter_statements  validate_statements
 
 query ITITTBTB colnames
 SELECT * FROM crdb_internal.table_columns WHERE descriptor_name = ''
@@ -200,8 +202,8 @@ statement ok
 INSERT INTO system.zones (id, config) VALUES
   (17, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0)),
   (18, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0)),
-  (51, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0)),
-  (52, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0))
+  (53, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0)),
+  (54, (SELECT config_proto FROM crdb_internal.zones WHERE id = 0))
 
 query IT
 SELECT id, cli_specifier FROM crdb_internal.zones ORDER BY id
@@ -212,8 +214,8 @@ SELECT id, cli_specifier FROM crdb_internal.zones ORDER BY id
 17  .system
 18  .timeseries
 22  .liveness
-51  testdb
-52  testdb.foo
+53  testdb
+54  testdb.foo
 
 query error pq: foo
 SELECT crdb_internal.force_error('', 'foo')
@@ -242,18 +244,18 @@ select crdb_internal.set_vmodule('')
 query T
 select crdb_internal.node_executable_version()
 ----
-2.0-1
+2.0-5
 
 query ITTT colnames
 select node_id, component, field, regexp_replace(regexp_replace(value, '^\d+$', '<port>'), e':\\d+', ':<port>') as value from crdb_internal.node_runtime_info
 ----
 node_id  component  field   value
-1        DB         URL     postgresql://root@127.0.0.1:<port>?application_name=cockroach&sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
+1        DB         URL     postgresql://root@127.0.0.1:<port>?sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
 1        DB         Scheme  postgresql
 1        DB         User    root
 1        DB         Host    127.0.0.1
 1        DB         Port    <port>
-1        DB         URI     /?application_name=cockroach&sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
+1        DB         URI     /?sslcert=test_certs%2Fclient.root.crt&sslkey=test_certs%2Fclient.root.key&sslmode=verify-full&sslrootcert=test_certs%2Fca.crt
 1        UI         URL     https://127.0.0.1:<port>
 1        UI         Scheme  https
 1        UI         User    ·
@@ -314,14 +316,20 @@ select * from crdb_internal.gossip_nodes
 query error pq: only superusers are allowed to read crdb_internal.gossip_liveness
 select * from crdb_internal.gossip_liveness
 
+query error pq: only superusers are allowed to read crdb_internal.node_metrics
+select * from crdb_internal.node_metrics
+
 query error pq: only superusers are allowed to read crdb_internal.kv_node_status
 select * from crdb_internal.kv_node_status
 
 query error pq: only superusers are allowed to read crdb_internal.kv_store_status
 select * from crdb_internal.kv_store_status
 
+query error pq: only superusers are allowed to read crdb_internal.gossip_alerts
+select * from crdb_internal.gossip_alerts
+
 # Anyone can see the executable version.
 query T
 select crdb_internal.node_executable_version()
 ----
-2.0-1
+2.0-5

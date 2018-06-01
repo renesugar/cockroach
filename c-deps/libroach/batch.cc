@@ -171,6 +171,10 @@ class BaseDeltaIterator : public rocksdb::Iterator {
     Advance();
   }
 
+  void SeekForPrev(const rocksdb::Slice& k) override {
+    status_ = rocksdb::Status::NotSupported("SeekForPrev() not supported");
+  }
+
   void Prev() override { status_ = rocksdb::Status::NotSupported("Prev() not supported"); }
 
   rocksdb::Slice key() const override {
@@ -509,7 +513,29 @@ DBStatus DBBatch::GetStats(DBStatsResult* stats) { return FmtStatus("unsupported
 
 DBString DBBatch::GetCompactionStats() { return ToDBString("unsupported"); }
 
+DBStatus DBBatch::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
+
 DBStatus DBBatch::EnvWriteFile(DBSlice path, DBSlice contents) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBBatch::EnvReadFile(DBSlice path, DBSlice* contents) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBBatch::EnvCloseFile(rocksdb::WritableFile* file) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::EnvSyncFile(rocksdb::WritableFile* file) { return FmtStatus("unsupported"); }
+
+DBStatus DBBatch::EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBBatch::EnvDeleteFile(DBSlice path) {
+  return FmtStatus("unsupported");
+}
 
 DBWriteOnlyBatch::DBWriteOnlyBatch(DBEngine* db) : DBEngine(db->rep, db->iters), updates(0) {}
 
@@ -574,7 +600,33 @@ DBStatus DBWriteOnlyBatch::GetStats(DBStatsResult* stats) { return FmtStatus("un
 
 DBString DBWriteOnlyBatch::GetCompactionStats() { return ToDBString("unsupported"); }
 
+DBStatus DBWriteOnlyBatch::GetEnvStats(DBEnvStatsResult* stats) { return FmtStatus("unsupported"); }
+
 DBStatus DBWriteOnlyBatch::EnvWriteFile(DBSlice path, DBSlice contents) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvReadFile(DBSlice path, DBSlice* contents) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvCloseFile(rocksdb::WritableFile* file) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvSyncFile(rocksdb::WritableFile* file) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBWriteOnlyBatch::EnvDeleteFile(DBSlice path) {
   return FmtStatus("unsupported");
 }
 

@@ -101,9 +101,11 @@ func createTestNode(
 		cfg.AmbientCtx,
 		cfg.Clock,
 		cfg.DB,
+		engines,
 		cfg.Gossip,
 		active,
 		renewal,
+		cfg.Settings,
 		cfg.HistogramWindowInterval,
 	)
 	storage.TimeUntilStoreDead.Override(&cfg.Settings.SV, 10*time.Millisecond)
@@ -523,9 +525,9 @@ func compareNodeStatus(
 	return nodeStatus
 }
 
-// TestStatusSummaries verifies that status summaries are written correctly for
+// TestNodeStatusWritten verifies that status summaries are written correctly for
 // both the Node and stores within the node.
-func TestStatusSummaries(t *testing.T) {
+func TestNodeStatusWritten(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// ========================================

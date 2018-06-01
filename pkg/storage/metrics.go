@@ -400,6 +400,9 @@ var (
 	metaSplitQueueProcessingNanos = metric.Metadata{
 		Name: "queue.split.processingnanos",
 		Help: "Nanoseconds spent processing replicas in the split queue"}
+	metaSplitQueuePurgatory = metric.Metadata{
+		Name: "queue.split.purgatory",
+		Help: "Number of replicas in the split queue's purgatory, waiting to become splittable"}
 	metaTimeSeriesMaintenanceQueueSuccesses = metric.Metadata{
 		Name: "queue.tsmaintenance.process.success",
 		Help: "Number of replicas successfully processed by the time series maintenance queue"}
@@ -558,7 +561,7 @@ type StoreMetrics struct {
 	RdbNumSSTables              *metric.Gauge
 
 	// TODO(mrtracy): This should be removed as part of #4465. This is only
-	// maintained to keep the current structure of StatusSummaries; it would be
+	// maintained to keep the current structure of NodeStatus; it would be
 	// better to convert the Gauges above into counters which are adjusted
 	// accordingly.
 
@@ -637,6 +640,7 @@ type StoreMetrics struct {
 	SplitQueueFailures                        *metric.Counter
 	SplitQueuePending                         *metric.Gauge
 	SplitQueueProcessingNanos                 *metric.Counter
+	SplitQueuePurgatory                       *metric.Gauge
 	TimeSeriesMaintenanceQueueSuccesses       *metric.Counter
 	TimeSeriesMaintenanceQueueFailures        *metric.Counter
 	TimeSeriesMaintenanceQueuePending         *metric.Gauge
@@ -824,8 +828,9 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		SplitQueueFailures:                        metric.NewCounter(metaSplitQueueFailures),
 		SplitQueuePending:                         metric.NewGauge(metaSplitQueuePending),
 		SplitQueueProcessingNanos:                 metric.NewCounter(metaSplitQueueProcessingNanos),
-		TimeSeriesMaintenanceQueueSuccesses:       metric.NewCounter(metaTimeSeriesMaintenanceQueueFailures),
-		TimeSeriesMaintenanceQueueFailures:        metric.NewCounter(metaTimeSeriesMaintenanceQueueSuccesses),
+		SplitQueuePurgatory:                       metric.NewGauge(metaSplitQueuePurgatory),
+		TimeSeriesMaintenanceQueueSuccesses:       metric.NewCounter(metaTimeSeriesMaintenanceQueueSuccesses),
+		TimeSeriesMaintenanceQueueFailures:        metric.NewCounter(metaTimeSeriesMaintenanceQueueFailures),
 		TimeSeriesMaintenanceQueuePending:         metric.NewGauge(metaTimeSeriesMaintenanceQueuePending),
 		TimeSeriesMaintenanceQueueProcessingNanos: metric.NewCounter(metaTimeSeriesMaintenanceQueueProcessingNanos),
 

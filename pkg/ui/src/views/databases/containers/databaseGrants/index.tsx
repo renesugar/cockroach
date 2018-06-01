@@ -14,16 +14,10 @@ import {
 } from "src/redux/apiReducers";
 
 import {
-    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos, grants,
+    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos, grants as selectGrants,
 } from "src/views/databases/containers/databaseSummary";
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-export const DatabaseGrantsSortedTable = SortedTable as new () => SortedTable<protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant>;
+class DatabaseGrantsSortedTable extends SortedTable<protos.cockroach.server.serverpb.DatabaseDetailsResponse.Grant> {}
 
 const grantsSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "databases/sort_setting/grants", (s) => s.localSettings,
@@ -92,7 +86,7 @@ export default connect(
       tableInfos: tableInfos(state, ownProps.name),
       sortSetting: grantsSortSetting.selector(state),
       dbResponse: databaseDetails(state)[ownProps.name] && databaseDetails(state)[ownProps.name].data,
-      grants: grants(state, ownProps.name),
+      grants: selectGrants(state, ownProps.name),
     };
   },
   {

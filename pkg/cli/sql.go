@@ -59,6 +59,7 @@ var sqlShellCmd = &cobra.Command{
 	Long: `
 Open a sql shell running against a cockroach database.
 `,
+	Args: cobra.NoArgs,
 	RunE: MaybeDecorateGRPCError(runTerm),
 }
 
@@ -518,15 +519,15 @@ func (c *cliState) refreshTransactionStatus() {
 
 	// Change the prompt based on the response from the server.
 	switch txnString {
-	case sql.NoTxn.String():
+	case sql.NoTxnStr:
 		c.lastKnownTxnStatus = ""
-	case sql.Aborted.String():
+	case sql.AbortedStateStr:
 		c.lastKnownTxnStatus = " ERROR"
-	case sql.CommitWait.String():
+	case sql.CommitWaitStateStr:
 		c.lastKnownTxnStatus = "  DONE"
-	case sql.RestartWait.String():
+	case sql.RestartWaitStateStr:
 		c.lastKnownTxnStatus = " RETRY"
-	case sql.Open.String():
+	case sql.OpenStateStr:
 		// The state AutoRetry is reported by the server as Open, so no need to
 		// handle it here.
 		c.lastKnownTxnStatus = "  OPEN"
@@ -546,6 +547,12 @@ func (c *cliState) refreshDatabaseName() (string, bool) {
 	dbVal, hasVal := c.conn.getServerValue("database name", `SHOW DATABASE`)
 	if !hasVal {
 		return "", false
+	}
+
+	if dbVal == "" {
+		// Attempt to be helpful to new users.
+		fmt.Fprintln(stderr, "warning: no current database set."+
+			" Use SET database = <dbname> to change, CREATE DATABASE to make a new database.")
 	}
 
 	dbName := formatVal(dbVal.(string),
@@ -569,12 +576,6 @@ func preparePrompts(dbURL string) (promptPrefix, fullPrompt, continuePrompt stri
 			username = parsedURL.User.Username()
 		}
 		promptPrefix = fmt.Sprintf("%s@%s", username, parsedURL.Host)
-
-		if parsedURL.Path == "" {
-			// Attempt to be helpful to new users.
-			fmt.Fprintln(stderr, "warning: no current database set."+
-				" Use SET database = <dbname> to change, CREATE DATABASE to make a new database.")
-		}
 	}
 
 	if len(promptPrefix) == 0 {
@@ -1140,10 +1141,6 @@ func runStatements(conn *sqlConn, stmts []string) error {
 }
 
 func runTerm(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-
 	// We don't consider sessions interactives unless we have a
 	// serious hunch they are. For now, only `cockroach sql` *without*
 	// `-e` has the ability to input from a (presumably) human user,
@@ -1157,7 +1154,7 @@ func runTerm(cmd *cobra.Command, args []string) error {
 		fmt.Print(infoMessage)
 	}
 
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach sql")
 	if err != nil {
 		return err
 	}

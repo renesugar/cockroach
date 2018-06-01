@@ -1,0 +1,189 @@
+# =============================================================================
+# join.opt contains normalization rules for Join operators.
+# =============================================================================
+
+
+# EnsureJoinFiltersAnd replaces an And operator in a Join's On condition with
+# the Filters operator. This allows other rules to rely upon the presence of
+# the Filters when matching. See comment at top of bool.opt for more details.
+# This rule is a special-case of the EnsureJoinFilters rule, for performance
+# reasons (no need to construct a new conditions list) in a common case.
+[EnsureJoinFiltersAnd, Normalize]
+(Join
+    $left:*
+    $right:*
+    (And $conditions:*)
+)
+=>
+((OpName)
+    $left
+    $right
+    (Filters $conditions)
+)
+
+# EnsureJoinFilters adds a Filters operator to a Join's On condition if it does
+# not already exist. This allows other rules to rely upon the presence of the
+# Filters when matching. See comment at top of bool.opt for more details.
+[EnsureJoinFilters, Normalize]
+(Join
+    $left:*
+    $right:*
+    $filter:^(Filters | And | True | False)
+)
+=>
+((OpName)
+    $left
+    $right
+    (Filters [ $filter ])
+)
+
+# PushFilterIntoJoinLeft pushes Join filter conditions into the left side of the
+# join. This is possible in the case of InnerJoin and RightJoin, as long as the
+# condition has no dependencies on the right side of the join. Left and Full
+# joins are not eligible, since filtering left rows will change the number of
+# rows in the result for those types of joins:
+#
+#   -- A row with nulls on the right side is returned for a.x=1, a.y=2, b.x=1.
+#   SELECT * FROM a LEFT JOIN b ON a.x=b.x AND a.y < 0
+#
+#   -- But if the filter is incorrectly pushed down, then no row is returned.
+#   SELECT * FROM (SELECT * FROM a WHERE a.y < 0) a LEFT JOIN b ON a.x=b.x
+#
+# In addition, AntiJoin is not eligible for this rule, as illustrated by this
+# example:
+#
+#   -- A row is returned for a.y=2.
+#   SELECT * FROM a ANTI JOIN b ON a.y < 0
+#
+#   -- But if the filter is incorrectly pushed down, then no row is returned.
+#   SELECT * FROM (SELECT * FROM a WHERE a.y < 0) a ANTI JOIN b ON True
+#
+# Citations: [1]
+[PushFilterIntoJoinLeft, Normalize]
+(InnerJoin | InnerJoinApply | RightJoin | RightJoinApply | SemiJoin | SemiJoinApply
+    $left:*
+    $right:*
+    $on:(Filters $list:[ ... $condition:* & (IsBoundBy $condition $left) ... ])
+)
+=>
+((OpName)
+    (Select
+        $left
+        (Filters (ExtractBoundConditions $list $left))
+    )
+    $right
+    (Filters (ExtractUnboundConditions $list $left))
+)
+
+# PushFilterIntoJoinRight is symmetric with PushFilterIntoJoinLeft. It pushes
+# Join filter conditions into the right side of the join rather than into the
+# left side. See that rule's comments for more details.
+#
+# This rule triggers a cycle with the TryDecorrelateSelect rule. That rule has
+# the DetectCycle tag to break the cycle.
+[PushFilterIntoJoinRight, Normalize]
+(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply |
+ SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+    $left:*
+    $right:*
+    $on:(Filters $list:[ ... $condition:* & (IsBoundBy $condition $right) ... ])
+)
+=>
+((OpName)
+    $left
+    (Select
+        $right
+        (Filters (ExtractBoundConditions $list $right))
+    )
+    (Filters (ExtractUnboundConditions $list $right))
+)
+
+# SimplifyLeftJoin reduces a LeftJoin operator to an InnerJoin operator (or a
+# FullJoin to a RightJoin) when it's known that the join's right input never
+# returns zero rows and when there's no join condition. The outer join only
+# populates the right side with NULL values when it would otherwise not be
+# present.
+[SimplifyLeftJoin, Normalize]
+(LeftJoin | LeftJoinApply | FullJoin | FullJoinApply
+    $left:*
+    $right:* & (HasOneOrMoreRows $right)
+    $on:(True)
+)
+=>
+(ConstructNonLeftJoin
+    (OpName)
+    $left
+    $right
+    $on
+)
+
+# SimplifyRightJoin reduces a RightJoin operator to an InnerJoin operator (or a
+# FullJoin to a LeftJoin) when it's known that the join's left input never
+# returns zero rows and when there's no join condition. The outer join only
+# populates the left side with NULL values when it would otherwise not be
+# present.
+[SimplifyRightJoin, Normalize]
+(RightJoin | RightJoinApply | FullJoin | FullJoinApply
+    $left:* & (HasOneOrMoreRows $left)
+    $right:*
+    $on:(True)
+)
+=>
+(ConstructNonRightJoin
+    (OpName)
+    $left
+    $right
+    $on
+)
+
+# EliminateSemiJoin discards a SemiJoin operator when it's known that the right
+# input never returns zero rows, and there is no join condition.
+[EliminateSemiJoin, Normalize]
+(SemiJoin | SemiJoinApply
+    $left:*
+    $right:* & (HasOneOrMoreRows $right)
+    (True)
+)
+=>
+$left
+
+# EliminateAntiJoin discards an AntiJoin operator when it's known that the right
+# input never returns any rows.
+[EliminateAntiJoin, Normalize]
+(AntiJoin | AntiJoinApply
+    $left:*
+    $right:* & (HasZeroRows $right)
+    *
+)
+=>
+$left
+
+# EliminateJoinNoColsLeft eliminates an InnerJoin with a one row, zero column
+# left input set. These can be produced when a Values, scalar GroupBy, or other
+# one-row operator's columns are never used.
+[EliminateJoinNoColsLeft, Normalize]
+(InnerJoin | InnerJoinApply
+    $left:* & (HasNoCols $left) & (HasOneRow $left)
+    $right:*
+    $on:*
+)
+=>
+(Select
+    $right
+    $on
+)
+
+# EliminateJoinNoColsRight eliminates an InnerJoin with a one row, zero column
+# right input set. These can be produced when a Values, scalar GroupBy, or other
+# one-row operator's columns are never used.
+[EliminateJoinNoColsRight, Normalize]
+(InnerJoin | InnerJoinApply
+    $left:*
+    $right:* & (HasNoCols $right) & (HasOneRow $right)
+    $on:*
+)
+=>
+(Select
+    $left
+    $on
+)

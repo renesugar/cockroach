@@ -44,7 +44,7 @@ func WaitForJob(db *gosql.DB, jobID int64) error {
 		if err := db.QueryRow(
 			`SELECT status, payload FROM system.jobs WHERE id = $1`, jobID,
 		).Scan(&status, &payloadBytes); err != nil {
-			return err
+			return errors.Wrap(err, "could not query job table")
 		}
 		if jobs.Status(status) == jobs.StatusFailed {
 			jobFailedErr = errors.New("job failed")
@@ -81,7 +81,8 @@ func RunJob(
 	t *testing.T,
 	db *sqlutils.SQLRunner,
 	allowProgressIota *chan struct{},
-	op, query string,
+	ops []string,
+	query string,
 	args ...interface{},
 ) (int64, error) {
 	*allowProgressIota = make(chan struct{})
@@ -97,7 +98,10 @@ func RunJob(
 	}
 	var jobID int64
 	db.QueryRow(t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`).Scan(&jobID)
-	db.Exec(t, fmt.Sprintf("%s JOB %d", op, jobID))
+	for _, op := range ops {
+		db.Exec(t, fmt.Sprintf("%s JOB %d", op, jobID))
+		*allowProgressIota <- struct{}{}
+	}
 	close(*allowProgressIota)
 	return jobID, <-errCh
 }
@@ -162,4 +166,15 @@ func VerifySystemJob(
 	}
 
 	return nil
+}
+
+// GetJobPayload loads the Payload message associated with the job.
+func GetJobPayload(t *testing.T, db *sqlutils.SQLRunner, jobID int64) *jobs.Payload {
+	ret := &jobs.Payload{}
+	var buf []byte
+	db.QueryRow(t, `SELECT payload FROM system.jobs WHERE id = $1`, jobID).Scan(&buf)
+	if err := protoutil.Unmarshal(buf, ret); err != nil {
+		t.Fatal(err)
+	}
+	return ret
 }

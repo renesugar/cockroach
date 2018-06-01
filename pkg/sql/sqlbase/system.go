@@ -48,7 +48,8 @@ CREATE TABLE system.descriptor (
 	UsersTableSchema = `
 CREATE TABLE system.users (
   username         STRING PRIMARY KEY,
-  "hashedPassword" BYTES
+  "hashedPassword" BYTES,
+  "isRole"         BOOL NOT NULL DEFAULT false
 );`
 
 	// Zone settings per DB/Table.
@@ -196,58 +197,32 @@ func pk(name string) IndexDescriptor {
 	}
 }
 
-// SystemAllowedPrivileges describes the allowable privilege lists for each
-// system object. The root user must have the privileges of exactly one of those
-// privilege lists. No user may have more privileges than the root user.
-//
-// Some system objects were created with different privileges in previous
-// versions of the system. These privileges are no longer "desired" but must
-// still be "allowed," or this version and the previous version with different
-// privileges will be unable to coexist in the same cluster because one version
-// will think it has invalid table descriptors.
-//
-// The currently-desired privileges (i.e., the privileges with which the object
-// will be created in fresh clusters) must be listed first in the mapped value,
-// followed by previously-desirable but still allowable privileges in any order.
-//
-// If we supported backwards-incompatible migrations, pruning allowed privileges
-// would require a two-step migration process. First, a new version that allows
-// both must be deployed to all nodes, after which a a migration to upgrade from
-// the old privileges to the new privileges can be run. Only then can a version
-// that removes the old allowed versions be deployed. TODO(benesch): Once we
-// support backwards-incompatible migrations, prune old allowed privileges.
-var SystemAllowedPrivileges = map[ID]privilege.Lists{
-	keys.SystemDatabaseID:  {privilege.ReadData},
-	keys.NamespaceTableID:  {privilege.ReadData},
-	keys.DescriptorTableID: {privilege.ReadData},
-	keys.UsersTableID:      {privilege.ReadWriteData},
-	keys.ZonesTableID:      {privilege.ReadWriteData},
+// SystemAllowedPrivileges describes the allowable privilege list for each
+// system object. Super users (root and admin) must have exactly the specified privileges,
+// other users must not exceed the specified privileges.
+var SystemAllowedPrivileges = map[ID]privilege.List{
+	keys.SystemDatabaseID:  privilege.ReadData,
+	keys.NamespaceTableID:  privilege.ReadData,
+	keys.DescriptorTableID: privilege.ReadData,
+	keys.UsersTableID:      privilege.ReadWriteData,
+	keys.ZonesTableID:      privilege.ReadWriteData,
 	// We eventually want to migrate the table to appear read-only to force the
 	// the use of a validating, logging accessor, so we'll go ahead and tolerate
 	// read-only privs to make that migration possible later.
-	keys.SettingsTableID:   {privilege.ReadWriteData, privilege.ReadData},
-	keys.LeaseTableID:      {privilege.ReadWriteData, {privilege.ALL}},
-	keys.EventLogTableID:   {privilege.ReadWriteData, {privilege.ALL}},
-	keys.RangeEventTableID: {privilege.ReadWriteData, {privilege.ALL}},
-	keys.UITableID:         {privilege.ReadWriteData, {privilege.ALL}},
+	keys.SettingsTableID:   privilege.ReadWriteData,
+	keys.LeaseTableID:      privilege.ReadWriteData,
+	keys.EventLogTableID:   privilege.ReadWriteData,
+	keys.RangeEventTableID: privilege.ReadWriteData,
+	keys.UITableID:         privilege.ReadWriteData,
 	// IMPORTANT: CREATE|DROP|ALL privileges should always be denied or database
 	// users will be able to modify system tables' schemas at will. CREATE and
 	// DROP privileges are allowed on the above system tables for backwards
 	// compatibility reasons only!
-	keys.JobsTableID:            {privilege.ReadWriteData},
-	keys.WebSessionsTableID:     {privilege.ReadWriteData},
-	keys.TableStatisticsTableID: {privilege.ReadWriteData},
-	keys.LocationsTableID:       {privilege.ReadWriteData},
-	keys.RoleMembersTableID:     {privilege.ReadWriteData},
-}
-
-// SystemDesiredPrivileges returns the desired privilege list (i.e., the
-// privilege list with which the object should be created with in a fresh
-// cluster) for a given system object ID. This function panics if id does not
-// exist in the SystemAllowedPrivileges map and should only be used in contexts
-// where id is guaranteed to exist.
-func SystemDesiredPrivileges(id ID) privilege.List {
-	return SystemAllowedPrivileges[id][0]
+	keys.JobsTableID:            privilege.ReadWriteData,
+	keys.WebSessionsTableID:     privilege.ReadWriteData,
+	keys.TableStatisticsTableID: privilege.ReadWriteData,
+	keys.LocationsTableID:       privilege.ReadWriteData,
+	keys.RoleMembersTableID:     privilege.ReadWriteData,
 }
 
 // Helpers used to make some of the TableDescriptor literals below more concise.
@@ -273,7 +248,7 @@ var (
 		Name: "system",
 		ID:   keys.SystemDatabaseID,
 		// Assign max privileges to root user.
-		Privileges: NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.SystemDatabaseID)),
+		Privileges: NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.SystemDatabaseID]),
 	}
 
 	// NamespaceTable is the descriptor for the namespace table.
@@ -302,7 +277,7 @@ var (
 			ColumnIDs:        []ColumnID{1, 2},
 		},
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.NamespaceTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.NamespaceTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -311,7 +286,7 @@ var (
 	DescriptorTable = TableDescriptor{
 		Name:       "descriptor",
 		ID:         keys.DescriptorTableID,
-		Privileges: NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.DescriptorTableID)),
+		Privileges: NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.DescriptorTableID]),
 		ParentID:   keys.SystemDatabaseID,
 		Version:    1,
 		Columns: []ColumnDescriptor{
@@ -330,6 +305,8 @@ var (
 		NextMutationID: 1,
 	}
 
+	falseBoolString = "false"
+
 	// UsersTable is the descriptor for the users table.
 	UsersTable = TableDescriptor{
 		Name:     "users",
@@ -339,16 +316,18 @@ var (
 		Columns: []ColumnDescriptor{
 			{Name: "username", ID: 1, Type: colTypeString},
 			{Name: "hashedPassword", ID: 2, Type: colTypeBytes, Nullable: true},
+			{Name: "isRole", ID: 3, Type: colTypeBool, DefaultExpr: &falseBoolString},
 		},
-		NextColumnID: 3,
+		NextColumnID: 4,
 		Families: []ColumnFamilyDescriptor{
 			{Name: "primary", ID: 0, ColumnNames: []string{"username"}, ColumnIDs: singleID1},
 			{Name: "fam_2_hashedPassword", ID: 2, ColumnNames: []string{"hashedPassword"}, ColumnIDs: []ColumnID{2}, DefaultColumnID: 2},
+			{Name: "fam_3_isRole", ID: 3, ColumnNames: []string{"isRole"}, ColumnIDs: []ColumnID{3}, DefaultColumnID: 3},
 		},
 		PrimaryIndex:   pk("username"),
-		NextFamilyID:   3,
+		NextFamilyID:   4,
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.UsersTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.UsersTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -378,7 +357,7 @@ var (
 		},
 		NextFamilyID:   3,
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.ZonesTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ZonesTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -406,7 +385,7 @@ var (
 		NextFamilyID:   1,
 		PrimaryIndex:   pk("name"),
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.SettingsTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.SettingsTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -444,7 +423,7 @@ var (
 		},
 		NextFamilyID:   1,
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.LeaseTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.LeaseTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -483,7 +462,7 @@ var (
 		},
 		NextFamilyID:   6,
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.EventLogTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.EventLogTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -524,7 +503,7 @@ var (
 		},
 		NextFamilyID:   7,
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.RangeEventTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.RangeEventTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -549,7 +528,7 @@ var (
 		NextFamilyID:   4,
 		PrimaryIndex:   pk("key"),
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.UITableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.UITableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -591,7 +570,7 @@ var (
 			},
 		},
 		NextIndexID:    3,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.JobsTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.JobsTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -653,7 +632,7 @@ var (
 			},
 		},
 		NextIndexID:    4,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.WebSessionsTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.WebSessionsTableID]),
 		NextMutationID: 1,
 		FormatVersion:  3,
 	}
@@ -704,7 +683,7 @@ var (
 			ColumnIDs:        []ColumnID{1, 2},
 		},
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.TableStatisticsTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.TableStatisticsTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -746,7 +725,7 @@ var (
 			ColumnIDs:        []ColumnID{1, 2},
 		},
 		NextIndexID:    2,
-		Privileges:     NewCustomRootPrivilegeDescriptor(SystemDesiredPrivileges(keys.LocationsTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.LocationsTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
@@ -809,28 +788,20 @@ var (
 			},
 		},
 		NextIndexID:    4,
-		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemDesiredPrivileges(keys.RoleMembersTableID)),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.RoleMembersTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
-
-//***************************************************************************
-// WARNING: any tables added after LocationsTable must use:
-//   Privileges: NewCustomSuperuserPrivilegeDescriptor(...)
-// instead of
-//   Privileges: NewCustomRootPrivilegeDescriptor(...)
-//***************************************************************************
 )
 
-// Create the key/value pair for the default zone config entry.
-func createDefaultZoneConfig() roachpb.KeyValue {
-	zoneConfig := config.DefaultZoneConfig()
+// Create a kv pair for the zone config for the given key and config value.
+func createZoneConfigKV(keyID int, zoneConfig config.ZoneConfig) roachpb.KeyValue {
 	value := roachpb.Value{}
 	if err := value.SetProto(&zoneConfig); err != nil {
-		panic(fmt.Sprintf("could not marshal DefaultZoneConfig: %s", err))
+		panic(fmt.Sprintf("could not marshal ZoneConfig for ID: %d: %s", keyID, err))
 	}
 	return roachpb.KeyValue{
-		Key:   config.MakeZoneKey(uint32(keys.RootNamespaceID)),
+		Key:   config.MakeZoneKey(uint32(keyID)),
 		Value: value,
 	}
 }
@@ -858,6 +829,11 @@ func addSystemDatabaseToSchema(target *MetadataSchema) {
 	target.AddDescriptor(keys.SystemDatabaseID, &SettingsTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &WebSessionsTable)
 
+	// Tables introduced in 2.0, added here for 2.1.
+	target.AddDescriptor(keys.SystemDatabaseID, &TableStatisticsTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &LocationsTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &RoleMembersTable)
+
 	// Adding a new system table? Don't add it to the metadata schema yet!
 	//
 	// The first release to contain the system table must add the system table
@@ -866,7 +842,21 @@ func addSystemDatabaseToSchema(target *MetadataSchema) {
 	// the metadata schema here. This ensures there's only ever one code path
 	// responsible for creating the table.
 
-	target.otherKV = append(target.otherKV, createDefaultZoneConfig())
+	// Default zone config entry.
+	zoneConf := config.DefaultZoneConfig()
+	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.RootNamespaceID, zoneConf))
+
+	// .meta zone config entry with a shorter GC time.
+	zoneConf.GC.TTLSeconds = 60 * 60 // 1h
+	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.MetaRangesID, zoneConf))
+
+	// Liveness zone config entry with a shorter GC time.
+	zoneConf.GC.TTLSeconds = 10 * 60 // 10m
+	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.LivenessRangesID, zoneConf))
+
+	// Jobs zone config entry with a shorter GC time.
+	zoneConf.GC.TTLSeconds = 10 * 60 // 10m
+	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.JobsTableID, zoneConf))
 }
 
 // IsSystemConfigID returns whether this ID is for a system config object.

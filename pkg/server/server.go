@@ -18,7 +18,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"io/ioutil"
 	"math"
@@ -33,8 +35,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-
 	"github.com/elazarl/go-bindata-assetfs"
 	raven "github.com/getsentry/raven-go"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -44,6 +44,7 @@ import (
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -59,6 +60,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -106,6 +111,17 @@ var (
 		"If enabled, forward clock jumps > max_offset/2 will cause a panic.",
 		false,
 	)
+
+	persistHLCUpperBoundInterval = settings.RegisterDurationSetting(
+		"server.clock.persist_upper_bound_interval",
+		"the interval between persisting the wall time upper bound of the clock. The clock "+
+			"does not generate a wall time greater than the persisted timestamp and will panic if "+
+			"it sees a wall time greater than this value. When cockroach starts, it waits for the "+
+			"wall time to catch-up till this persisted timestamp. This guarantees monotonic wall "+
+			"time across server restarts. Not setting this or setting a value of 0 disables this "+
+			"feature.",
+		0,
+	)
 )
 
 // Server is the cockroach server node.
@@ -138,14 +154,16 @@ type Server struct {
 	tsServer           ts.Server
 	raftTransport      *storage.RaftTransport
 	stopper            *stop.Stopper
-	sqlExecutor        *sql.Executor
 	execCfg            *sql.ExecutorConfig
+	internalExecutor   *sql.InternalExecutor
 	leaseMgr           *sql.LeaseManager
 	sessionRegistry    *sql.SessionRegistry
 	jobRegistry        *jobs.Registry
 	engines            Engines
 	internalMemMetrics sql.MemoryMetrics
 	adminMemMetrics    sql.MemoryMetrics
+	// sqlMemMetrics are used to track memory usage of sql sessions.
+	sqlMemMetrics sql.MemoryMetrics
 	serveMode
 }
 
@@ -271,9 +289,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.cfg.AmbientCtx,
 		s.clock,
 		s.db,
+		s.engines,
 		s.gossip,
 		nlActive,
 		nlRenewal,
+		s.st,
 		s.cfg.HistogramWindowInterval(),
 	)
 	s.registry.AddMetricStruct(s.nodeLiveness.Metrics())
@@ -305,7 +325,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		nil, /* execCfg - will be set later because of circular dependencies */
 		lmKnobs,
 		s.stopper,
-		&s.internalMemMetrics,
 		s.cfg.LeaseManagerConfig,
 	)
 
@@ -324,7 +343,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Set up the DistSQL temp engine.
 
-	tempEngine, err := engine.NewTempEngine(s.cfg.TempStorageConfig)
+	useStoreSpec := cfg.Stores.Specs[s.cfg.TempStorageConfig.SpecIdx]
+	tempEngine, err := engine.NewTempEngine(s.cfg.TempStorageConfig, useStoreSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create temp storage")
 	}
@@ -332,7 +352,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Remove temporary directory linked to tempEngine after closing
 	// tempEngine.
 	s.stopper.AddCloser(stop.CloserFn(func() {
-		firstStore := cfg.Stores.Specs[0]
+		firstStore := cfg.Stores.Specs[s.cfg.TempStorageConfig.SpecIdx]
 		var err error
 		if firstStore.InMemory {
 			// First store is in-memory so we remove the temp
@@ -365,8 +385,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// of the server's components. There's a circular dependency - many things
 	// need an InternalExecutor, but the InternalExecutor needs an ExecutorConfig,
 	// which in turn needs many things. That's why everybody that needs an
-	// InternalExecutor takes pointers to this one instance.
-	sqlExecutor := sql.InternalExecutor{}
+	// InternalExecutor uses this one instance.
+	internalExecutor := &sql.InternalExecutor{}
 
 	// Similarly for execCfg.
 	var execCfg sql.ExecutorConfig
@@ -387,7 +407,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		TimestampCachePageSize:  s.cfg.TimestampCachePageSize,
 		HistogramWindowInterval: s.cfg.HistogramWindowInterval(),
 		StorePool:               s.storePool,
-		SQLExecutor:             &sqlExecutor,
+		SQLExecutor:             internalExecutor,
 		LogRangeEvents:          s.cfg.EventLogEnabled,
 		TimeSeriesDataStore:     s.tsDB,
 
@@ -411,11 +431,18 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	s.sessionRegistry = sql.MakeSessionRegistry()
 	s.jobRegistry = jobs.MakeRegistry(
-		s.cfg.AmbientCtx, s.clock, s.db, &sqlExecutor, &s.nodeIDContainer, st, func(opName, user string) (interface{}, func()) {
+		s.cfg.AmbientCtx,
+		s.clock,
+		s.db,
+		internalExecutor,
+		&s.nodeIDContainer,
+		st,
+		func(opName, user string) (interface{}, func()) {
 			// This is a hack to get around a Go package dependency cycle. See comment
 			// in sql/jobs/registry.go on planHookMaker.
 			return sql.NewInternalPlanner(opName, nil, user, &sql.MemoryMetrics{}, &execCfg)
-		})
+		},
+	)
 
 	distSQLMetrics := distsqlrun.MakeDistSQLMetrics(cfg.HistogramWindowInterval())
 	s.registry.AddMetricStruct(distSQLMetrics)
@@ -425,7 +452,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		AmbientContext: s.cfg.AmbientCtx,
 		Settings:       st,
 		DB:             s.db,
-		Executor:       &sqlExecutor,
+		Executor:       internalExecutor,
 		FlowDB:         client.NewDB(s.tcsFactory, s.clock),
 		RPCContext:     s.rpcContext,
 		Stopper:        s.stopper,
@@ -448,9 +475,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	s.distSQLServer = distsqlrun.NewServer(ctx, distSQLCfg)
 	distsqlrun.RegisterDistSQLServer(s.grpc, s.distSQLServer)
 
-	s.admin = newAdminServer(s, &sqlExecutor)
+	s.admin = newAdminServer(s)
 	s.status = newStatusServer(
 		s.cfg.AmbientCtx,
+		st,
 		s.cfg.Config,
 		s.admin,
 		s.db,
@@ -462,7 +490,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.stopper,
 		s.sessionRegistry,
 	)
-	s.authentication = newAuthenticationServer(s, &sqlExecutor)
+	s.authentication = newAuthenticationServer(s)
 	for _, gw := range []grpcGatewayServer{s.admin, s.status, s.authentication, &s.tsServer} {
 		gw.RegisterService(s.grpc)
 	}
@@ -499,6 +527,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		AmbientCtx:              s.cfg.AmbientCtx,
 		DB:                      s.db,
 		Gossip:                  s.gossip,
+		MetricsRecorder:         s.recorder,
 		DistSender:              s.distSender,
 		RPCContext:              s.rpcContext,
 		LeaseManager:            s.leaseMgr,
@@ -512,6 +541,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		RangeDescriptorCache:    s.distSender.RangeDescriptorCache(),
 		LeaseHolderCache:        s.distSender.LeaseHolderCache(),
 		TestingKnobs:            sqlExecutorTestingKnobs,
+
 		DistSQLPlanner: sql.NewDistSQLPlanner(
 			ctx,
 			distsqlrun.Version,
@@ -523,10 +553,25 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			s.distSender,
 			s.gossip,
 			s.stopper,
+			s.nodeLiveness,
 			sqlExecutorTestingKnobs.DistSQLPlannerKnobs,
 		),
-		ExecLogger:             log.NewSecondaryLogger(nil, "sql-exec", true /*enableGc*/, false /*forceSyncWrites*/),
-		AuditLogger:            log.NewSecondaryLogger(s.cfg.SQLAuditLogDirName, "sql-audit", true /*enableGc*/, true /*forceSyncWrites*/),
+
+		TableStatsCache: stats.NewTableStatisticsCache(
+			s.cfg.SQLTableStatCacheSize,
+			s.gossip,
+			s.db,
+			internalExecutor,
+		),
+
+		ExecLogger: log.NewSecondaryLogger(
+			nil /* dirName */, "sql-exec", true /* enableGc */, false, /*forceSyncWrites*/
+		),
+
+		AuditLogger: log.NewSecondaryLogger(
+			s.cfg.SQLAuditLogDirName, "sql-audit", true /*enableGc*/, true, /*forceSyncWrites*/
+		),
+
 		ConnResultsBufferBytes: s.cfg.ConnResultsBufferBytes,
 	}
 
@@ -538,28 +583,46 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	if sqlEvalContext := s.cfg.TestingKnobs.SQLEvalContext; sqlEvalContext != nil {
 		execCfg.EvalContextTestingKnobs = *sqlEvalContext.(*tree.EvalContextTestingKnobs)
 	}
-	s.sqlExecutor = sql.NewExecutor(execCfg, s.stopper)
-	if s.cfg.UseLegacyConnHandling {
-		s.registry.AddMetricStruct(s.sqlExecutor)
-	}
 
+	// Set up internal memory metrics for use by internal SQL executors.
+	s.sqlMemMetrics = sql.MakeMemMetrics("sql", cfg.HistogramWindowInterval())
+	s.registry.AddMetricStruct(s.sqlMemMetrics)
 	s.pgServer = pgwire.MakeServer(
 		s.cfg.AmbientCtx,
 		s.cfg.Config,
 		s.ClusterSettings(),
-		s.sqlExecutor,
-		&s.internalMemMetrics,
+		s.sqlMemMetrics,
 		&rootSQLMemoryMonitor,
 		s.cfg.HistogramWindowInterval(),
 		&execCfg,
 	)
-	s.registry.AddMetricStruct(s.pgServer.Metrics())
-	if !s.cfg.UseLegacyConnHandling {
-		s.registry.AddMetricStruct(s.pgServer.StatementCounters())
-		s.registry.AddMetricStruct(s.pgServer.EngineMetrics())
-	}
 
-	sqlExecutor.ExecCfg = &execCfg
+	// Now that we have a pgwire.Server (which has a sql.Server), we can close a
+	// circular dependency between the distsqlrun.Server and sql.Server and set
+	// SessionBoundInternalExecutorCtor.
+	s.distSQLServer.ServerConfig.SessionBoundInternalExecutorFactory =
+		func(
+			ctx context.Context, sessionData *sessiondata.SessionData,
+		) sqlutil.InternalExecutor {
+			ie := sql.MakeSessionBoundInternalExecutor(
+				ctx,
+				sessionData,
+				s.pgServer.SQLServer,
+				s.sqlMemMetrics,
+				s.st,
+			)
+			return &ie
+		}
+
+	s.registry.AddMetricStruct(s.pgServer.Metrics())
+	s.registry.AddMetricStruct(s.pgServer.StatementCounters())
+	s.registry.AddMetricStruct(s.pgServer.EngineMetrics())
+	*internalExecutor = sql.MakeInternalExecutor(
+		ctx, s.pgServer.SQLServer, s.internalMemMetrics, s.ClusterSettings(),
+	)
+	s.internalExecutor = internalExecutor
+	execCfg.InternalExecutor = internalExecutor
+
 	s.execCfg = &execCfg
 
 	s.leaseMgr.SetExecCfg(&execCfg)
@@ -719,6 +782,192 @@ func (s *Server) startMonitoringForwardClockJumps(ctx context.Context) {
 	}
 
 	log.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check_enabled")
+}
+
+// ensureClockMonotonicity sleeps till the wall time reaches
+// prevHLCUpperBound. prevHLCUpperBound > 0 implies we need to guarantee HLC
+// monotonicity across server restarts. prevHLCUpperBound is the last
+// successfully persisted timestamp greater then any wall time used by the
+// server.
+//
+// If prevHLCUpperBound is 0, the function sleeps up to max offset
+func ensureClockMonotonicity(
+	ctx context.Context,
+	clock *hlc.Clock,
+	startTime time.Time,
+	prevHLCUpperBound int64,
+	sleepUntilFn func(until int64, currTime func() int64),
+) {
+	var sleepUntil int64
+	if prevHLCUpperBound != 0 {
+		// Sleep until previous HLC upper bound to ensure wall time monotonicity
+		sleepUntil = prevHLCUpperBound + 1
+	} else {
+		// Previous HLC Upper bound is not known
+		// We might have to sleep a bit to protect against this node producing non-
+		// monotonic timestamps. Before restarting, its clock might have been driven
+		// by other nodes' fast clocks, but when we restarted, we lost all this
+		// information. For example, a client might have written a value at a
+		// timestamp that's in the future of the restarted node's clock, and if we
+		// don't do something, the same client's read would not return the written
+		// value. So, we wait up to MaxOffset; we couldn't have served timestamps more
+		// than MaxOffset in the future (assuming that MaxOffset was not changed, see
+		// #9733).
+		//
+		// As an optimization for tests, we don't sleep if all the stores are brand
+		// new. In this case, the node will not serve anything anyway until it
+		// synchronizes with other nodes.
+
+		// Don't have to sleep for monotonicity when using clockless reads
+		// (nor can we, for we would sleep forever).
+		if maxOffset := clock.MaxOffset(); maxOffset != timeutil.ClocklessMaxOffset {
+			sleepUntil = startTime.UnixNano() + int64(maxOffset) + 1
+		}
+	}
+
+	currentWallTimeFn := func() int64 { /* function to report current time */
+		return clock.Now().WallTime
+	}
+	currentWallTime := currentWallTimeFn()
+	delta := time.Duration(sleepUntil - currentWallTime)
+	if delta > 0 {
+		log.Infof(
+			ctx,
+			"Sleeping till wall time %v to catches up to %v to ensure monotonicity. Delta: %v",
+			currentWallTime,
+			sleepUntil,
+			delta,
+		)
+		sleepUntilFn(sleepUntil, currentWallTimeFn)
+	}
+}
+
+// periodicallyPersistHLCUpperBound periodically persists an upper bound of
+// the HLC's wall time. The interval for persisting is read from
+// persistHLCUpperBoundIntervalCh. An interval of 0 disables persisting.
+//
+// persistHLCUpperBoundFn is used to persist the hlc upper bound, and should
+// return an error if the persist fails.
+//
+// tickerFn is used to create the ticker used for persisting
+//
+// tickCallback is called whenever a tick is processed
+func periodicallyPersistHLCUpperBound(
+	clock *hlc.Clock,
+	persistHLCUpperBoundIntervalCh chan time.Duration,
+	persistHLCUpperBoundFn func(int64) error,
+	tickerFn func(d time.Duration) *time.Ticker,
+	stopCh <-chan struct{},
+	tickCallback func(),
+) {
+	// Create a ticker which can be used in selects.
+	// This ticker is turned on / off based on persistHLCUpperBoundIntervalCh
+	ticker := tickerFn(time.Hour)
+	ticker.Stop()
+
+	// persistInterval is the interval used for persisting the
+	// an upper bound of the HLC
+	var persistInterval time.Duration
+	var ok bool
+
+	persistHLCUpperBound := func() {
+		if err := clock.RefreshHLCUpperBound(
+			persistHLCUpperBoundFn,
+			int64(persistInterval*3), /* delta to compute upper bound */
+		); err != nil {
+			log.Fatalf(
+				context.Background(),
+				"error persisting HLC upper bound: %v",
+				err,
+			)
+		}
+	}
+
+	for {
+		select {
+		case persistInterval, ok = <-persistHLCUpperBoundIntervalCh:
+			ticker.Stop()
+			if !ok {
+				return
+			}
+
+			if persistInterval > 0 {
+				ticker = tickerFn(persistInterval)
+				persistHLCUpperBound()
+				log.Info(context.Background(), "persisting HLC upper bound is enabled")
+			} else {
+				if err := clock.ResetHLCUpperBound(persistHLCUpperBoundFn); err != nil {
+					log.Fatalf(
+						context.Background(),
+						"error resetting hlc upper bound: %v",
+						err,
+					)
+				}
+				log.Info(context.Background(), "persisting HLC upper bound is disabled")
+			}
+
+		case <-ticker.C:
+			if persistInterval > 0 {
+				persistHLCUpperBound()
+			}
+
+		case <-stopCh:
+			ticker.Stop()
+			return
+		}
+
+		if tickCallback != nil {
+			tickCallback()
+		}
+	}
+}
+
+// startPersistingHLCUpperBound starts a goroutine to persist an upper bound
+// to the HLC.
+//
+// persistHLCUpperBoundFn is used to persist upper bound of the HLC, and should
+// return an error if the persist fails
+//
+// tickerFn is used to create a new ticker
+//
+// tickCallback is called whenever persistHLCUpperBoundCh or a ticker tick is
+// processed
+func (s *Server) startPersistingHLCUpperBound(
+	hlcUpperBoundExists bool,
+	persistHLCUpperBoundFn func(int64) error,
+	tickerFn func(d time.Duration) *time.Ticker,
+) {
+	persistHLCUpperBoundIntervalCh := make(chan time.Duration, 1)
+	persistHLCUpperBoundInterval.SetOnChange(&s.st.SV, func() {
+		persistHLCUpperBoundIntervalCh <- persistHLCUpperBoundInterval.Get(&s.st.SV)
+	})
+
+	if hlcUpperBoundExists {
+		// The feature to persist upper bounds to wall times is enabled.
+		// Persist a new upper bound to continue guaranteeing monotonicity
+		// Going forward the goroutine launched below will take over persisting
+		// the upper bound
+		if err := s.clock.RefreshHLCUpperBound(
+			persistHLCUpperBoundFn,
+			int64(5*time.Second),
+		); err != nil {
+			log.Fatal(context.TODO(), err)
+		}
+	}
+
+	s.stopper.RunWorker(
+		context.TODO(),
+		func(context.Context) {
+			periodicallyPersistHLCUpperBound(
+				s.clock,
+				persistHLCUpperBoundIntervalCh,
+				persistHLCUpperBoundFn,
+				tickerFn,
+				s.stopper.ShouldStop(),
+				nil, /* tick callback */
+			)
+		},
+	)
 }
 
 // Start starts the server on the specified port, starts gossip and initializes
@@ -926,14 +1175,18 @@ func (s *Server) Start(ctx context.Context) error {
 	// endpoints.
 	s.mux.Handle(debug.Endpoint, debug.NewServer(s.st))
 
-	// Also throw the landing page in there. It won't work well, but it's better than a 404.
-	// The remaining endpoints will be opened late, when we're sure that the subsystems they
-	// talk to are functional.
-	s.mux.Handle("/", http.FileServer(&assetfs.AssetFS{
+	fileServer := http.FileServer(&assetfs.AssetFS{
 		Asset:     ui.Asset,
 		AssetDir:  ui.AssetDir,
 		AssetInfo: ui.AssetInfo,
-	}))
+	})
+
+	// Serve UI assets. This needs to be before the gRPC handlers are registered, otherwise
+	// the `s.mux.Handle("/", ...)` would cover all URLs, allowing anonymous access.
+	maybeAuthMux := newAuthenticationMuxAllowAnonymous(
+		s.authentication, serveUIAssets(fileServer, s.cfg),
+	)
+	s.mux.Handle("/", maybeAuthMux)
 
 	// Initialize grpc-gateway mux and context in order to get the /health
 	// endpoint working even before the node has fully initialized.
@@ -950,6 +1203,7 @@ func (s *Server) Start(ctx context.Context) error {
 		gwruntime.WithMarshalerOption(httputil.ProtoContentType, protopb),
 		gwruntime.WithMarshalerOption(httputil.AltProtoContentType, protopb),
 		gwruntime.WithOutgoingHeaderMatcher(authenticationHeaderMatcher),
+		gwruntime.WithMetadata(forwardAuthenticationMetadata),
 	)
 	gwCtx, gwCancel := context.WithCancel(s.AnnotateCtx(context.Background()))
 	s.stopper.AddCloser(stop.CloserFn(gwCancel))
@@ -1069,30 +1323,25 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			msg)
 	}).Stop()
 
+	var hlcUpperBoundExists bool
 	if len(bootstrappedEngines) > 0 {
-		// We might have to sleep a bit to protect against this node producing non-
-		// monotonic timestamps. Before restarting, its clock might have been driven
-		// by other nodes' fast clocks, but when we restarted, we lost all this
-		// information. For example, a client might have written a value at a
-		// timestamp that's in the future of the restarted node's clock, and if we
-		// don't do something, the same client's read would not return the written
-		// value. So, we wait up to MaxOffset; we couldn't have served timestamps more
-		// than MaxOffset in the future (assuming that MaxOffset was not changed, see
-		// #9733).
-		//
-		// As an optimization for tests, we don't sleep if all the stores are brand
-		// new. In this case, the node will not serve anything anyway until it
-		// synchronizes with other nodes.
-		var sleepDuration time.Duration
-		// Don't have to sleep for monotonicity when using clockless reads
-		// (nor can we, for we would sleep forever).
-		if maxOffset := s.clock.MaxOffset(); maxOffset != timeutil.ClocklessMaxOffset {
-			sleepDuration = maxOffset - timeutil.Since(startTime)
+		hlcUpperBound, err := storage.ReadMaxHLCUpperBound(ctx, bootstrappedEngines)
+		if err != nil {
+			log.Fatal(ctx, err)
 		}
-		if sleepDuration > 0 {
-			log.Infof(ctx, "sleeping for %s to guarantee HLC monotonicity", sleepDuration)
-			time.Sleep(sleepDuration)
+
+		if hlcUpperBound > 0 {
+			hlcUpperBoundExists = true
 		}
+
+		ensureClockMonotonicity(
+			ctx,
+			s.clock,
+			startTime,
+			hlcUpperBound,
+			timeutil.SleepUntil,
+		)
+
 	} else if len(s.cfg.GossipBootstrapResolvers) == 0 {
 		// If the _unfiltered_ list of hosts from the --join flag is
 		// empty, then this node can bootstrap a new cluster. We disallow
@@ -1165,6 +1414,14 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 		return err
 	}
 	log.Event(ctx, "started node")
+	s.startPersistingHLCUpperBound(
+		hlcUpperBoundExists,
+		func(t int64) error { /* function to persist upper bound of HLC to all stores */
+			return s.node.SetHLCUpperBound(context.Background(), t)
+		},
+		time.NewTicker,
+	)
+
 	s.execCfg.DistSQLPlanner.SetNodeDesc(s.node.Descriptor)
 
 	// Cluster ID should have been determined by this point.
@@ -1192,7 +1449,7 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 	)
 
 	// Begin recording status summaries.
-	s.node.startWriteSummaries(DefaultMetricsSampleInterval)
+	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
 
 	// Create and start the schema change manager only after a NodeID
 	// has been assigned.
@@ -1212,16 +1469,18 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 		s.execCfg.DistSQLPlanner,
 	).Start(s.stopper)
 
-	s.sqlExecutor.Start(ctx, s.execCfg.DistSQLPlanner)
 	s.distSQLServer.Start()
 	s.pgServer.Start(ctx, s.stopper)
 
 	s.serveMode.set(modeOperational)
 
 	s.mux.Handle(adminPrefix, authHandler)
+	// Exempt the health check endpoint from authentication.
+	s.mux.Handle("/_admin/v1/health", gwMux)
 	s.mux.Handle(ts.URLPrefix, authHandler)
 	s.mux.Handle(statusPrefix, authHandler)
-	s.mux.Handle(authPrefix, gwMux)
+	s.mux.Handle(loginPath, gwMux)
+	s.mux.Handle(logoutPath, authHandler)
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 	log.Event(ctx, "added http endpoints")
 
@@ -1290,10 +1549,9 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 	migMgr := sqlmigrations.NewManager(
 		s.stopper,
 		s.db,
-		s.sqlExecutor,
+		s.internalExecutor,
 		s.clock,
 		mmKnobs,
-		&s.internalMemMetrics,
 		s.NodeID().String(),
 	)
 	if err := migMgr.EnsureMigrations(ctx); err != nil {
@@ -1311,6 +1569,9 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 	log.Info(ctx, "serving sql connections")
 	// Start servicing SQL connections.
 
+	// Attempt to upgrade cluster version.
+	s.startAttemptUpgrade(ctx)
+
 	pgCtx := s.pgServer.AmbientCtx.AnnotateCtx(context.Background())
 	s.stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 		select {
@@ -1322,13 +1583,7 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 			connCtx := log.WithLogTagStr(pgCtx, "client", conn.RemoteAddr().String())
 			setTCPKeepAlive(connCtx, conn)
 
-			var serveFn func(ctx context.Context, conn net.Conn) error
-			if !s.cfg.UseLegacyConnHandling {
-				serveFn = s.pgServer.ServeConn2
-			} else {
-				serveFn = s.pgServer.ServeConn
-			}
-			if err := serveFn(connCtx, conn); err != nil && !netutil.IsClosedConnection(err) {
+			if err := s.pgServer.ServeConn(connCtx, conn); err != nil && !netutil.IsClosedConnection(err) {
 				// Report the error on this connection's context, so that we
 				// know which remote client caused the error when looking at
 				// the logs.
@@ -1545,7 +1800,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(httputil.ContentEncodingHeader, httputil.GzipEncoding)
 		gzw := newGzipResponseWriter(w)
 		defer func() {
-			if err := gzw.Close(); err != nil {
+			// Certain requests must not have a body, yet closing the gzip writer will
+			// attempt to write the gzip header. Avoid logging a warning in this case.
+			// This is notably triggered by:
+			//
+			// curl -H 'Accept-Encoding: gzip' \
+			// 	    -H 'If-Modified-Since: Thu, 29 Mar 2018 22:36:32 GMT' \
+			//      -v http://localhost:8080/favicon.ico > /dev/null
+			//
+			// which results in a 304 Not Modified.
+			if err := gzw.Close(); err != nil && err != http.ErrBodyNotAllowed {
 				ctx := s.AnnotateCtx(r.Context())
 				log.Warningf(ctx, "error closing gzip response writer: %v", err)
 			}
@@ -1559,6 +1823,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // It is empty for an in-memory temp storage.
 func (s *Server) TempDir() string {
 	return s.cfg.TempStorageConfig.Path
+}
+
+// PGServer exports the pgwire server. Used by tests.
+func (s *Server) PGServer() *pgwire.Server {
+	return s.pgServer
 }
 
 type gzipResponseWriter struct {
@@ -1646,4 +1915,40 @@ func officialAddr(
 	}
 
 	return util.NewUnresolvedAddr(lnAddr.Network(), net.JoinHostPort(host, port)), nil
+}
+
+func serveUIAssets(fileServer http.Handler, cfg Config) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/" {
+			fileServer.ServeHTTP(writer, request)
+			return
+		}
+
+		// Construct arguments for template.
+		tmplArgs := ui.IndexHTMLArgs{
+			ExperimentalUseLogin: cfg.EnableWebSessionAuthentication,
+			LoginEnabled:         cfg.RequireWebSession(),
+			Version:              build.VersionPrefix(),
+		}
+		loggedInUser, ok := request.Context().Value(webSessionUserKey{}).(string)
+		if ok && loggedInUser != "" {
+			tmplArgs.LoggedInUser = &loggedInUser
+		}
+
+		argsJSON, err := json.Marshal(tmplArgs)
+		if err != nil {
+			http.Error(writer, err.Error(), 500)
+		}
+
+		// Execute the template.
+		writer.Header().Add("Content-Type", "text/html")
+		if err := ui.IndexHTMLTemplate.Execute(writer, map[string]template.JS{
+			"DataFromServer": template.JS(string(argsJSON)),
+		}); err != nil {
+			wrappedErr := errors.Wrap(err, "templating index.html")
+			http.Error(writer, wrappedErr.Error(), 500)
+			log.Error(request.Context(), wrappedErr)
+			return
+		}
+	})
 }

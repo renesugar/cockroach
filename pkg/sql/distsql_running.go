@@ -98,6 +98,9 @@ func (dsp *DistSQLPlanner) initRunners() {
 // Run executes a physical plan. The plan should have been finalized using
 // FinalizePlan.
 //
+// txn is the transaction in which the plan will run. If nil, the different
+// processors are expected to manage their own internal transactions.
+//
 // All errors encoutered are reported to the distSQLReceiver's resultWriter.
 // Additionally, if the error is a "communication error" (an error encoutered
 // while using that resultWriter), the error is also stored in
@@ -112,6 +115,11 @@ func (dsp *DistSQLPlanner) Run(
 ) {
 	ctx := planCtx.ctx
 
+	var txnProto *roachpb.Transaction
+	if txn != nil {
+		txnProto = txn.Proto()
+	}
+
 	if err := planCtx.sanityCheckAddresses(); err != nil {
 		recv.SetError(err)
 		return
@@ -121,7 +129,7 @@ func (dsp *DistSQLPlanner) Run(
 
 	if logPlanDiagram {
 		log.VEvent(ctx, 1, "creating plan diagram")
-		json, url, err := distsqlrun.GeneratePlanDiagramWithURL(flows)
+		json, url, err := distsqlrun.GeneratePlanDiagramURL(flows)
 		if err != nil {
 			log.Infof(ctx, "Error generating diagram: %s", err)
 		} else {
@@ -140,10 +148,6 @@ func (dsp *DistSQLPlanner) Run(
 	thisNodeID := dsp.nodeDesc.NodeID
 
 	evalCtxProto := distsqlrun.MakeEvalContext(evalCtx.EvalContext)
-	iter := evalCtx.SessionData.SearchPath.Iter()
-	for s, ok := iter(); ok; s, ok = iter() {
-		evalCtxProto.SearchPath = append(evalCtxProto.SearchPath, s)
-	}
 
 	// Start all the flows except the flow on this node (there is always a flow on
 	// this node).
@@ -158,7 +162,7 @@ func (dsp *DistSQLPlanner) Run(
 		}
 		req := &distsqlrun.SetupFlowRequest{
 			Version:     distsqlrun.Version,
-			Txn:         *txn.Proto(),
+			Txn:         txnProto,
 			Flow:        flowSpec,
 			EvalContext: evalCtxProto,
 		}
@@ -198,11 +202,11 @@ func (dsp *DistSQLPlanner) Run(
 	// Set up the flow on this node.
 	localReq := distsqlrun.SetupFlowRequest{
 		Version:     distsqlrun.Version,
-		Txn:         *txn.Proto(),
+		Txn:         txnProto,
 		Flow:        flows[thisNodeID],
 		EvalContext: evalCtxProto,
 	}
-	ctx, flow, err := dsp.distSQLSrv.SetupSyncFlow(ctx, &localReq, recv)
+	ctx, flow, err := dsp.distSQLSrv.SetupSyncFlow(ctx, evalCtx.Mon, &localReq, recv)
 	if err != nil {
 		recv.SetError(err)
 		return
@@ -283,6 +287,8 @@ type errWrap struct {
 // rowResultWriter is a subset of CommandResult to be used with the
 // distSQLReceiver. It's implemented by RowResultWriter.
 type rowResultWriter interface {
+	// AddRow writes a result row.
+	// Note that the caller owns the row slice and might reuse it.
 	AddRow(ctx context.Context, row tree.Datums) error
 	IncrementRowsAffected(n int)
 	SetError(error)

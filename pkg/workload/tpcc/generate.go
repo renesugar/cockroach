@@ -18,6 +18,8 @@ package tpcc
 import (
 	"math/rand"
 	"strconv"
+
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // These constants are all set by the spec - they're not knobs. Don't change
@@ -34,11 +36,6 @@ const (
 	numNewOrdersPerWarehouse = numNewOrdersPerDistrict * numDistrictsPerWarehouse
 	minOrderLinesPerOrder    = 5
 	maxOrderLinesPerOrder    = 15
-
-	// TODO(dan): This doesn't match the spec, it should be rand 5-15 per order.
-	hackOrderLinesPerOrder     = (minOrderLinesPerOrder + maxOrderLinesPerOrder) / 2
-	hackOrderLinesPerDistrict  = hackOrderLinesPerOrder * numOrdersPerDistrict
-	hackOrderLinesPerWarehouse = hackOrderLinesPerDistrict * numDistrictsPerWarehouse
 
 	originalString = "ORIGINAL"
 	wYtd           = 300000.00
@@ -188,18 +185,21 @@ func (w *tpcc) tpccHistoryInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
 
+	rowID := uuid.MakeV4().String()
 	cID := (rowIdx % numCustomersPerDistrict) + 1
 	dID := ((rowIdx / numCustomersPerDistrict) % numDistrictsPerWarehouse) + 1
 	wID := (rowIdx / numCustomersPerWarehouse)
 
 	return []interface{}{
-		cID, dID, wID, dID, wID, w.nowString, 10.00, randAString(rng, 12, 24),
+		rowID, cID, dID, wID, dID, wID, w.nowString, 10.00, randAString(rng, 12, 24),
 	}
 }
 
 func (w *tpcc) tpccOrderInitialRow(rowIdx int) []interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
+	rng.Seed(w.seed + int64(rowIdx))
+	numOrderLines := randInt(rng, minOrderLinesPerOrder, maxOrderLinesPerOrder)
 
 	oID := (rowIdx % numOrdersPerDistrict) + 1
 	dID := ((rowIdx / numOrdersPerDistrict) % numDistrictsPerWarehouse) + 1
@@ -226,16 +226,13 @@ func (w *tpcc) tpccOrderInitialRow(rowIdx int) []interface{} {
 		w.randomCIDsCache.Unlock()
 	}
 
-	// TODO(dan): This doesn't match the spec, it should be rand 5-15 per order.
-	olCnt := hackOrderLinesPerOrder
-
 	var carrierID interface{}
 	if oID < 2101 {
 		carrierID = strconv.Itoa(randInt(rng, 1, 10))
 	}
 
 	return []interface{}{
-		oID, dID, wID, cID, w.nowString, carrierID, olCnt, 1,
+		oID, dID, wID, cID, w.nowString, carrierID, numOrderLines, 1,
 	}
 }
 
@@ -251,31 +248,39 @@ func (w *tpcc) tpccNewOrderInitialRow(rowIdx int) []interface{} {
 	}
 }
 
-func (w *tpcc) tpccOrderLineInitialRow(rowIdx int) []interface{} {
+func (w *tpcc) tpccOrderLineInitialRowBatch(orderRowIdx int) [][]interface{} {
 	rng := w.rngPool.Get().(*rand.Rand)
 	defer w.rngPool.Put(rng)
+	rng.Seed(w.seed + int64(orderRowIdx))
+	numOrderLines := randInt(rng, minOrderLinesPerOrder, maxOrderLinesPerOrder)
 
-	olNumber := (rowIdx % hackOrderLinesPerOrder) + 1
-	oID := ((rowIdx / hackOrderLinesPerOrder) % numOrdersPerDistrict) + 1
-	dID := ((rowIdx / hackOrderLinesPerDistrict) % numDistrictsPerWarehouse) + 1
-	wID := (rowIdx / hackOrderLinesPerWarehouse)
+	// NB: There is one batch of order_line rows per order
+	oID := (orderRowIdx % numOrdersPerDistrict) + 1
+	dID := ((orderRowIdx / numOrdersPerDistrict) % numDistrictsPerWarehouse) + 1
+	wID := (orderRowIdx / numOrdersPerWarehouse)
 
-	var amount float64
-	var deliveryD interface{}
-	if oID < 2101 {
-		amount = 0
-		deliveryD = w.nowString
-	} else {
-		amount = float64(randInt(rng, 1, 999999)) / 100.0
+	var rows [][]interface{}
+	for i := 0; i < numOrderLines; i++ {
+		olNumber := i + 1
+
+		var amount float64
+		var deliveryD interface{}
+		if oID < 2101 {
+			amount = 0
+			deliveryD = w.nowString
+		} else {
+			amount = float64(randInt(rng, 1, 999999)) / 100.0
+		}
+
+		rows = append(rows, []interface{}{
+			oID, dID, wID, olNumber,
+			randInt(rng, 1, 100000), // ol_i_id
+			wID, // supply_w_id
+			deliveryD,
+			5, // quantity
+			amount,
+			randAString(rng, 24, 24),
+		})
 	}
-
-	return []interface{}{
-		oID, dID, wID, olNumber,
-		randInt(rng, 1, 100000), // ol_i_id
-		wID, // supply_w_id
-		deliveryD,
-		5, // quantity
-		amount,
-		randAString(rng, 24, 24),
-	}
+	return rows
 }

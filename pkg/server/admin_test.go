@@ -228,7 +228,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
@@ -238,24 +238,17 @@ func TestAdminAPIDatabases(t *testing.T) {
 
 	// Test databases endpoint.
 	const testdb = "test"
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		&sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	query := "CREATE DATABASE " + testdb
-	createRes, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	defer createRes.Close(ctx)
 
 	var resp serverpb.DatabasesResponse
 	if err := getAdminJSONProto(s, "databases", &resp); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedDBs := []string{"system", testdb}
+	expectedDBs := []string{"defaultdb", "postgres", "system", testdb}
 	if a, e := len(resp.Databases), len(expectedDBs); a != e {
 		t.Fatalf("length of result %d != expected %d", a, e)
 	}
@@ -271,18 +264,14 @@ func TestAdminAPIDatabases(t *testing.T) {
 	privileges := []string{"SELECT", "UPDATE"}
 	testuser := "testuser"
 	createUserQuery := "CREATE USER " + testuser
-	createUserRes, err := s.(*TestServer).sqlExecutor.ExecuteStatementsBuffered(session, createUserQuery, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(createUserQuery); err != nil {
 		t.Fatal(err)
 	}
-	defer createUserRes.Close(ctx)
 
 	grantQuery := "GRANT " + strings.Join(privileges, ", ") + " ON DATABASE " + testdb + " TO " + testuser
-	grantRes, err := s.(*TestServer).sqlExecutor.ExecuteStatementsBuffered(session, grantQuery, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(grantQuery); err != nil {
 		t.Fatal(err)
 	}
-	defer grantRes.Close(ctx)
 
 	var details serverpb.DatabaseDetailsResponse
 	if err := getAdminJSONProto(s, "databases/"+testdb, &details); err != nil {
@@ -323,7 +312,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	}
 
 	// Verify Descriptor ID.
-	path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{testdb})
+	path, err := ts.admin.queryDescriptorIDPath(ctx, sql.SessionArgs{User: security.RootUser}, []string{testdb})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +388,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 		{name: "upper", dbName: "TEST", tblName: "TBL"}, // Regression test for issue #14056
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 			defer s.Stopper().Stop(context.TODO())
 			ts := s.(*TestServer)
 
@@ -410,11 +399,6 @@ func TestAdminAPITableDetails(t *testing.T) {
 			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 			defer span.Finish()
 
-			session := sql.NewSession(
-				ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-				&sql.MemoryMetrics{}, nil /* conn */)
-			session.StartUnlimitedMonitor()
-			defer session.Finish(ts.sqlExecutor)
 			setupQueries := []string{
 				fmt.Sprintf("CREATE DATABASE %s", escDBName),
 				fmt.Sprintf(`CREATE TABLE %s.%s (
@@ -431,11 +415,9 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			for _, q := range setupQueries {
-				res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-				if err != nil {
-					t.Fatalf("error executing '%s': %s", q, err)
+				if _, err := db.Exec(q); err != nil {
+					t.Fatal(err)
 				}
-				res.Close(ctx)
 			}
 
 			// Perform API call.
@@ -510,19 +492,11 @@ func TestAdminAPITableDetails(t *testing.T) {
 			// Verify Create Table Statement.
 			{
 
-				const createTableCol = "CreateTable"
 				showCreateTableQuery := fmt.Sprintf("SHOW CREATE TABLE %s.%s", escDBName, escTblName)
 
-				resSet, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, showCreateTableQuery, nil, 1)
-				if err != nil {
-					t.Fatalf("error executing '%s': %s", showCreateTableQuery, err)
-				}
-				defer resSet.Close(ctx)
-
-				res := resSet.ResultList[0]
-				scanner := makeResultScanner(res.Columns)
-				var createStmt string
-				if err := scanner.Scan(res.Rows.At(0), createTableCol, &createStmt); err != nil {
+				row := db.QueryRow(showCreateTableQuery)
+				var createStmt, tableName string
+				if err := row.Scan(&tableName, &createStmt); err != nil {
 					t.Fatal(err)
 				}
 
@@ -532,7 +506,9 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			path, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{tc.dbName, tc.tblName})
+			path, err := ts.admin.queryDescriptorIDPath(
+				ctx, sql.SessionArgs{User: security.RootUser}, []string{tc.dbName, tc.tblName},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -547,7 +523,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 // for both DatabaseDetailsResponse AND TableDetailsResponse.
 func TestAdminAPIZoneDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
@@ -555,20 +531,14 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		&sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
 	setupQueries := []string{
 		"CREATE DATABASE test",
 		"CREATE TABLE test.tbl (val STRING)",
 	}
 	for _, q := range setupQueries {
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-		if err != nil {
+		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("error executing '%s': %s", q, err)
 		}
-		res.Close(ctx)
 	}
 
 	// Function to verify the zone for table "test.tbl" as returned by the Admin
@@ -618,14 +588,9 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 		const query = `INSERT INTO system.zones VALUES($1, $2)`
-		params := tree.MakePlaceholderInfo()
-		params.SetValue(`1`, tree.NewDInt(tree.DInt(id)))
-		params.SetValue(`2`, tree.NewDBytes(tree.DBytes(zoneBytes)))
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, &params, 1)
-		if err != nil {
+		if _, err := db.Exec(query, id, zoneBytes); err != nil {
 			t.Fatalf("error executing '%s': %s", query, err)
 		}
-		res.Close(ctx)
 	}
 
 	// Verify zone matches cluster default.
@@ -634,7 +599,9 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 	// Get ID path for table. This will be an array of three IDs, containing the ID of the root namespace,
 	// the database, and the table (in that order).
-	idPath, err := ts.admin.queryDescriptorIDPath(ctx, session, []string{"test", "tbl"})
+	idPath, err := ts.admin.queryDescriptorIDPath(
+		ctx, sql.SessionArgs{User: security.RootUser}, []string{"test", "tbl"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,27 +625,16 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 
 func TestAdminAPIUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	ts := s.(*TestServer)
 
 	// Create sample users.
-	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		&sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	query := `
 INSERT INTO system.users (username, "hashedPassword")
 VALUES ('adminUser', 'abc'), ('bob', 'xyz')`
-	res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, query, nil, 1)
-	if err != nil {
+	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
-	defer res.Close(ctx)
 
 	// Query the API for users.
 	var resp serverpb.UsersResponse
@@ -704,18 +660,9 @@ VALUES ('adminUser', 'abc'), ('bob', 'xyz')`
 
 func TestAdminAPIEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.TODO())
-	ts := s.(*TestServer)
 
-	ac := log.AmbientContext{Tracer: s.ClusterSettings().Tracer}
-	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
-	defer span.Finish()
-	session := sql.NewSession(
-		ctx, sql.SessionArgs{User: security.RootUser}, ts.sqlExecutor,
-		&sql.MemoryMetrics{}, nil /* conn */)
-	session.StartUnlimitedMonitor()
-	defer session.Finish(ts.sqlExecutor)
 	setupQueries := []string{
 		"CREATE DATABASE api_test",
 		"CREATE TABLE api_test.tbl1 (a INT)",
@@ -726,11 +673,9 @@ func TestAdminAPIEvents(t *testing.T) {
 		"SET CLUSTER SETTING cluster.organization = 'somestring';",
 	}
 	for _, q := range setupQueries {
-		res, err := ts.sqlExecutor.ExecuteStatementsBuffered(session, q, nil, 1)
-		if err != nil {
+		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("error executing '%s': %s", q, err)
 		}
-		res.Close(ctx)
 	}
 
 	const allEvents = ""
@@ -744,7 +689,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		{sql.EventLogNodeJoin, false, 0, 1},
 		{sql.EventLogNodeRestart, false, 0, 0},
 		{sql.EventLogDropDatabase, false, 0, 0},
-		{sql.EventLogCreateDatabase, false, 0, 1},
+		{sql.EventLogCreateDatabase, false, 0, 3},
 		{sql.EventLogDropTable, false, 0, 2},
 		{sql.EventLogCreateTable, false, 0, 3},
 		{sql.EventLogSetClusterSetting, false, 0, 5},
@@ -846,8 +791,14 @@ func TestAdminAPISettings(t *testing.T) {
 		}
 		typ := ref.Typ()
 
-		if ref.String(&st.SV) != v.Value {
-			t.Errorf("%s: expected value %s, got %s", k, ref, v.Value)
+		if typ == "s" && k != "version" {
+			if v.Value != "<redacted>" && v.Value != "" {
+				t.Errorf("%s: expected redacted value for %v, got %s", k, ref, v.Value)
+			}
+		} else {
+			if ref.String(&st.SV) != v.Value {
+				t.Errorf("%s: expected value %v, got %s", k, ref, v.Value)
+			}
 		}
 
 		if desc := ref.Description(); desc != v.Description {
@@ -1090,9 +1041,7 @@ func TestHealthAPI(t *testing.T) {
 	}
 	s.Clock().Update(hlc.Timestamp(self.Expiration).Add(1, 0))
 
-	// Health API is not accessible if the node is not accessible, because it
-	// cannot verify the authentication session.
-	expected := "500 Internal Server Error"
+	expected := "503 Service Unavailable"
 	var resp serverpb.HealthResponse
 	for {
 		if err := getAdminJSONProto(s, "health", &resp); !testutils.IsError(err, expected) {
@@ -1347,4 +1296,155 @@ func TestAdminAPIFullRangeLog(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdminAPIReplicaMatrix(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Skip("#24802")
+
+	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+
+	firstServer := testCluster.Server(0)
+	sqlDB := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+
+	// Create some tables.
+	sqlDB.Exec(t, `CREATE DATABASE roachblog`)
+	sqlDB.Exec(t, `CREATE TABLE roachblog.posts (id INT PRIMARY KEY, title text, body text)`)
+	sqlDB.Exec(t, `CREATE TABLE roachblog.comments (
+		id INT PRIMARY KEY,
+		post_id INT REFERENCES roachblog.posts,
+		body text
+	)`)
+	// Test special characters in DB and table names.
+	sqlDB.Exec(t, `CREATE DATABASE "sp'ec\ch""ars"`)
+	sqlDB.Exec(t, `CREATE TABLE "sp'ec\ch""ars"."more\spec'chars" (id INT PRIMARY KEY)`)
+
+	// Verify that we see their replicas in the ReplicaMatrix response, evenly spread
+	// across the test cluster's three nodes.
+
+	expectedResp := map[string]serverpb.ReplicaMatrixResponse_DatabaseInfo{
+		"roachblog": {
+			TableInfo: map[string]serverpb.ReplicaMatrixResponse_TableInfo{
+				"posts": {
+					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
+						1: 1,
+						2: 1,
+						3: 1,
+					},
+				},
+				"comments": {
+					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
+						1: 1,
+						2: 1,
+						3: 1,
+					},
+				},
+			},
+		},
+		`sp'ec\ch"ars`: {
+			TableInfo: map[string]serverpb.ReplicaMatrixResponse_TableInfo{
+				`more\spec'chars`: {
+					ReplicaCountByNodeId: map[roachpb.NodeID]int64{
+						1: 1,
+						2: 1,
+						3: 1,
+					},
+				},
+			},
+		},
+	}
+
+	// Wait for the new tables' ranges to be created and replicated.
+	testutils.SucceedsSoon(t, func() error {
+		var resp serverpb.ReplicaMatrixResponse
+		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
+			t.Fatal(err)
+		}
+
+		delete(resp.DatabaseInfo, "system") // delete results for system database.
+		if !reflect.DeepEqual(resp.DatabaseInfo, expectedResp) {
+			return fmt.Errorf("expected %v; got %v", expectedResp, resp.DatabaseInfo)
+		}
+
+		// Don't test anything about the zone configs for now; just verify that something is there.
+		if len(resp.ZoneConfigs) == 0 {
+			return fmt.Errorf("no zone configs returned")
+		}
+
+		return nil
+	})
+
+	// Add a zone config.
+	sqlDB.Exec(t, `ALTER TABLE roachblog.posts EXPERIMENTAL CONFIGURE ZONE 'num_replicas: 1'`)
+
+	expectedNewZoneConfigID := int64(51)
+	sqlDB.CheckQueryResults(
+		t,
+		`SELECT id
+		FROM [EXPERIMENTAL SHOW ALL ZONE CONFIGURATIONS]
+		WHERE cli_specifier = 'roachblog.posts'`,
+		[][]string{
+			{fmt.Sprintf("%d", expectedNewZoneConfigID)},
+		},
+	)
+
+	// Verify that we see the zone config and its effects.
+	testutils.SucceedsSoon(t, func() error {
+		var resp serverpb.ReplicaMatrixResponse
+		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
+			t.Fatal(err)
+		}
+
+		postsTableInfo := resp.DatabaseInfo["roachblog"].TableInfo["posts"]
+
+		// Verify that the TableInfo for roachblog.posts points at the new zone config.
+		if postsTableInfo.ZoneConfigId != expectedNewZoneConfigID {
+			t.Fatalf(
+				"expected roachblog.posts to have zone config id %d; had %d",
+				expectedNewZoneConfigID, postsTableInfo.ZoneConfigId,
+			)
+		}
+
+		// Verify that the num_replicas setting has taken effect.
+		numPostsReplicas := int64(0)
+		for _, count := range postsTableInfo.ReplicaCountByNodeId {
+			numPostsReplicas += count
+		}
+
+		if numPostsReplicas != 1 {
+			return fmt.Errorf("expected 1 replica; got %d", numPostsReplicas)
+		}
+
+		return nil
+	})
+}
+
+func BenchmarkAdminAPIReplicaMatrix(b *testing.B) {
+	testCluster := serverutils.StartTestCluster(b, 3, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(context.Background())
+
+	firstServer := testCluster.Server(0)
+	sqlDB := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+
+	sqlDB.Exec(b, `CREATE DATABASE roachblog`)
+
+	// Create a bunch of tables.
+	for i := 0; i < 200; i++ {
+		sqlDB.Exec(
+			b,
+			fmt.Sprintf(`CREATE TABLE roachblog.t%d (id INT PRIMARY KEY, title text, body text)`, i),
+		)
+		// TODO(vilterp): split to increase the number of ranges for each table
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		var resp serverpb.ReplicaMatrixResponse
+		if err := getAdminJSONProto(firstServer, "replica_matrix", &resp); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
 }

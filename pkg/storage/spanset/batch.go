@@ -47,6 +47,11 @@ func NewIterator(iter engine.Iterator, spans *SpanSet) *Iterator {
 	}
 }
 
+// Stats is part of the engine.Iterator interface.
+func (s *Iterator) Stats() engine.IteratorStats {
+	return s.i.Stats()
+}
+
 // Close is part of the engine.Iterator interface.
 func (s *Iterator) Close() {
 	s.i.Close()
@@ -228,12 +233,14 @@ func (s spanSetReader) Iterate(
 	return s.r.Iterate(start, end, f)
 }
 
-func (s spanSetReader) NewIterator(prefix bool) engine.Iterator {
-	return &Iterator{s.r.NewIterator(prefix), s.spans, nil, false}
+func (s spanSetReader) NewIterator(opts engine.IterOptions) engine.Iterator {
+	return &Iterator{s.r.NewIterator(opts), s.spans, nil, false}
 }
 
-func (s spanSetReader) NewTimeBoundIterator(start, end hlc.Timestamp) engine.Iterator {
-	return &Iterator{s.r.NewTimeBoundIterator(start, end), s.spans, nil, false}
+func (s spanSetReader) NewTimeBoundIterator(
+	start, end hlc.Timestamp, withStats bool,
+) engine.Iterator {
+	return &Iterator{s.r.NewTimeBoundIterator(start, end, withStats), s.spans, nil, false}
 }
 
 type spanSetWriter struct {
@@ -307,6 +314,12 @@ func makeSpanSetReadWriter(rw engine.ReadWriter, spans *SpanSet) spanSetReadWrit
 	}
 }
 
+// NewReadWriter returns an engine.ReadWriter that asserts access of the
+// underlying ReadWriter against the given SpanSet.
+func NewReadWriter(rw engine.ReadWriter, spans *SpanSet) engine.ReadWriter {
+	return makeSpanSetReadWriter(rw, spans)
+}
+
 type spanSetBatch struct {
 	spanSetReadWriter
 	b     engine.Batch
@@ -321,6 +334,10 @@ func (s spanSetBatch) Commit(sync bool) error {
 
 func (s spanSetBatch) Distinct() engine.ReadWriter {
 	return makeSpanSetReadWriter(s.b.Distinct(), s.spans)
+}
+
+func (s spanSetBatch) Empty() bool {
+	return s.b.Empty()
 }
 
 func (s spanSetBatch) Repr() []byte {

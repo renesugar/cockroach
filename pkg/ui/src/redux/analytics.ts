@@ -80,15 +80,15 @@ export class AnalyticsSync {
 
      /**
       * Construct a new AnalyticsSync object.
-      * @param analytics Underlying interface to push to the analytics service.
-      * @param store The redux store for the Admin UI.
+      * @param analyticsService Underlying interface to push to the analytics service.
+      * @param deprecatedStore The redux store for the Admin UI. [DEPRECATED]
       * @param redactions A list of redaction regular expressions, used to
       * scrub any potential personally-identifying information from the data
       * being tracked.
       */
     constructor(
-        private analytics: Analytics,
-        private store: Store<AdminUIState>,
+        private analyticsService: Analytics,
+        private deprecatedStore: Store<AdminUIState>,
         private redactions: PageTrackRedaction[],
     ) {}
 
@@ -147,13 +147,13 @@ export class AnalyticsSync {
         }
 
         // Do nothing if version information is not yet available.
-        const state = this.store.getState();
+        const state = this.deprecatedStore.getState();
         const versions = versionsSelector(state);
         if (_.isEmpty(versions)) {
             return;
         }
 
-        this.analytics.identify({
+        this.analyticsService.identify({
             userId: cluster_id,
             traits: {
                 version: versions[0],
@@ -170,7 +170,7 @@ export class AnalyticsSync {
      * to eventually retrieve this without having to request it ourselves.
      */
     private getCluster(): ClusterResponse | null {
-        const state = this.store.getState();
+        const state = this.deprecatedStore.getState();
 
         // Do nothing if cluster ID has not been loaded.
         const cluster = state.cachedData.cluster;
@@ -188,9 +188,33 @@ export class AnalyticsSync {
 
         // Loop through redactions, if any matches return the appropriate
         // redacted string.
-        let path = location.pathname;
+        const path = this.redact(location.pathname);
+        let search = "";
+
+        if (location.search && location.search.length > 1) {
+            const query = location.search.slice(1);
+            const params = new URLSearchParams(query);
+
+            for (const param of params) {
+                params.set(param[0], this.redact(param[1]));
+            }
+
+            search = "?" + params.toString();
+        }
+
+        this.analyticsService.page({
+            userId: userID,
+            name: path,
+            properties: {
+                path,
+                search,
+            },
+        });
+    }
+
+    private redact(path: string): string {
         _.each(this.redactions, (r) => {
-            if (r.match.test(location.pathname)) {
+            if (r.match.test(path)) {
 
                 // Apparently TypeScript doesn't know how to dispatch functions.
                 // If there are two function overloads defined (as with
@@ -207,14 +231,7 @@ export class AnalyticsSync {
                 return false;
             }
         });
-
-        this.analytics.page({
-            userId: userID,
-            name: path,
-            properties: {
-                path,
-            },
-        });
+        return path;
     }
 }
 
@@ -238,9 +255,10 @@ history.listen((location) => {
   }
   lastPageLocation = location;
   analytics.page(location);
-  analytics.identify();
 });
 
 // Record the initial page that was accessed; listen won't fire for the first
 // page loaded.
 analytics.page(history.getCurrentLocation());
+// Identify the cluster.
+analytics.identify();

@@ -25,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -51,8 +53,8 @@ func TestAllocateIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	desc := TableDescriptor{
-		ID:       keys.MaxReservedDescID + 2,
-		ParentID: keys.MaxReservedDescID + 1,
+		ParentID: keys.MinUserDescID,
+		ID:       keys.MinUserDescID + 1,
 		Name:     "foo",
 		Columns: []ColumnDescriptor{
 			{Name: "a"},
@@ -72,8 +74,8 @@ func TestAllocateIDs(t *testing.T) {
 	}
 
 	expected := TableDescriptor{
-		ID:       keys.MaxReservedDescID + 2,
-		ParentID: keys.MaxReservedDescID + 1,
+		ParentID: keys.MinUserDescID,
+		ID:       keys.MinUserDescID + 1,
 		Version:  1,
 		Name:     "foo",
 		Columns: []ColumnDescriptor{
@@ -614,7 +616,7 @@ func TestValidateTableDesc(t *testing.T) {
 			}},
 	}
 	for i, d := range testData {
-		if err := d.desc.ValidateTable(); err == nil {
+		if err := d.desc.ValidateTable(cluster.MakeTestingClusterSettings()); err == nil {
 			t.Errorf("%d: expected \"%s\", but found success: %+v", i, d.err, d.desc)
 		} else if d.err != err.Error() {
 			t.Errorf("%d: expected \"%s\", but found \"%+v\"", i, d.err, err)
@@ -1250,7 +1252,7 @@ func TestMaybeUpgradeFormatVersion(t *testing.T) {
 	}
 	for i, test := range tests {
 		desc := test.desc
-		upgraded := desc.MaybeUpgradeFormatVersion()
+		upgraded := desc.maybeUpgradeFormatVersion()
 		if upgraded != test.expUpgrade {
 			t.Fatalf("%d: expected upgraded=%t, but got upgraded=%t", i, test.expUpgrade, upgraded)
 		}
@@ -1344,5 +1346,16 @@ func TestKeysPerRow(t *testing.T) {
 				t.Errorf("expected %d keys got %d", test.expected, keys)
 			}
 		})
+	}
+}
+
+func TestDatumTypeToColumnSemanticType(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, typ := range types.AnyNonArray {
+		_, err := DatumTypeToColumnSemanticType(typ)
+		if err != nil {
+			t.Errorf("couldn't get semantic type: %s", err)
+		}
 	}
 }

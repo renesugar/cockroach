@@ -69,7 +69,11 @@ var _ Processor = &interleavedReaderJoiner{}
 
 // newInterleavedReaderJoiner creates a interleavedReaderJoiner.
 func newInterleavedReaderJoiner(
-	flowCtx *FlowCtx, spec *InterleavedReaderJoinerSpec, post *PostProcessSpec, output RowReceiver,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *InterleavedReaderJoinerSpec,
+	post *PostProcessSpec,
+	output RowReceiver,
 ) (*interleavedReaderJoiner, error) {
 	if flowCtx.nodeID == 0 {
 		return nil, errors.Errorf("attempting to create an interleavedReaderJoiner with uninitialized NodeID")
@@ -161,6 +165,7 @@ func newInterleavedReaderJoiner(
 	// TODO(richardwu): Generalize this to 2+ tables.
 	if err := irj.joinerBase.init(
 		flowCtx,
+		processorID,
 		irj.tables[0].post.outputTypes,
 		irj.tables[1].post.outputTypes,
 		spec.Type,
@@ -170,6 +175,7 @@ func newInterleavedReaderJoiner(
 		0,   /*numMergedColumns*/
 		post,
 		output,
+		procStateOpts{}, // irj doesn't implement RowSource and so doesn't use it.
 	); err != nil {
 		return nil, err
 	}
@@ -194,10 +200,7 @@ func (irj *interleavedReaderJoiner) initRowFetcher(
 		// since we do not expect any projections or rendering
 		// on a scan before a join.
 		args[i].ValNeededForCol.AddRange(0, len(desc.Columns)-1)
-		args[i].ColIdxMap = make(map[sqlbase.ColumnID]int, len(desc.Columns))
-		for j, c := range desc.Columns {
-			args[i].ColIdxMap[c.ID] = j
-		}
+		args[i].ColIdxMap = desc.ColumnIdxMap()
 		args[i].Desc = &desc
 		args[i].Cols = desc.Columns
 		args[i].Spans = make(roachpb.Spans, len(table.Spans))
@@ -222,19 +225,22 @@ func (irj *interleavedReaderJoiner) sendMisplannedRangesMetadata(ctx context.Con
 	}
 }
 
-// Run is part of the processor interface.
-func (irj *interleavedReaderJoiner) Run(wg *sync.WaitGroup) {
+const interleavedReaderJoinerProcName = "interleaved reader joiner"
+
+// Run is part of the Processor interface.
+func (irj *interleavedReaderJoiner) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
+
+	irj.startInternal(ctx, interleavedReaderJoinerProcName)
+	defer tracing.FinishSpan(irj.span)
+	ctx = irj.ctx
 
 	tableIDs := make([]sqlbase.ID, len(irj.tables))
 	for i := range tableIDs {
 		tableIDs[i] = irj.tables[i].tableID
 	}
-	ctx := log.WithLogTag(irj.flowCtx.Ctx, "InterleaveReaderJoiner", tableIDs)
-	ctx, span := processorSpan(ctx, "interleaved reader joiner")
-	defer tracing.FinishSpan(span)
 
 	txn := irj.flowCtx.txn
 	if txn == nil {
@@ -256,7 +262,8 @@ func (irj *interleavedReaderJoiner) Run(wg *sync.WaitGroup) {
 		return
 	}
 
-	for {
+	ok := true
+	for ok {
 		row, desc, index, err := irj.fetcher.NextRow(ctx)
 		if err != nil || row == nil {
 			if err != nil {
@@ -287,11 +294,10 @@ func (irj *interleavedReaderJoiner) Run(wg *sync.WaitGroup) {
 		}
 
 		// We post-process the intermediate row from either table.
-		tableRow, consumerStatus, err := tInfo.post.ProcessRow(ctx, row)
-		if err != nil || consumerStatus != NeedMoreRows {
-			if err != nil {
-				irj.out.output.Push(nil /* row */, &ProducerMetadata{Err: err})
-			}
+		var tableRow sqlbase.EncDatumRow
+		tableRow, ok, err = tInfo.post.ProcessRow(ctx, row)
+		if err != nil {
+			irj.out.output.Push(nil /* row */, &ProducerMetadata{Err: err})
 			break
 		}
 
@@ -356,7 +362,7 @@ func (irj *interleavedReaderJoiner) Run(wg *sync.WaitGroup) {
 				break
 			}
 			if renderedRow != nil {
-				consumerStatus, err = irj.out.EmitRow(ctx, renderedRow)
+				consumerStatus, err := irj.out.EmitRow(ctx, renderedRow)
 				if err != nil || consumerStatus != NeedMoreRows {
 					if err != nil {
 						irj.out.output.Push(nil /* row */, &ProducerMetadata{Err: err})
@@ -397,6 +403,7 @@ func (irj *interleavedReaderJoiner) Run(wg *sync.WaitGroup) {
 
 	irj.sendMisplannedRangesMetadata(ctx)
 	sendTraceData(ctx, irj.out.output)
+	sendTxnCoordMetaMaybe(irj.flowCtx.txn, irj.out.output)
 	irj.out.Close()
 }
 

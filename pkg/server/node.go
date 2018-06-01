@@ -55,11 +55,6 @@ import (
 const (
 	// gossipStatusInterval is the interval for logging gossip status.
 	gossipStatusInterval = 1 * time.Minute
-	// gossipNodeDescriptorInterval is the interval for gossiping the node descriptor.
-	// Note that increasing this duration may increase the likelihood of gossip
-	// thrashing, since node descriptors are used to determine the number of gossip
-	// hops between nodes (see #9819 for context).
-	gossipNodeDescriptorInterval = 1 * time.Hour
 
 	// FirstNodeID is the node ID of the first node in a new cluster.
 	FirstNodeID = 1
@@ -188,9 +183,16 @@ func bootstrapCluster(
 	tr := cfg.Settings.Tracer
 	defer tr.Close()
 	cfg.AmbientCtx.Tracer = tr
-	// Create a KV DB with a local sender.
+	// Create a KV DB with a sender that routes all requests to the first range
+	// and first local store.
 	stores := storage.NewStores(cfg.AmbientCtx, cfg.Clock, cfg.Settings.Version.MinSupportedVersion, cfg.Settings.Version.ServerVersion)
-	tcsFactory := kv.NewTxnCoordSenderFactory(cfg.AmbientCtx, cfg.Settings, stores, cfg.Clock, false /* linearizable */, stopper, txnMetrics)
+	localSender := client.Wrap(stores, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
+		ba.RangeID = 1
+		ba.Replica.StoreID = 1
+		return ba
+	})
+	tcsFactory := kv.NewTxnCoordSenderFactory(cfg.AmbientCtx, cfg.Settings, localSender, cfg.Clock,
+		false /* linearizable */, stopper, txnMetrics)
 	cfg.DB = client.NewDB(tcsFactory, cfg.Clock)
 	cfg.Transport = storage.NewDummyRaftTransport(cfg.Settings)
 	if err := cfg.Settings.InitializeVersion(bootstrapVersion); err != nil {
@@ -410,14 +412,6 @@ func (n *Node) start(
 		return err
 	}
 
-	if n.initialBoot {
-		// The cluster was just bootstrapped by this node, explicitly notify the
-		// stores that they were bootstrapped.
-		for _, s := range stores {
-			s.NotifyBootstrapped()
-		}
-	}
-
 	if err := n.startStores(ctx, stores, n.stopper); err != nil {
 		return err
 	}
@@ -465,6 +459,14 @@ func (n *Node) SetDraining(drain bool) error {
 	return n.stores.VisitStores(func(s *storage.Store) error {
 		s.SetDraining(drain)
 		return nil
+	})
+}
+
+// SetHLCUpperBound sets the upper bound of the HLC wall time on all of the
+// node's underlying stores.
+func (n *Node) SetHLCUpperBound(ctx context.Context, hlcUpperBound int64) error {
+	return n.stores.VisitStores(func(s *storage.Store) error {
+		return s.WriteHLCUpperBound(ctx, hlcUpperBound)
 	})
 }
 
@@ -632,7 +634,7 @@ func (n *Node) bootstrapStores(
 	}
 	// write a new status summary after all stores have been bootstrapped; this
 	// helps the UI remain responsive when new nodes are added.
-	if err := n.writeSummaries(ctx); err != nil {
+	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
 		log.Warningf(ctx, "error writing node summary after store bootstrap: %s", err)
 	}
 }
@@ -689,8 +691,8 @@ func (n *Node) startGossip(ctx context.Context, stopper *stop.Stopper) {
 		}
 
 		statusTicker := time.NewTicker(gossipStatusInterval)
-		storesTicker := time.NewTicker(gossip.GossipStoresInterval)
-		nodeTicker := time.NewTicker(gossipNodeDescriptorInterval)
+		storesTicker := time.NewTicker(gossip.StoresInterval)
+		nodeTicker := time.NewTicker(gossip.NodeDescriptorInterval)
 		defer storesTicker.Stop()
 		defer nodeTicker.Stop()
 		n.gossipStores(ctx) // one-off run before going to sleep
@@ -756,15 +758,15 @@ func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
 	})
 }
 
-// startWriteSummaries begins periodically persisting status summaries for the
+// startWriteNodeStatus begins periodically persisting status summaries for the
 // node and its stores.
-func (n *Node) startWriteSummaries(frequency time.Duration) {
+func (n *Node) startWriteNodeStatus(frequency time.Duration) {
 	ctx := log.WithLogTag(n.AnnotateCtx(context.Background()), "summaries", nil)
 	// Immediately record summaries once on server startup.
 	n.stopper.RunWorker(ctx, func(ctx context.Context) {
 		// Write a status summary immediately; this helps the UI remain
 		// responsive when new nodes are added.
-		if err := n.writeSummaries(ctx); err != nil {
+		if err := n.writeNodeStatus(ctx, 0 /* alertTTL */); err != nil {
 			log.Warningf(ctx, "error recording initial status summaries: %s", err)
 		}
 		ticker := time.NewTicker(frequency)
@@ -772,7 +774,11 @@ func (n *Node) startWriteSummaries(frequency time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := n.writeSummaries(ctx); err != nil {
+				// Use an alertTTL of twice the ticker frequency. This makes sure that
+				// alerts don't disappear and reappear spuriously while at the same
+				// time ensuring that an alert doesn't linger for too long after having
+				// resolved.
+				if err := n.writeNodeStatus(ctx, 2*frequency); err != nil {
 					log.Warningf(ctx, "error recording status summaries: %s", err)
 				}
 			case <-n.stopper.ShouldStop():
@@ -782,12 +788,30 @@ func (n *Node) startWriteSummaries(frequency time.Duration) {
 	})
 }
 
-// writeSummaries retrieves status summaries from the supplied
+// writeNodeStatus retrieves status summaries from the supplied
 // NodeStatusRecorder and persists them to the cockroach data store.
-func (n *Node) writeSummaries(ctx context.Context) error {
+func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration) error {
 	var err error
 	if runErr := n.stopper.RunTask(ctx, "node.Node: writing summary", func(ctx context.Context) {
-		err = n.recorder.WriteStatusSummary(ctx, n.storeCfg.DB)
+		nodeStatus := n.recorder.GenerateNodeStatus(ctx)
+		if nodeStatus == nil {
+			return
+		}
+
+		if result := n.recorder.CheckHealth(ctx, *nodeStatus); len(result.Alerts) != 0 {
+			log.Warningf(ctx, "health alerts detected: %+v", result)
+			if err := n.storeCfg.Gossip.AddInfoProto(
+				gossip.MakeNodeHealthAlertKey(n.Descriptor.NodeID), &result, alertTTL,
+			); err != nil {
+				log.Warningf(ctx, "unable to gossip health alerts: %+v", result)
+			}
+
+			// TODO(tschottdorf): add a metric that we increment every time there are
+			// alerts. This can help understand how long the cluster has been in that
+			// state (since it'll be incremented every ~10s).
+		}
+
+		err = n.recorder.WriteNodeStatus(ctx, n.storeCfg.DB, *nodeStatus)
 	}); runErr != nil {
 		err = runErr
 	}

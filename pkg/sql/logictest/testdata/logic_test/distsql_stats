@@ -1,4 +1,4 @@
-# LogicTest: 5node-distsql
+# LogicTest: 5node-distsql 5node-distsql-opt 5node-distsql-metadata
 
 statement ok
 CREATE TABLE data (a INT, b INT, c FLOAT, d DECIMAL, PRIMARY KEY (a, b, c, d))
@@ -36,13 +36,6 @@ NULL       /1       {1}       1
 /8         /9       {4}       4
 /9         NULL     {5}       5
 
-# We hardcode the plan for the testcase that follows to make it easier to debug
-# errors caused by changing planning logic.
-query T
-SELECT "URL" FROM [EXPLAIN (DISTSQL) CREATE STATISTICS s1 ON a FROM data]
-----
-https://cockroachdb.github.io/distsqlplan/decode.html?eJzElLGOozAQhvt7CvRXd5ILG0guR5Ur01xOyXUnCgePEFqCkW2k3Y149xVQZIMSs6soS8mYz98_GmtOqLSiP_JIFsl_CDCEYIjAEINhgZShNjoja7XpfhmAjXpGwhmKqm5cV04ZMm0IyQmucCUhwT95KGlHUpEBgyIni7KX1KY4SvOyVtJJMGwblwRrgbRl0I07X2idzAmJaNnHpXt5rMuxcCjui1dKAsE552DYO-nXhje1Z1tTaaPIkLrwpe3NYL_z3FAunf5EwuB7yHlwaLIncvbHzbzRRV4xx2wmpI-aTThHrxPSR_UazdHrhPRRvcZz9Doh_Yr9ckW7I1vrytJoz1y_mXf7h1ROw7KyujEZ_TU66zXD57bn-oIi64ZTMXxsquGoC_geFl44vIDFGA795gl15KVjPxzfk3vhhZd-8_Ie808vvPKbV_eYf_lnxSeeif-Rjd1p--0tAAD__0dOyfM=
-
 statement ok
 CREATE STATISTICS s1 ON a FROM data
 
@@ -50,7 +43,7 @@ query TTIII colnames
 SELECT name, columns, row_count, distinct_count, null_count FROM [SHOW STATISTICS FOR TABLE data]
 ----
 name  columns  row_count  distinct_count  null_count
-s1    a        10000      10              0
+s1    {"a"}    10000      10              0
 
 let $hist_id_1
 SELECT histogram_id FROM [SHOW STATISTICS FOR TABLE data] WHERE name = 's1'
@@ -61,10 +54,7 @@ SHOW HISTOGRAM $hist_id_1
 upper_bound  num_range  num_eq
 1            0          1000
 2            0          1000
-3            0          1000
-4            0          1000
-5            0          1000
-6            0          1000
+3            0          1000 4            0          1000 5            0          1000 6            0          1000
 7            0          1000
 8            0          1000
 9            0          1000
@@ -77,5 +67,44 @@ query TTIII colnames
 SELECT name, columns, row_count, distinct_count, null_count FROM [SHOW STATISTICS FOR TABLE data]
 ----
 name  columns  row_count  distinct_count  null_count
-s1    a        10000      10              0
-NULL  b        10000      10              0
+s1    {"a"}    10000      10              0
+NULL  {"b"}    10000      10              0
+
+# Verify that we can package statistics into a json object and later restore them.
+let $json_stats
+SHOW STATISTICS USING JSON FOR TABLE data
+
+statement ok
+DELETE FROM system.table_statistics
+
+statement ok
+ALTER TABLE data INJECT STATISTICS '$json_stats'
+
+query TTIII colnames
+SELECT name, columns, row_count, distinct_count, null_count FROM [SHOW STATISTICS FOR TABLE data]
+----
+name  columns  row_count  distinct_count  null_count
+s1    {"a"}    10000      10              0
+NULL  {"b"}    10000      10              0
+
+# Verify that any other statistics are blown away when we INJECT.
+statement ok
+CREATE STATISTICS s3 ON c FROM data
+
+query TTIII colnames
+SELECT name, columns, row_count, distinct_count, null_count FROM [SHOW STATISTICS FOR TABLE data]
+----
+name  columns  row_count  distinct_count  null_count
+s1    {"a"}    10000      10              0
+NULL  {"b"}    10000      10              0
+s3    {"c"}    10000      10              0
+
+statement ok
+ALTER TABLE data INJECT STATISTICS '$json_stats'
+
+query TTIII colnames
+SELECT name, columns, row_count, distinct_count, null_count FROM [SHOW STATISTICS FOR TABLE data]
+----
+name  columns  row_count  distinct_count  null_count
+s1    {"a"}    10000      10              0
+NULL  {"b"}    10000      10              0

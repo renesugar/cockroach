@@ -78,7 +78,7 @@ func SplitTable(
 
 	rightRangeStartKey := rightRange.StartKey.AsRawKey()
 	rightRange, err = tc.AddReplicas(rightRangeStartKey, tc.Target(targetNodeIdx))
-	if err != nil {
+	if err != nil && !testutils.IsError(err, "is already present") {
 		t.Fatal(err)
 	}
 
@@ -509,7 +509,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	}
 
 	// Verify distribution.
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJzEkTFr8zAQhvfvV3zclIKGyEkXTSmdMtQujkOHYoJqHcZgS-YkQUvwfy-2htQmdpuhdNRJz_u8nM6gjcJYNmhBvAIHBhHkDFoyBVprqB-HR3v1DmLNoNKtd_04Z1AYQhBncJWrEQRk8q3GFKVCAgYKnazqIbilqpH0sdO-scAg8U78j41GyDsGxrtLpHWyRBC8Yz_XPpQlYSmdmVgfk2OcndLk5bC6mzVFs6aLwGtDCgnVKD_vbuhyOD6d9nG22vH5KptRFf43u_5G-0u7vmJK0bZGW5zs_Hryuv8LVCWGj7PGU4HPZIpBE47JwA0DhdaFWx4Oex2u-oJfYb4IRyOYT-FoEb5fNm8W4e0yvL2pdt79-wwAAP__GRdW0w=="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJyskT1rwzAQhvf-inJTCoJETrpoSumUoXbJBx2KCap1GEMsmZMELcH_vdgaEodYTSGjTn7uef3qCNooTGWNFsQncGCQQM6gIVOgtYa6cfhopb5BzBhUuvGuG-cMCkMI4giucgcEAVv5dcA1SoU0nQEDhU5Wh351Q1Ut6WepfW2BQeadeEyNRshbBsa701LrZIkgeMtuF7-UJWEpnaFpMvS-Zrt0u19nH5vJ06grGXWdFF4bUkioBvvzNp5mMUyz2b3tV-l2suTjYeaDMPz2xvldG_9DfPaP87s2fsW1RtsYbfGi-eubZ92LoCoxPJ81ngp8J1P0mnDMeq4fKLQu3PJwWOlw1QU8h3kUTgYwv4STKPwcN8-j8CIOL_4VO28ffgMAAP__nC9YuA=="}})
 
 	// Drain the second node and expect the query to be planned on only the
 	// first node.
@@ -517,7 +517,7 @@ func TestDistSQLDrainingHosts(t *testing.T) {
 	distServer.ServerConfig.TestingKnobs.DrainFast = true
 	distServer.Drain(ctx, 0 /* flowDrainWait */)
 
-	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkEFLxDAQhe_-CnknhRy2e8xJ8bSXVuqKBwkSmyEU2kxJJqAs_e_S5qAuVNzjvMn3vjAnBHZU25ES9CsqGIUpckcpcVyi8uDgPqB3Cn2YsiyxUeg4EvQJ0stA0Dja94Faso4iFByJ7Ye1dIr9aOPnXchjgkKTRV_XHAhmVuAs35VJrCfoalb_1957H8lb4TPrQ_NcH9_a5uXp5nbTtL_E1FKaOCT65dlq3s1GgZyncsTEOXb0GLlbNWVsVm4NHCUp26oMh1BWywd_wtWf8P4MNvPVVwAAAP__856gRQ=="}})
+	expectPlan([][]string{{"https://cockroachdb.github.io/distsqlplan/decode.html?eJyUkEFL9DAQhu_fr_h4TwqBbfeYk-JpL63UFQ8SJDZDKLSZMklAWfrfpc1BV1jR47yT533CnBDYUWMnitDPqGEUZuGeYmRZo_Lg4N6gK4UhzDmtsVHoWQj6hDSkkaBxtK8jdWQdya6CgqNkh3GrnWWYrLzfhDxFKLQ56f8NB4JZFDinz9KYrCfoelG_F996L-RtYtnV59679rE5vnTt08PV9UXX_i-ujuLMIdKZ51JztRgFcp7KISNn6eleuN80ZWw3bgscxVS2dRkOoazWD36F6x_h_TfYLP8-AgAA__-zG6EE"}})
 
 	// Verify correctness.
 	var res int
@@ -1067,4 +1067,94 @@ func TestPartitionSpansSkipsNodesNotInGossip(t *testing.T) {
 	if !reflect.DeepEqual(resMap, expectedPartitions) {
 		t.Errorf("expected partitions:\n  %v\ngot:\n  %v", expectedPartitions, resMap)
 	}
+}
+
+func TestCheckNodeHealth(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+
+	const nodeID = roachpb.NodeID(5)
+
+	mockGossip := gossip.NewTest(nodeID, nil /* rpcContext */, nil, /* grpcServer */
+		stopper, metric.NewRegistry())
+
+	desc := &roachpb.NodeDescriptor{
+		NodeID:  nodeID,
+		Address: util.UnresolvedAddr{NetworkField: "tcp", AddressField: "testaddr"},
+	}
+	if err := mockGossip.SetNodeDescriptor(desc); err != nil {
+		t.Fatal(err)
+	}
+	if err := mockGossip.AddInfoProto(
+		gossip.MakeDistSQLNodeVersionKey(nodeID),
+		&distsqlrun.DistSQLVersionGossipInfo{
+			MinAcceptedVersion: distsqlrun.MinAcceptedVersion,
+			Version:            distsqlrun.Version,
+		},
+		0, // ttl - no expiration
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	errLive := func(roachpb.NodeID) (bool, error) {
+		return false, errors.New("injected liveness error")
+	}
+	notLive := func(roachpb.NodeID) (bool, error) {
+		return false, nil
+	}
+	live := func(roachpb.NodeID) (bool, error) {
+		return true, nil
+	}
+
+	connHealthy := func(string) error {
+		return nil
+	}
+	connUnhealthy := func(string) error {
+		return errors.New("injected conn health error")
+	}
+	_ = connUnhealthy
+
+	livenessTests := []struct {
+		isLive func(roachpb.NodeID) (bool, error)
+		exp    string
+	}{
+		{live, ""},
+		{errLive, "not using n5 due to liveness: injected liveness error"},
+		{notLive, "not using n5 due to liveness: node is not live"},
+	}
+
+	for _, test := range livenessTests {
+		t.Run("liveness", func(t *testing.T) {
+			if err := checkNodeHealth(
+				context.Background(), nodeID, desc.Address.AddressField,
+				DistSQLPlannerTestingKnobs{}, /* knobs */
+				mockGossip, connHealthy, test.isLive,
+			); !testutils.IsError(err, test.exp) {
+				t.Fatalf("expected %v, got %v", test.exp, err)
+			}
+		})
+	}
+
+	connHealthTests := []struct {
+		connHealth func(string) error
+		exp        string
+	}{
+		{connHealthy, ""},
+		{connUnhealthy, "injected conn health error"},
+	}
+
+	for _, test := range connHealthTests {
+		t.Run("connHealth", func(t *testing.T) {
+			if err := checkNodeHealth(
+				context.Background(), nodeID, desc.Address.AddressField,
+				DistSQLPlannerTestingKnobs{}, /* knobs */
+				mockGossip, test.connHealth, live,
+			); !testutils.IsError(err, test.exp) {
+				t.Fatalf("expected %v, got %v", test.exp, err)
+			}
+		})
+	}
+
 }

@@ -64,6 +64,11 @@ func (p *planner) changePrivileges(
 	if err != nil {
 		return nil, err
 	}
+
+	// We're allowed to grant/revoke privileges to/from the "public" role even though
+	// it does not exist: add it to the list of all users and roles.
+	users[sqlbase.PublicRole] = true // isRole
+
 	for _, grantee := range grantees {
 		if _, ok := users[string(grantee)]; !ok {
 			return nil, errors.Errorf("user or role %s does not exist", &grantee)
@@ -73,7 +78,7 @@ func (p *planner) changePrivileges(
 	var descriptors []sqlbase.DescriptorProto
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		descriptors, err = getDescriptorsFromTargetList(ctx, p, targets)
 	})
 	if err != nil {
@@ -91,6 +96,12 @@ func (p *planner) changePrivileges(
 			changePrivilege(privileges, string(grantee))
 		}
 
+		// Validate privilege descriptors directly as the db/table level Validate
+		// may fix up the descriptor.
+		if err := privileges.Validate(descriptor.GetID()); err != nil {
+			return nil, err
+		}
+
 		switch d := descriptor.(type) {
 		case *sqlbase.DatabaseDescriptor:
 			if err := d.Validate(); err != nil {
@@ -98,7 +109,7 @@ func (p *planner) changePrivileges(
 			}
 
 		case *sqlbase.TableDescriptor:
-			if err := d.Validate(ctx, p.txn); err != nil {
+			if err := d.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
 				return nil, err
 			}
 			if err := d.SetUpVersion(); err != nil {

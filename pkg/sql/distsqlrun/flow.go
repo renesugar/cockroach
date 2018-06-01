@@ -21,6 +21,7 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -52,10 +53,6 @@ type FlowID struct {
 type FlowCtx struct {
 	log.AmbientContext
 
-	// Context used for all execution within the flow.
-	// Created in Start(), canceled in Cleanup().
-	Ctx context.Context
-
 	Settings *cluster.Settings
 
 	stopper *stop.Stopper
@@ -65,18 +62,28 @@ type FlowCtx struct {
 	// EvalCtx is used by all the processors in the flow to evaluate expressions.
 	// Processors that intend to evaluate expressions with this EvalCtx should
 	// get a copy with NewEvalCtx instead of storing a pointer to this one
-	// directly.
+	// directly (since some processor mutate the EvalContext they use).
+	//
+	// TODO(andrei): Get rid of this field and pass a non-shared EvalContext to
+	// ctors of the processors that need it.
 	EvalCtx tree.EvalContext
 	// rpcCtx is used by the Outboxes that may be present in the flow for
 	// connecting to other nodes.
 	rpcCtx *rpc.Context
+	// gossip is used by the sample aggregator to notify nodes of a new statistic.
+	gossip *gossip.Gossip
 	// The transaction in which kv operations performed by processors in the flow
 	// must be performed. Processors in the Flow will use this txn concurrently.
+	// This field is generally not nil, except for flows that don't run in a
+	// higher-level txn (like backfills).
 	txn *client.Txn
 	// clientDB is a handle to the cluster. Used for performing requests outside
 	// of the transaction in which the flow's query is running.
 	clientDB *client.DB
-	// executor provides access to the SQL executor.
+
+	// Executor can be used to run "internal queries". Note that Flows also have
+	// access to an executor in the EvalContext. That one is "session bound"
+	// whereas this one isn't.
 	executor sqlutil.InternalExecutor
 
 	// nodeID is the ID of the node on which the processors using this FlowCtx
@@ -126,7 +133,10 @@ type Flow struct {
 	FlowCtx
 
 	flowRegistry *flowRegistry
-	processors   []Processor
+	// processors contains a subset of the processors in the flow - the ones that
+	// run in their own goroutines. Some processors that implement RowSource are
+	// scheduled to run in their consumer's goroutine; those are not present here.
+	processors []Processor
 	// startables are entities that must be started when the flow starts;
 	// currently these are outboxes and routers.
 	startables []startable
@@ -154,6 +164,7 @@ type Flow struct {
 	// Cancel function for ctx. Call this to cancel the flow (safe to be called
 	// multiple times).
 	ctxCancel context.CancelFunc
+	ctxDone   <-chan struct{}
 
 	// spec is the request that produced this flow. Only used for debugging.
 	spec *FlowSpec
@@ -265,7 +276,9 @@ func checkNumInOut(inputs []RowSource, outputs []RowReceiver, numIn, numOut int)
 	return nil
 }
 
-func (f *Flow) makeProcessor(ps *ProcessorSpec, inputs []RowSource) (Processor, error) {
+func (f *Flow) makeProcessor(
+	ctx context.Context, ps *ProcessorSpec, inputs []RowSource,
+) (Processor, error) {
 	if len(ps.Output) != 1 {
 		return nil, errors.Errorf("only single-output processors supported")
 	}
@@ -293,10 +306,12 @@ func (f *Flow) makeProcessor(ps *ProcessorSpec, inputs []RowSource) (Processor, 
 		outputs[i] = r
 		f.startables = append(f.startables, r)
 	}
-	proc, err := newProcessor(&f.FlowCtx, &ps.Core, &ps.Post, inputs, outputs)
+
+	proc, err := newProcessor(ctx, &f.FlowCtx, ps.ProcessorID, &ps.Core, &ps.Post, inputs, outputs)
 	if err != nil {
 		return nil, err
 	}
+
 	// Initialize any routers (the setupRouter case above) and outboxes.
 	types := proc.OutputTypes()
 	for _, o := range outputs {
@@ -364,59 +379,68 @@ func (f *Flow) setup(ctx context.Context, spec *FlowSpec) error {
 		}
 	}
 
-	f.processors = make([]Processor, len(spec.Processors))
+	f.processors = make([]Processor, 0, len(spec.Processors))
 
+	// Populate f.processors: see which processors need their own goroutine and
+	// which are fused with their consumer.
 	for i := range spec.Processors {
-		var err error
-		f.processors[i], err = f.makeProcessor(&spec.Processors[i], inputSyncs[i])
+		pspec := &spec.Processors[i]
+		p, err := f.makeProcessor(ctx, pspec, inputSyncs[i])
 		if err != nil {
 			return err
 		}
 
-		// If the processor implements RowSource try to hook it up directly to the
-		// input of a later processor.
-		source, ok := f.processors[i].(RowSource)
-		if !ok {
-			continue
-		}
-		pspec := &spec.Processors[i]
-		if len(pspec.Output) != 1 {
-			// The processor has more than one output, use the normal routing
-			// machinery.
-			continue
-		}
-		ospec := &pspec.Output[0]
-		if ospec.Type != OutputRouterSpec_PASS_THROUGH {
-			// The output is not pass-through and thus is being sent through a
-			// router.
-			continue
-		}
-		if len(ospec.Streams) != 1 {
-			// The output contains more than one stream.
-			continue
-		}
+		// fuse will return true if we managed to fuse p, false otherwise.
+		fuse := func() bool {
+			// If the processor implements RowSource try to hook it up directly to the
+			// input of a later processor.
+			source, ok := p.(RowSource)
+			if !ok {
+				return false
+			}
+			if len(pspec.Output) != 1 {
+				// The processor has more than one output, use the normal routing
+				// machinery.
+				return false
+			}
+			ospec := &pspec.Output[0]
+			if ospec.Type != OutputRouterSpec_PASS_THROUGH {
+				// The output is not pass-through and thus is being sent through a
+				// router.
+				return false
+			}
+			if len(ospec.Streams) != 1 {
+				// The output contains more than one stream.
+				return false
+			}
 
-		for pIdx, ps := range spec.Processors {
-			if pIdx <= i {
-				// Skip processors which have already been created.
-				continue
+			for pIdx, ps := range spec.Processors {
+				if pIdx <= i {
+					// Skip processors which have already been created.
+					continue
+				}
+				for inIdx, in := range ps.Input {
+					// Look for "simple" inputs: an unordered input (which, by definition,
+					// doesn't require an ordered synchronizer), with a single input stream
+					// (which doesn't require a MultiplexedRowChannel).
+					if in.Type != InputSyncSpec_UNORDERED {
+						continue
+					}
+					if len(in.Streams) != 1 {
+						continue
+					}
+					if in.Streams[0].StreamID != ospec.Streams[0].StreamID {
+						continue
+					}
+					// We found a consumer to fuse our proc to.
+					inputSyncs[pIdx][inIdx] = source
+					return true
+				}
 			}
-			for inIdx, in := range ps.Input {
-				// Look for "simple" inputs: an unordered input (which, by definition,
-				// doesn't require an ordered synchronizer), with a single input stream
-				// (which doesn't require a MultiplexedRowChannel).
-				if in.Type != InputSyncSpec_UNORDERED {
-					continue
-				}
-				if len(in.Streams) != 1 {
-					continue
-				}
-				if in.Streams[0].StreamID != ospec.Streams[0].StreamID {
-					continue
-				}
-				inputSyncs[pIdx][inIdx] = source
-				f.processors[i] = nil
-			}
+			return false
+		}
+		if !fuse() {
+			f.processors = append(f.processors, p)
 		}
 	}
 	return nil
@@ -433,9 +457,9 @@ func (f *Flow) Start(ctx context.Context, doneFn func()) error {
 	log.VEventf(
 		ctx, 1, "starting (%d processors, %d startables)", len(f.processors), len(f.startables),
 	)
-	f.status = FlowRunning
 
-	f.Ctx, f.ctxCancel = contextutil.WithCancel(ctx)
+	ctx, f.ctxCancel = contextutil.WithCancel(ctx)
+	f.ctxDone = ctx.Done()
 
 	// Once we call RegisterFlow, the inbound streams become accessible; we must
 	// set up the WaitGroup counter before.
@@ -444,7 +468,7 @@ func (f *Flow) Start(ctx context.Context, doneFn func()) error {
 	f.waitGroup.Add(len(f.inboundStreams))
 
 	if err := f.flowRegistry.RegisterFlow(
-		f.Ctx, f.id, f, f.inboundStreams, flowStreamDefaultTimeout,
+		ctx, f.id, f, f.inboundStreams, flowStreamDefaultTimeout,
 	); err != nil {
 		if f.syncFlowConsumer != nil {
 			// For sync flows, the error goes to the consumer.
@@ -454,17 +478,18 @@ func (f *Flow) Start(ctx context.Context, doneFn func()) error {
 		}
 		return err
 	}
+
+	f.status = FlowRunning
+
 	if log.V(1) {
-		log.Infof(f.Ctx, "registered flow %s", f.id.Short())
+		log.Infof(ctx, "registered flow %s", f.id.Short())
 	}
 	for _, s := range f.startables {
-		s.start(f.Ctx, &f.waitGroup, f.ctxCancel)
+		s.start(ctx, &f.waitGroup, f.ctxCancel)
 	}
 	for _, p := range f.processors {
-		if p != nil {
-			f.waitGroup.Add(1)
-			go p.Run(&f.waitGroup)
-		}
+		f.waitGroup.Add(1)
+		go p.Run(ctx, &f.waitGroup)
 	}
 	return nil
 }
@@ -480,7 +505,7 @@ func (f *Flow) Wait() {
 	}()
 
 	select {
-	case <-f.Ctx.Done():
+	case <-f.ctxDone:
 		f.cancel()
 		<-waitChan
 	case <-waitChan:

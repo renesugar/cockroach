@@ -255,7 +255,7 @@ func batchRequestForIndexValues(
 		if err != nil {
 			return roachpb.BatchRequest{}, nil, err
 		}
-		req.Add(&roachpb.ScanRequest{Span: span})
+		req.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(span)})
 	}
 	return req, colIDtoRowIndex, nil
 }
@@ -286,7 +286,7 @@ func batchRequestForPKValues(
 		if err != nil {
 			return roachpb.BatchRequest{}, err
 		}
-		req.Add(&roachpb.ScanRequest{Span: span})
+		req.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(span)})
 	}
 	return req, nil
 }
@@ -507,8 +507,8 @@ func (c *cascader) deleteRows(
 	defer primaryKeysToDelete.Close(ctx)
 
 	for _, resp := range br.Responses {
-		fetcher := spanKVFetcher{
-			kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+		fetcher := SpanKVFetcher{
+			KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 		}
 		if err := indexPKRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 			return nil, nil, 0, err
@@ -570,8 +570,8 @@ func (c *cascader) deleteRows(
 	batch := c.txn.NewBatch()
 
 	for _, resp := range pkResp.Responses {
-		fetcher := spanKVFetcher{
-			kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+		fetcher := SpanKVFetcher{
+			KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 		}
 		if err := pkRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 			return nil, nil, 0, err
@@ -728,8 +728,8 @@ func (c *cascader) updateRows(
 		defer primaryKeysToUpdate.Close(ctx)
 
 		for _, resp := range br.Responses {
-			fetcher := spanKVFetcher{
-				kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+			fetcher := SpanKVFetcher{
+				KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 			}
 			if err := indexPKRowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 				return nil, nil, nil, 0, err
@@ -765,8 +765,8 @@ func (c *cascader) updateRows(
 		}
 
 		for _, resp := range pkResp.Responses {
-			fetcher := spanKVFetcher{
-				kvs: resp.GetInner().(*roachpb.ScanResponse).Rows,
+			fetcher := SpanKVFetcher{
+				KVs: resp.GetInner().(*roachpb.ScanResponse).Rows,
 			}
 			if err := rowFetcher.StartScanFrom(ctx, &fetcher); err != nil {
 				return nil, nil, nil, 0, err

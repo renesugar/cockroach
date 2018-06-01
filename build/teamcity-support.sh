@@ -11,8 +11,12 @@ maybe_ccache() {
     echo "On release branch ($TC_BUILD_BRANCH), so not enabling ccache."
   else
     echo "Building PR (#$TC_BUILD_BRANCH), so enabling ccache."
-    run export COCKROACH_BUILDER_CCACHE=1
+    definitely_ccache
   fi
+}
+
+definitely_ccache() {
+  run export COCKROACH_BUILDER_CCACHE=1
 }
 
 run() {
@@ -23,7 +27,7 @@ run() {
 changed_go_pkgs() {
   git fetch --quiet origin master
   # Find changed packages, minus those that have been removed entirely.
-  git diff --name-only origin/master... -- "pkg/**/*.go" \
+  git diff --name-only origin/master... -- "pkg/**/*.go" ":!*/testdata/*" \
     | xargs -rn1 dirname \
     | sort -u \
     | { while read path; do if ls "$path"/*.go &>/dev/null; then echo -n "./$path "; fi; done; }

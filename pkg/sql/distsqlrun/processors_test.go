@@ -315,69 +315,69 @@ func TestAggregatorSpecAggregationEquals(t *testing.T) {
 	}{
 		// Func tests.
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
 			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_AVG},
 			expected: false,
 		},
 
 		// ColIdx tests.
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1, 2}},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1, 2}},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1, 2}},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1, 2}},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1}},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1, 3}},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1}},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1, 3}},
 			expected: false,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1, 2}},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, ColIdx: []uint32{1, 3}},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1, 2}},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, ColIdx: []uint32{1, 3}},
 			expected: false,
 		},
 
 		// FilterColIdx tests.
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, FilterColIdx: &colIdx1},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, FilterColIdx: &colIdx1},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, FilterColIdx: &colIdx1},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, FilterColIdx: &colIdx1},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, FilterColIdx: &colIdx1},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, FilterColIdx: &colIdx1},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
 			expected: false,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, FilterColIdx: &colIdx1},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, FilterColIdx: &colIdx2},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, FilterColIdx: &colIdx1},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, FilterColIdx: &colIdx2},
 			expected: false,
 		},
 
 		// Distinct tests.
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: true},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: true},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: true},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: true},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: false},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: false},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: false},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: false},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: false},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: false},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
 			expected: true,
 		},
 		{
-			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT, Distinct: true},
-			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_IDENT},
+			a:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL, Distinct: true},
+			b:        AggregatorSpec_Aggregation{Func: AggregatorSpec_ANY_NOT_NULL},
 			expected: false,
 		},
 	} {
@@ -400,27 +400,28 @@ func TestProcessorBaseContext(t *testing.T) {
 
 	runTest := func(t *testing.T, f func(noop *noopProcessor)) {
 		flowCtx := &FlowCtx{
-			Ctx:      ctx,
 			Settings: st,
 			EvalCtx:  tree.MakeTestingEvalContext(st),
 		}
 		defer flowCtx.EvalCtx.Stop(ctx)
 
 		input := NewRepeatableRowSource(oneIntCol, makeIntRows(10, 1))
-		noop, err := newNoopProcessor(flowCtx, input, &PostProcessSpec{}, &RowDisposer{})
+		noop, err := newNoopProcessor(flowCtx, 0 /* processorID */, input, &PostProcessSpec{}, &RowDisposer{})
 		if err != nil {
 			t.Fatal(err)
 		}
+		noop.Start(ctx)
+		origCtx := noop.ctx
 
-		// The context should be valid before Next is called in case ConsumerDone
-		// or ConsumerClosed are called without calling Next.j
-		if noop.ctx != ctx {
+		// The context should be valid after Start but before Next is called in case
+		// ConsumerDone or ConsumerClosed are called without calling Next.
+		if noop.ctx == nil {
 			t.Fatalf("processorBase.ctx not initialized")
 		}
 		f(noop)
 		// The context should be reset after ConsumerClosed is called so that any
 		// subsequent logging calls will not operate on closed spans.
-		if noop.ctx != ctx {
+		if noop.ctx != origCtx {
 			t.Fatalf("processorBase.ctx not reset on close")
 		}
 	}

@@ -1,7 +1,5 @@
 /// <reference path="../node_modules/protobufjs/stub-node.d.ts" />
 
-import "codemirror/lib/codemirror.css";
-import "codemirror/theme/neat.css";
 import "nvd3/build/nv.d3.min.css";
 import "react-select/dist/react-select.css";
 import "styl/app.styl";
@@ -23,39 +21,37 @@ import {
   tableNameAttr, databaseNameAttr, nodeIDAttr, dashboardNameAttr, rangeIDAttr,
 } from "src/util/constants";
 
+import { alertDataSync } from "src/redux/alerts";
 import "src/redux/analytics";
 import { store, history } from "src/redux/state";
+
+import loginRoutes from "src/routes/login";
 import visualizationRoutes from "src/routes/visualization";
 
+import NotFound from "src/views/app/components/NotFound";
 import Layout from "src/views/app/containers/layout";
-
 import { DatabaseTablesList, DatabaseGrantsList } from "src/views/databases/containers/databases";
 import TableDetails from "src/views/databases/containers/tableDetails";
-
-import JobsPage from "src/views/jobs";
-
-import NodesOverview from "src/views/cluster/containers/nodesOverview";
-import NodeOverview from "src/views/cluster/containers/nodeOverview";
-import NodeGraphs from "src/views/cluster/containers/nodeGraphs";
-import NodeLogs from "src/views/cluster/containers/nodeLogs";
 import { EventPage } from "src/views/cluster/containers/events";
-
 import Raft from "src/views/devtools/containers/raft";
 import RaftRanges from "src/views/devtools/containers/raftRanges";
 import RaftMessages from "src/views/devtools/containers/raftMessages";
+import NodeGraphs from "src/views/cluster/containers/nodeGraphs";
+import NodeOverview from "src/views/cluster/containers/nodeOverview";
+import NodeLogs from "src/views/cluster/containers/nodeLogs";
+import JobsPage from "src/views/jobs";
+import Certificates from "src/views/reports/containers/certificates";
+import CommandQueue from "src/views/reports/containers/commandQueue";
+import CustomChart from "src/views/reports/containers/customChart";
+import Debug from "src/views/reports/containers/debug";
 import ProblemRanges from "src/views/reports/containers/problemRanges";
 import Localities from "src/views/reports/containers/localities";
 import Network from "src/views/reports/containers/network";
 import Nodes from "src/views/reports/containers/nodes";
-import Certificates from "src/views/reports/containers/certificates";
-import Range from "src/views/reports/containers/range";
-import CommandQueue from "src/views/reports/containers/commandQueue";
-import Debug from "src/views/reports/containers/debug";
 import ReduxDebug from "src/views/reports/containers/redux";
-import CustomGraph from "src/views/reports/containers/customgraph";
-import NotFound from "src/views/app/components/NotFound";
-
-import { alertDataSync } from "src/redux/alerts";
+import Range from "src/views/reports/containers/range";
+import Settings from "src/views/reports/containers/settings";
+import Stores from "src/views/reports/containers/stores";
 
 // NOTE: If you are adding a new path to the router, and that path contains any
 // components that are personally identifying information, you MUST update the
@@ -69,6 +65,9 @@ import { alertDataSync } from "src/redux/alerts";
 ReactDOM.render(
   <Provider store={store}>
     <Router history={history}>
+      { /* login */}
+      { loginRoutes() }
+
       <Route path="/" component={Layout}>
         <IndexRedirect to="overview" />
 
@@ -89,11 +88,8 @@ ReactDOM.render(
         </Route>
 
         { /* node details */ }
-        <Route path="nodes">
-          <IndexRoute component={ NodesOverview } />
-        </Route>
         <Route path="node">
-          <IndexRedirect to="/nodes" />
+          <IndexRedirect to="/overview/list" />
           <Route path={ `:${nodeIDAttr}` }>
             <IndexRoute component={ NodeOverview } />
             <Route path="logs" component={ NodeLogs } />
@@ -129,7 +125,7 @@ ReactDOM.render(
         <Route path="debug">
           <IndexRoute component={Debug} />
           <Route path="redux" component={ReduxDebug} />
-          <Route path="graph" component={CustomGraph} />
+          <Route path="chart" component={CustomChart} />
         </Route>
         <Route path="raft" component={ Raft }>
           <IndexRedirect to="ranges" />
@@ -144,9 +140,12 @@ ReactDOM.render(
           <Route path="localities" component={ Localities } />
           <Route path="network" component={ Network } />
           <Route path="nodes" component={ Nodes } />
+          <Route path="settings" component={ Settings } />
           <Route path={`certificates/:${nodeIDAttr}`} component={ Certificates } />
           <Route path={`range/:${rangeIDAttr}`} component={ Range } />
           <Route path={`range/:${rangeIDAttr}/cmdqueue`} component={ CommandQueue } />
+          <Route path={`stores/:${nodeIDAttr}`} component={ Stores } />
+
         </Route>
 
         { /* old route redirects */ }
@@ -161,13 +160,16 @@ ReactDOM.render(
             to={ `/metrics/:${dashboardNameAttr}/node/:${nodeIDAttr}` }
           />
           <Route path="nodes">
-            <IndexRedirect to="/nodes" />
+            <IndexRedirect to="/overview/list" />
             <Route path={`:${nodeIDAttr}`}>
               <IndexRedirect to={ `/node/:${nodeIDAttr}` } />
               <Redirect from="logs" to={ `/node/:${nodeIDAttr}/logs` } />
             </Route>
           </Route>
           <Redirect from="events" to="/events" />
+        </Route>
+        <Route path="nodes">
+          <IndexRedirect to="/overview/list" />
         </Route>
 
         { /* 404 */ }

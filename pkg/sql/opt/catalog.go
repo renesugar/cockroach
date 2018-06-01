@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
@@ -32,6 +33,11 @@ type ColumnName string
 
 // TableName is the type of a table name.
 type TableName string
+
+// PrimaryIndex selects the primary index of a table when calling the
+// Table.Index method. Every table is guaranteed to have a unique primary
+// index, even if it meant adding a hidden unique rowid column.
+const PrimaryIndex = 0
 
 // Column is an interface to a table column, exposing only the information
 // needed by the query optimizer.
@@ -92,11 +98,45 @@ type Index interface {
 	Column(i int) IndexColumn
 }
 
+// TableStatistic is an interface to a table statistic. Each statistic is
+// associated with a set of columns.
+type TableStatistic interface {
+	// CreatedAt indicates when the statistic was generated.
+	CreatedAt() time.Time
+
+	// ColumnCount is the number of columns the statistic pertains to.
+	ColumnCount() int
+
+	// ColumnOrdinal returns the column ordinal (see Table.Column) of the ith
+	// column in this statistic, with 0 <= i < ColumnCount.
+	ColumnOrdinal(i int) int
+
+	// RowCount returns the estimated number of rows in the table.
+	RowCount() uint64
+
+	// DistinctCount returns the estimated number of distinct values on the
+	// columns of the statistic. If there are multiple columns, each "value" is a
+	// tuple with the values on each column. Rows where any statistic column have
+	// a NULL don't contribute to this count.
+	DistinctCount() uint64
+
+	// NullCount returns the estimated number of rows which have a NULL value on
+	// any column in the statistic.
+	NullCount() uint64
+
+	// TODO(radu): add Histogram().
+}
+
 // Table is an interface to a database table, exposing only the information
 // needed by the query optimizer.
 type Table interface {
 	// TabName returns the name of the table.
 	TabName() TableName
+
+	// IsVirtualTable returns true if this table is a special system table that
+	// constructs its rows "on the fly" when it's queried. An example is the
+	// information_schema tables.
+	IsVirtualTable() bool
 
 	// ColumnCount returns the number of columns in the table.
 	ColumnCount() int
@@ -105,18 +145,22 @@ type Table interface {
 	// position within the table, where i < ColumnCount.
 	Column(i int) Column
 
-	// Primary returns the unique index that specifies the primary ordering of
-	// the rows in the table. It corresponds to the table's primary key, and is
-	// always present. If a primary key was not explicitly specified, then the
-	// system implicitly creates one based on a hidden rowid column.
-	Primary() Index
+	// IndexCount returns the number of indexes defined on this table. This
+	// includes the primary index, so the count is always >= 1.
+	IndexCount() int
 
-	// SecondaryCount returns the number of secondary indexes defined on this
-	// table.
-	SecondaryCount() int
+	// Index returns the ith index, where i < IndexCount. The table's primary
+	// index is always the 0th index, and is always present (use the
+	// opt.PrimaryIndex to select it). The primary index corresponds to the
+	// table's primary key. If a primary key was not explicitly specified, then
+	// the system implicitly creates one based on a hidden rowid column.
+	Index(i int) Index
 
-	// Secondary returns the ith secondary index, where i < SecondaryCount.
-	Secondary(i int) Index
+	// StatisticCount returns the number of statistics available for the table.
+	StatisticCount() int
+
+	// Statistic returns the ith statistic, where i < StatisticCount.
+	Statistic(i int) TableStatistic
 }
 
 // Catalog is an interface to a database catalog, exposing only the information
@@ -129,20 +173,18 @@ type Catalog interface {
 
 // FormatCatalogTable nicely formats a catalog table using a treeprinter for
 // debugging and testing.
-func FormatCatalogTable(tbl Table, tp treeprinter.Node) {
-	child := tp.Childf("TABLE %s", tbl.TabName())
+func FormatCatalogTable(tab Table, tp treeprinter.Node) {
+	child := tp.Childf("TABLE %s", tab.TabName())
 
 	var buf bytes.Buffer
-	for i := 0; i < tbl.ColumnCount(); i++ {
+	for i := 0; i < tab.ColumnCount(); i++ {
 		buf.Reset()
-		formatColumn(tbl.Column(i), &buf)
+		formatColumn(tab.Column(i), &buf)
 		child.Child(buf.String())
 	}
 
-	formatCatalogIndex(tbl.Primary(), child)
-
-	for i := 0; i < tbl.SecondaryCount(); i++ {
-		formatCatalogIndex(tbl.Secondary(i), child)
+	for i := 0; i < tab.IndexCount(); i++ {
+		formatCatalogIndex(tab.Index(i), child)
 	}
 }
 

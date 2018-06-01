@@ -24,13 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -91,6 +84,9 @@ var queries = [...]benchQuery{
 
 	// Taken from BenchmarkCount in pkg/sql/bench/bench_test.go.
 	{"Count", `SELECT COUNT(*) FROM bench.count`},
+
+	// Taken from BenchmarkScan in pkg/sql/bench/bench_test.go.
+	{"Scan", `SELECT * FROM scan LIMIT 10`},
 
 	// Taken from BenchmarkPlanning in pkg/sql/bench/bench_test.go.
 	{"Planning1", `SELECT * FROM abc`},
@@ -159,6 +155,7 @@ func newBenchmark(b *testing.B) *benchmark {
 	bm.sr = sqlutils.MakeSQLRunner(bm.db)
 	bm.sr.Exec(b, `CREATE DATABASE bench`)
 	bm.sr.Exec(b, `CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)`)
+	bm.sr.Exec(b, `CREATE TABLE bench.scan (k INT PRIMARY KEY)`)
 	bm.sr.Exec(b, `CREATE TABLE bench.select (k INT PRIMARY KEY, a INT, b INT, c INT, d INT)`)
 	bm.sr.Exec(b, `CREATE TABLE bench.count (k INT PRIMARY KEY, v TEXT)`)
 	bm.sr.Exec(b, `CREATE TABLE scan2 (a INT, b INT, PRIMARY KEY (a, b))`)
@@ -184,85 +181,17 @@ func (bm *benchmark) close() {
 
 func (bm *benchmark) run(b *testing.B, bmType benchmarkType, query benchQuery) {
 	b.Run(fmt.Sprintf("%s/%s", query.name, benchmarkTypeStrings[bmType]), func(b *testing.B) {
-		switch bmType {
-		case v20, v21:
-			bm.runUsingSQLRunner(b, bmType, query.query)
+		if bmType == v20 {
+			// TODO(radu): remove this once the optimizer plays nice with distsql.
+			bm.sr.Exec(b, `SET DISTSQL=OFF`)
+			bm.sr.Exec(b, `SET EXPERIMENTAL_OPT=OFF`)
+		} else {
+			bm.sr.Exec(b, `SET EXPERIMENTAL_OPT=ON`)
+		}
 
-		default:
-			bm.runUsingAPI(b, bmType, query.query)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			bm.sr.Exec(b, query.query)
 		}
 	})
-}
-
-func (bm *benchmark) runUsingAPI(b *testing.B, bmType benchmarkType, query string) {
-	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext(false /* privileged */)
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-
-	eng := bm.s.Executor().(exec.TestEngineFactory).NewTestEngine("bench")
-	defer eng.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		stmt, err := parser.ParseOne(query)
-		if err != nil {
-			b.Fatalf("%v", err)
-		}
-
-		if bmType == parse {
-			continue
-		}
-
-		optSteps := xform.OptimizeAll
-		if bmType == optbuild {
-			optSteps = xform.OptimizeNone
-		}
-
-		opt := xform.NewOptimizer(&evalCtx, optSteps)
-		bld := optbuilder.New(ctx, &semaCtx, &evalCtx, eng.Catalog(), opt.Factory(), stmt)
-		root, props, err := bld.Build()
-		if err != nil {
-			b.Fatalf("%v", err)
-		}
-
-		if bmType == optbuild || bmType == prepare {
-			continue
-		}
-
-		ev := opt.Optimize(root, props)
-
-		if bmType == search {
-			continue
-		}
-
-		node, err := execbuilder.New(eng.Factory(), ev).Build()
-		if err != nil {
-			b.Fatalf("%v", err)
-		}
-
-		if bmType == execbuild {
-			continue
-		}
-
-		// execute the node tree.
-		_, err = eng.Execute(node)
-		if err != nil {
-			b.Fatalf("%v", err)
-		}
-	}
-}
-
-func (bm *benchmark) runUsingSQLRunner(b *testing.B, bmType benchmarkType, query string) {
-	if bmType == v20 {
-		// TODO(radu): remove this once the optimizer plays nice with distsql.
-		bm.sr.Exec(b, `SET DISTSQL=OFF`)
-		bm.sr.Exec(b, `SET EXPERIMENTAL_OPT=OFF`)
-	} else {
-		bm.sr.Exec(b, `SET EXPERIMENTAL_OPT=ON`)
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		bm.sr.Exec(b, query)
-	}
 }

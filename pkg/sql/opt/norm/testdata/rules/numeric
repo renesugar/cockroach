@@ -1,0 +1,132 @@
+exec-ddl
+CREATE TABLE a (k INT PRIMARY KEY, i INT, f FLOAT, d DECIMAL, t TIME)
+----
+TABLE a
+ ├── k int not null
+ ├── i int
+ ├── f float
+ ├── d decimal
+ ├── t time
+ └── INDEX primary
+      └── k int not null
+
+# --------------------------------------------------
+# FoldPlusZero, FoldZeroPlus
+# --------------------------------------------------
+
+# Add columns to prevent NormalizeVar from swapping left and right.
+opt
+SELECT
+    (a.i + a.i) + 0, 0 + (a.i + a.i),
+    (a.f + a.f) + 0, 0 + (a.f + a.f),
+    (a.d + a.d) + 0, 0 + (a.d + a.d)
+FROM a
+----
+project
+ ├── columns: "(a.i + a.i) + 0":6(int) "0 + (a.i + a.i)":7(int) "(a.f + a.f) + 0":8(float) "0 + (a.f + a.f)":9(float) "(a.d + a.d) + 0":10(decimal) "0 + (a.d + a.d)":11(decimal)
+ ├── scan a
+ │    └── columns: i:2(int) f:3(float) d:4(decimal)
+ └── projections [outer=(2-4)]
+      ├── a.i + a.i [type=int, outer=(2)]
+      ├── a.i + a.i [type=int, outer=(2)]
+      ├── a.f + a.f [type=float, outer=(3)]
+      ├── a.f + a.f [type=float, outer=(3)]
+      ├── a.d + a.d [type=decimal, outer=(4)]
+      └── a.d + a.d [type=decimal, outer=(4)]
+
+# --------------------------------------------------
+# FoldMinusZero
+# --------------------------------------------------
+
+# Add columns to prevent NormalizeVar from swapping left and right.
+opt
+SELECT
+    (a.i + a.i) - 0,
+    (a.f + a.f) - 0,
+    (a.d + a.d) - 0
+FROM a
+----
+project
+ ├── columns: "(a.i + a.i) - 0":6(int) "(a.f + a.f) - 0":7(float) "(a.d + a.d) - 0":8(decimal)
+ ├── scan a
+ │    └── columns: i:2(int) f:3(float) d:4(decimal)
+ └── projections [outer=(2-4)]
+      ├── a.i + a.i [type=int, outer=(2)]
+      ├── a.f + a.f [type=float, outer=(3)]
+      └── a.d + a.d [type=decimal, outer=(4)]
+
+# --------------------------------------------------
+# FoldMultOne, FoldOneMult
+# --------------------------------------------------
+
+# Add columns to prevent NormalizeVar from swapping left and right.
+opt
+SELECT
+    (a.i + a.i) * 1, 1 * (a.i + a.i),
+    (a.f + a.f) * 1, 1 * (a.f + a.f),
+    (a.d + a.d) * 1, 1 * (a.d + a.d)
+FROM a
+----
+project
+ ├── columns: "(a.i + a.i) * 1":6(int) "1 * (a.i + a.i)":7(int) "(a.f + a.f) * 1":8(float) "1 * (a.f + a.f)":9(float) "(a.d + a.d) * 1":10(decimal) "1 * (a.d + a.d)":11(decimal)
+ ├── scan a
+ │    └── columns: i:2(int) f:3(float) d:4(decimal)
+ └── projections [outer=(2-4)]
+      ├── a.i + a.i [type=int, outer=(2)]
+      ├── a.i + a.i [type=int, outer=(2)]
+      ├── a.f + a.f [type=float, outer=(3)]
+      ├── a.f + a.f [type=float, outer=(3)]
+      ├── a.d + a.d [type=decimal, outer=(4)]
+      └── a.d + a.d [type=decimal, outer=(4)]
+
+# --------------------------------------------------
+# FoldDivOne
+# --------------------------------------------------
+
+opt
+SELECT
+    a.i / 1,
+    a.f / 1,
+    a.d / 1
+FROM a
+----
+project
+ ├── columns: "a.i / 1":6(decimal) "a.f / 1":7(float) "a.d / 1":8(decimal)
+ ├── scan a
+ │    └── columns: i:2(int) f:3(float) d:4(decimal)
+ └── projections [outer=(2-4)]
+      ├── variable: a.i [type=int, outer=(2)]
+      ├── variable: a.f [type=float, outer=(3)]
+      └── variable: a.d [type=decimal, outer=(4)]
+
+# --------------------------------------------------
+# InvertMinus
+# --------------------------------------------------
+opt
+SELECT
+    -(a.f - a.f),
+    -(a.d - a.i),
+    -(a.t - a.t)
+FROM a
+----
+project
+ ├── columns: "-(a.f - a.f)":6(float) "-(a.d - a.i)":7(decimal) "-(a.t - a.t)":8(interval)
+ ├── scan a
+ │    └── columns: i:2(int) f:3(float) d:4(decimal) t:5(time)
+ └── projections [outer=(2-5)]
+      ├── a.f - a.f [type=float, outer=(3)]
+      ├── a.i - a.d [type=decimal, outer=(2,4)]
+      └── a.t - a.t [type=interval, outer=(5)]
+
+# --------------------------------------------------
+# EliminateUnaryMinus
+# --------------------------------------------------
+opt
+SELECT -(-a.i::int) FROM a
+----
+project
+ ├── columns: "-(-a.i::INT)":6(int)
+ ├── scan a
+ │    └── columns: i:2(int)
+ └── projections [outer=(2)]
+      └── variable: a.i [type=int, outer=(2)]

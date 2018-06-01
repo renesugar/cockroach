@@ -111,8 +111,8 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 
 	joinType := n.joinType
 
-	post, joinToStreamColMap := joinOutColumns(n, plans[0], plans[1])
-	onExpr := remapOnExpr(planCtx.EvalContext(), n, plans[0], plans[1])
+	post, joinToStreamColMap := joinOutColumns(n, plans[0].planToStreamColMap, plans[1].planToStreamColMap)
+	onExpr := remapOnExpr(planCtx.EvalContext(), n, plans[0].planToStreamColMap, plans[1].planToStreamColMap)
 
 	ancestor, descendant := n.interleavedNodes()
 
@@ -229,14 +229,17 @@ func (dsp *DistSQLPlanner) tryCreatePlanForInterleavedJoin(
 	}
 
 	plan.planToStreamColMap = joinToStreamColMap
-	plan.ResultTypes = getTypesForPlanResult(n, joinToStreamColMap)
+	plan.ResultTypes, err = getTypesForPlanResult(n, joinToStreamColMap)
+	if err != nil {
+		return physicalPlan{}, false, err
+	}
 
 	plan.SetMergeOrdering(dsp.convertOrdering(n.props, plan.planToStreamColMap))
 	return plan, true, nil
 }
 
 func joinOutColumns(
-	n *joinNode, leftPlan, rightPlan physicalPlan,
+	n *joinNode, leftPlanToStreamColMap, rightPlanToStreamColMap []int,
 ) (post distsqlrun.PostProcessSpec, joinToStreamColMap []int) {
 	joinToStreamColMap = makePlanToStreamColMap(len(n.columns))
 	post.Projection = true
@@ -253,19 +256,26 @@ func joinOutColumns(
 	//  - the columns on the left side (numLeftCols)
 	//  - the columns on the right side (numRightCols)
 	joinCol := 0
+	leftCols := 0
 	for i := 0; i < n.pred.numLeftCols; i++ {
-		if !n.columns[joinCol].Omitted {
-			joinToStreamColMap[joinCol] = addOutCol(uint32(leftPlan.planToStreamColMap[i]))
+		if !n.columns[i].Omitted {
+			joinToStreamColMap[joinCol] = addOutCol(uint32(leftPlanToStreamColMap[i]))
+		}
+		if leftPlanToStreamColMap[i] != -1 {
+			leftCols++
 		}
 		joinCol++
 	}
-	for i := 0; i < n.pred.numRightCols; i++ {
-		if !n.columns[joinCol].Omitted {
-			joinToStreamColMap[joinCol] = addOutCol(
-				uint32(rightPlan.planToStreamColMap[i] + len(leftPlan.ResultTypes)),
-			)
+
+	if n.pred.joinType != sqlbase.LeftSemiJoin && n.pred.joinType != sqlbase.LeftAntiJoin {
+		for i := 0; i < n.pred.numRightCols; i++ {
+			if !n.columns[joinCol].Omitted {
+				joinToStreamColMap[joinCol] = addOutCol(
+					uint32(leftCols + rightPlanToStreamColMap[i]),
+				)
+			}
+			joinCol++
 		}
-		joinCol++
 	}
 
 	return post, joinToStreamColMap
@@ -275,49 +285,28 @@ func joinOutColumns(
 // join columns as described above) to values that make sense in the joiner (0
 // to N-1 for the left input columns, N to N+M-1 for the right input columns).
 func remapOnExpr(
-	evalCtx *tree.EvalContext, n *joinNode, leftPlan, rightPlan physicalPlan,
+	evalCtx *tree.EvalContext, n *joinNode, leftPlanToStreamColMap, rightPlanToStreamColMap []int,
 ) distsqlrun.Expression {
 	if n.pred.onCond == nil {
 		return distsqlrun.Expression{}
 	}
 
-	joinColMap := make([]int, len(n.columns))
+	joinColMap := make([]int, n.pred.numLeftCols+n.pred.numRightCols)
 	idx := 0
+	leftCols := 0
 	for i := 0; i < n.pred.numLeftCols; i++ {
-		joinColMap[idx] = leftPlan.planToStreamColMap[i]
+		joinColMap[idx] = leftPlanToStreamColMap[i]
+		if leftPlanToStreamColMap[i] != -1 {
+			leftCols++
+		}
 		idx++
 	}
 	for i := 0; i < n.pred.numRightCols; i++ {
-		joinColMap[idx] = rightPlan.planToStreamColMap[i] + len(leftPlan.ResultTypes)
+		joinColMap[idx] = leftCols + rightPlanToStreamColMap[i]
 		idx++
 	}
 
 	return distsqlplan.MakeExpression(n.pred.onCond, evalCtx, joinColMap)
-}
-
-// shiftExprCols remaps expression columns when merging rows in a join. It takes
-// expression columns for the right side of a join, and remaps the indices so
-// that they refer to indices in the merged row.
-func shiftExprCols(
-	evalCtx *tree.EvalContext, expr tree.TypedExpr, rightStreamToPlan, leftStreamToPlan []int,
-) distsqlrun.Expression {
-	offset := 0
-	for _, val := range leftStreamToPlan {
-		if val >= 0 {
-			offset++
-		}
-	}
-	shiftMap := make([]int, len(rightStreamToPlan))
-	idx := 0
-	for i := 0; i < len(rightStreamToPlan); i++ {
-		if rightStreamToPlan[i] >= 0 {
-			shiftMap[i] = idx + offset
-			idx++
-		} else {
-			shiftMap[i] = -1
-		}
-	}
-	return distsqlplan.MakeExpression(expr, evalCtx, shiftMap)
 }
 
 // eqCols produces a slice of ordinal references for the plan columns specified

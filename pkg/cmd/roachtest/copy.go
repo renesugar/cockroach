@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach-go/crdb"
 )
 
-func init() {
+func registerCopy(r *registry) {
 	// This test imports a fully-populated Bank table. It then creates an empty
 	// Bank schema. Finally, it performs a series of `INSERT ... SELECT ...`
 	// statements to copy all data from the first table into the second table.
@@ -51,7 +51,7 @@ func init() {
 			defer db.Close()
 
 			t.Status("importing Bank fixture")
-			c.Run(ctx, 1, fmt.Sprintf(
+			c.Run(ctx, c.Node(1), fmt.Sprintf(
 				"./workload fixtures load bank --rows=%d --payload-bytes=%d {pgurl:1}",
 				rows, payload))
 			if _, err := db.Exec("ALTER TABLE bank.bank RENAME TO bank.bank_orig"); err != nil {
@@ -59,7 +59,7 @@ func init() {
 			}
 
 			t.Status("create copy of Bank schema")
-			c.Run(ctx, 1, "./workload init bank --rows=0 --ranges=1 {pgurl:1}")
+			c.Run(ctx, c.Node(1), "./workload init bank --rows=0 --ranges=1 {pgurl:1}")
 
 			rangeCount := func() int {
 				var count int
@@ -86,7 +86,7 @@ func init() {
 			type querier interface {
 				QueryRow(query string, args ...interface{}) *gosql.Row
 			}
-			runCopy := func(qu querier) {
+			runCopy := func(qu querier) error {
 				for lastID := -1; lastID+1 < rows; {
 					if lastID > 0 {
 						t.Progress(float64(lastID+1) / float64(rows))
@@ -104,19 +104,20 @@ func init() {
 						LIMIT 1`,
 						lastID, rowsPerInsert)
 					if err := qu.QueryRow(q).Scan(&lastID); err != nil {
-						t.Fatalf("failed to copy rows: %v", err)
+						return err
 					}
 				}
+				return nil
 			}
+
+			var err error
 			if inTxn {
-				if err := crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error {
-					runCopy(tx)
-					return nil
-				}); err != nil {
-					t.Fatal(err)
-				}
+				err = crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error { return runCopy(tx) })
 			} else {
-				runCopy(db)
+				err = runCopy(db)
+			}
+			if err != nil {
+				t.Fatalf("failed to copy rows: %s", err)
 			}
 
 			rc := rangeCount()
@@ -137,9 +138,10 @@ func init() {
 
 	for _, inTxn := range []bool{true, false} {
 		inTxn := inTxn
-		tests.Add(testSpec{
-			Name:  fmt.Sprintf("copy/bank/rows=%d,nodes=%d,txn=%t", rows, numNodes, inTxn),
-			Nodes: nodes(numNodes),
+		r.Add(testSpec{
+			Name:   fmt.Sprintf("copy/bank/rows=%d,nodes=%d,txn=%t", rows, numNodes, inTxn),
+			Nodes:  nodes(numNodes),
+			Stable: true, // DO NOT COPY to new tests
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runCopy(ctx, t, c, rows, inTxn)
 			},

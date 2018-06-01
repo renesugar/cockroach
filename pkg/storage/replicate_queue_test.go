@@ -21,12 +21,10 @@ import (
 	"math"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -44,13 +42,6 @@ func TestReplicateQueueRebalance(t *testing.T) {
 		t.Skip("short flag")
 	}
 
-	// Set the gossip stores interval lower to speed up rebalancing. With the
-	// default of 5s we have to wait ~5s for the rebalancing to start.
-	defer func(v time.Duration) {
-		gossip.GossipStoresInterval = v
-	}(gossip.GossipStoresInterval)
-	gossip.GossipStoresInterval = 100 * time.Millisecond
-
 	const numNodes = 5
 	tc := testcluster.StartTestCluster(t, numNodes,
 		base.TestClusterArgs{ReplicationMode: base.ReplicationAuto},
@@ -65,7 +56,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 
 	const newRanges = 5
 	for i := 0; i < newRanges; i++ {
-		tableID := keys.MaxReservedDescID + i + 1
+		tableID := keys.MinUserDescID + i
 		splitKey := keys.MakeTablePrefix(uint32(tableID))
 		if _, _, err := tc.SplitRange(splitKey); err != nil {
 			t.Fatal(err)

@@ -23,10 +23,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -53,8 +51,11 @@ type sampleAggregator struct {
 
 var _ Processor = &sampleAggregator{}
 
+const sampleAggregatorProcName = "sample aggregator"
+
 func newSampleAggregator(
 	flowCtx *FlowCtx,
+	processorID int32,
 	spec *SampleAggregatorSpec,
 	input RowSource,
 	post *PostProcessSpec,
@@ -100,25 +101,35 @@ func newSampleAggregator(
 
 	s.sr.Init(int(spec.SampleSize))
 
-	if err := s.init(post, []sqlbase.ColumnType{}, flowCtx, nil /* evalCtx */, output); err != nil {
+	if err := s.init(
+		post, []sqlbase.ColumnType{}, flowCtx, processorID, output,
+		// this proc doesn't implement RowSource and doesn't use processorBase to drain
+		procStateOpts{},
+	); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
+func (s *sampleAggregator) pushTrailingMeta(ctx context.Context) {
+	sendTraceData(ctx, s.out.output)
+}
+
 // Run is part of the Processor interface.
-func (s *sampleAggregator) Run(wg *sync.WaitGroup) {
+func (s *sampleAggregator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
-	ctx, span := processorSpan(s.flowCtx.Ctx, "sample aggregator")
-	defer tracing.FinishSpan(span)
 
-	earlyExit, err := s.mainLoop(ctx)
+	s.input.Start(ctx)
+	s.startInternal(ctx, sampleAggregatorProcName)
+	defer tracing.FinishSpan(s.span)
+
+	earlyExit, err := s.mainLoop(s.ctx)
 	if err != nil {
-		DrainAndClose(ctx, s.out.output, err, s.input)
+		DrainAndClose(s.ctx, s.out.output, err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		sendTraceData(ctx, s.out.output)
+		s.pushTrailingMeta(s.ctx)
 		s.input.ConsumerClosed()
 		s.out.Close()
 	}
@@ -130,7 +141,7 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, _ erro
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if !emitHelper(ctx, &s.out, nil /* row */, meta, s.input) {
+			if !emitHelper(ctx, &s.out, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}
@@ -194,15 +205,19 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, _ erro
 
 // writeResults inserts the new statistics into system.table_statistics.
 func (s *sampleAggregator) writeResults(ctx context.Context) error {
+	// TODO(andrei): This method would benefit from a session interface on the
+	// internal executor instead of doing this weird thing where it uses the
+	// internal executor to execute one statement at a time inside a db.Txn()
+	// closure.
 	return s.flowCtx.clientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		for _, si := range s.sketches {
-			var histogram []byte
-			if si.spec.GenerateHistogram {
+			var histogram *stats.HistogramData
+			if si.spec.GenerateHistogram && len(s.sr.Get()) != 0 {
 				colIdx := int(si.spec.Columns[0])
 				typ := s.inTypes[colIdx]
 
 				h, err := generateHistogram(
-					&s.flowCtx.EvalCtx,
+					s.evalCtx,
 					s.sr.Get(),
 					colIdx,
 					typ,
@@ -212,47 +227,29 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				histogram, err = protoutil.Marshal(&h)
-				if err != nil {
-					return err
-				}
+				histogram = &h
 			}
 
-			columnIDs := tree.NewDArray(types.Int)
-			for _, c := range si.spec.Columns {
-				if err := columnIDs.Append(tree.NewDInt(tree.DInt(int(s.sampledCols[c])))); err != nil {
-					return err
-				}
+			columnIDs := make([]sqlbase.ColumnID, len(si.spec.Columns))
+			for i, c := range si.spec.Columns {
+				columnIDs[i] = s.sampledCols[c]
 			}
 
-			var name interface{}
-			if si.spec.StatName != "" {
-				name = si.spec.StatName
-			}
-
-			if _, err := s.flowCtx.executor.ExecuteStatementInTransaction(
-				ctx, "insert-statistic", txn,
-				`INSERT INTO system.table_statistics (
-					"tableID",
-					"name",
-					"columnIDs",
-					"rowCount",
-					"distinctCount",
-					"nullCount",
-					histogram
-				) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			if err := stats.InsertNewStat(
+				ctx,
+				s.flowCtx.gossip,
+				s.flowCtx.executor,
+				txn,
 				s.tableID,
-				name,
+				si.spec.StatName,
 				columnIDs,
 				si.numRows,
-				si.sketch.Estimate(),
+				int64(si.sketch.Estimate()),
 				si.numNulls,
 				histogram,
 			); err != nil {
 				return err
 			}
-
-			// TODO(radu): we need to clear out old stats that are superseded.
 		}
 		return nil
 	})

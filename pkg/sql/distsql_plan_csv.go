@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
@@ -33,10 +35,50 @@ import (
 	"github.com/pkg/errors"
 )
 
-// DistLoader uses DistSQL to convert external data formats (csv, etc) into
-// sstables of our mvcc-format key values.
-type DistLoader struct {
-	distSQLPlanner *DistSQLPlanner
+// ExportPlanResultTypes is the result types for EXPORT plans.
+var ExportPlanResultTypes = []sqlbase.ColumnType{
+	{SemanticType: sqlbase.ColumnType_STRING}, // filename
+	{SemanticType: sqlbase.ColumnType_INT},    // rows
+	{SemanticType: sqlbase.ColumnType_INT},    // bytes
+}
+
+// PlanAndRunExport makes and runs an EXPORT plan for the given input and output
+// planNode and spec respectively.  The input planNode must be runnable via
+// DistSQL. The output spec's results must conform to the ExportResultTypes.
+func PlanAndRunExport(
+	ctx context.Context,
+	dsp *DistSQLPlanner,
+	execCfg *ExecutorConfig,
+	txn *client.Txn,
+	evalCtx *extendedEvalContext,
+	in planNode,
+	out distsqlrun.ProcessorCoreUnion,
+	resultRows *RowResultWriter,
+) error {
+	planCtx := dsp.newPlanningCtx(ctx, evalCtx, txn)
+	p, err := dsp.createPlanForNode(&planCtx, in)
+	if err != nil {
+		return errors.Wrap(err, "constructing distSQL plan")
+	}
+
+	p.AddNoGroupingStage(
+		out, distsqlrun.PostProcessSpec{}, ExportPlanResultTypes, distsqlrun.Ordering{},
+	)
+
+	// Overwrite planToStreamColMap (used by recv below) to reflect the output of
+	// the non-grouping stage we've added above. That stage outputs produces
+	// columns filename/rows/bytes.
+	p.planToStreamColMap = identityMap(p.planToStreamColMap, len(ExportPlanResultTypes))
+
+	dsp.FinalizePlan(&planCtx, &p)
+
+	recv := makeDistSQLReceiver(
+		ctx, resultRows, tree.Rows,
+		execCfg.RangeDescriptorCache, execCfg.LeaseHolderCache, txn, func(ts hlc.Timestamp) {},
+	)
+
+	dsp.Run(&planCtx, txn, &p, recv, evalCtx)
+	return resultRows.Err()
 }
 
 // RowResultWriter is a thin wrapper around a RowContainer.
@@ -77,21 +119,22 @@ func (b *RowResultWriter) Err() error {
 // callbackResultWriter is a rowResultWriter that runs a callback function
 // on AddRow.
 type callbackResultWriter struct {
-	fn  func(ctx context.Context, row tree.Datums) error
-	err error
+	fn           func(ctx context.Context, row tree.Datums) error
+	rowsAffected int
+	err          error
 }
 
 var _ rowResultWriter = &callbackResultWriter{}
 
-// makeCallbackResultWriter creates a new callbackResultWriter.
+// newCallbackResultWriter creates a new callbackResultWriter.
 func newCallbackResultWriter(
 	fn func(ctx context.Context, row tree.Datums) error,
-) callbackResultWriter {
-	return callbackResultWriter{fn: fn}
+) *callbackResultWriter {
+	return &callbackResultWriter{fn: fn}
 }
 
-func (*callbackResultWriter) IncrementRowsAffected(n int) {
-	panic("IncrementRowsAffected not supported by callbackResultWriter")
+func (c *callbackResultWriter) IncrementRowsAffected(n int) {
+	c.rowsAffected += n
 }
 
 func (c *callbackResultWriter) AddRow(ctx context.Context, row tree.Datums) error {
@@ -110,41 +153,58 @@ var colTypeBytes = sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES}
 
 // LoadCSV performs a distributed transformation of the CSV files at from
 // and stores them in enterprise backup format at to.
-func (l *DistLoader) LoadCSV(
+func LoadCSV(
 	ctx context.Context,
+	phs PlanHookState,
 	job *jobs.Job,
-	db *client.DB,
-	evalCtx *extendedEvalContext,
-	thisNode roachpb.NodeID,
-	nodes []roachpb.NodeDescriptor,
 	resultRows *RowResultWriter,
 	tableDesc *sqlbase.TableDescriptor,
 	from []string,
 	to string,
-	comma, comment rune,
-	skip uint32,
-	nullif *string,
+	format roachpb.IOFileFormat,
 	walltime int64,
 	splitSize int64,
 ) error {
 	ctx = log.WithLogTag(ctx, "import-distsql", nil)
 
+	dsp := phs.DistSQLPlanner()
+	evalCtx := phs.ExtendedEvalContext()
+	planCtx := dsp.newPlanningCtx(ctx, evalCtx, nil /* txn */)
+
+	resp, err := phs.ExecCfg().StatusServer.Nodes(ctx, &serverpb.NodesRequest{})
+	if err != nil {
+		return err
+	}
+	// Because we're not going through the normal pathways, we have to set up
+	// the nodeID -> nodeAddress map ourselves.
+	for _, node := range resp.Nodes {
+		if err := dsp.checkNodeHealthAndVersion(&planCtx, &node.Desc); err != nil {
+			continue
+		}
+	}
+	nodes := make([]roachpb.NodeID, 0, len(planCtx.nodeAddresses))
+	for nodeID := range planCtx.nodeAddresses {
+		nodes = append(nodes, nodeID)
+	}
+	// Shuffle node order so that multiple IMPORTs done in parallel will not
+	// identically schedule CSV reading. For example, if there are 3 nodes and 4
+	// files, the first node will get 2 files while the other nodes will each get 1
+	// file. Shuffling will make that first node random instead of always the same.
+	rand.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	})
+
 	// Setup common to both stages.
 
 	// For each input file, assign it to a node.
-	csvSpecs := make([]*distsqlrun.ReadCSVSpec, 0, len(nodes))
+	csvSpecs := make([]*distsqlrun.ReadImportDataSpec, 0, len(nodes))
 	for i, input := range from {
 		// Round robin assign CSV files to nodes. Files 0 through len(nodes)-1
 		// creates the spec. Future files just add themselves to the Uris.
 		if i < len(nodes) {
-			csvSpecs = append(csvSpecs, &distsqlrun.ReadCSVSpec{
+			csvSpecs = append(csvSpecs, &distsqlrun.ReadImportDataSpec{
 				TableDesc: *tableDesc,
-				Options: roachpb.CSVOptions{
-					Comma:   comma,
-					Comment: comment,
-					Nullif:  nullif,
-					Skip:    skip,
-				},
+				Format:    format,
 				Progress: distsqlrun.JobProgress{
 					JobID: *job.ID(),
 					Slot:  int32(i),
@@ -170,12 +230,8 @@ func (l *DistLoader) LoadCSV(
 		}
 	}
 
-	planCtx := l.distSQLPlanner.newPlanningCtx(ctx, evalCtx, nil /* txn */)
-	// Because we're not going through the normal pathways, we have to set up
-	// the nodeID -> nodeAddress map ourselves.
-	for _, node := range nodes {
-		planCtx.nodeAddresses[node.NodeID] = node.Address.String()
-	}
+	db := phs.ExecCfg().DB
+	thisNode := phs.ExecCfg().NodeID.Get()
 
 	// Determine if we need to run the sampling plan or not.
 
@@ -183,7 +239,7 @@ func (l *DistLoader) LoadCSV(
 	samples := details.Tables[0].Samples
 	if samples == nil {
 		var err error
-		samples, err = l.loadCSVSamplingPlan(ctx, job, db, evalCtx, thisNode, nodes, from, splitSize, &planCtx, csvSpecs, sstSpecs)
+		samples, err = dsp.loadCSVSamplingPlan(ctx, job, db, evalCtx, thisNode, nodes, from, splitSize, &planCtx, csvSpecs, sstSpecs)
 		if err != nil {
 			return err
 		}
@@ -196,7 +252,7 @@ func (l *DistLoader) LoadCSV(
 	splits = append(splits, samples...)
 	splits = append(splits, tableSpan.EndKey)
 
-	// jobSpans is a slite of split points, including table start and end keys
+	// jobSpans is a slice of split points, including table start and end keys
 	// for the table. We create router range spans then from taking each pair
 	// of adjacent keys.
 	spans := make([]distsqlrun.OutputRouterSpec_RangeRouterSpec_Span, len(splits)-1)
@@ -241,11 +297,10 @@ func (l *DistLoader) LoadCSV(
 	// We can reuse the phase 1 ReadCSV specs, just have to clear sampling.
 	for i, rcs := range csvSpecs {
 		rcs.SampleSize = 0
-		node := nodes[i]
 		proc := distsqlplan.Processor{
-			Node: node.NodeID,
+			Node: nodes[i],
 			Spec: distsqlrun.ProcessorSpec{
-				Core: distsqlrun.ProcessorCoreUnion{ReadCSV: rcs},
+				Core: distsqlrun.ProcessorCoreUnion{ReadImport: rcs},
 				Output: []distsqlrun.OutputRouterSpec{{
 					Type:             distsqlrun.OutputRouterSpec_BY_RANGE,
 					RangeRouterSpec:  routerSpec,
@@ -282,7 +337,7 @@ func (l *DistLoader) LoadCSV(
 			Contribution: float32(len(swSpec.Spans)) / float32(len(spans)),
 		}
 		proc := distsqlplan.Processor{
-			Node: node.NodeID,
+			Node: node,
 			Spec: distsqlrun.ProcessorSpec{
 				Input: []distsqlrun.InputSyncSpec{{
 					ColumnTypes: firstStageTypes,
@@ -318,7 +373,7 @@ func (l *DistLoader) LoadCSV(
 		return err
 	}
 
-	l.distSQLPlanner.FinalizePlan(&planCtx, &p)
+	dsp.FinalizePlan(&planCtx, &p)
 
 	recv := makeDistSQLReceiver(
 		ctx,
@@ -334,22 +389,22 @@ func (l *DistLoader) LoadCSV(
 	// TODO(dan): We really don't need the txn for this flow, so remove it once
 	// Run works without one.
 	return db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		l.distSQLPlanner.Run(&planCtx, txn, &p, recv, evalCtx)
+		dsp.Run(&planCtx, txn, &p, recv, evalCtx)
 		return resultRows.Err()
 	})
 }
 
-func (l *DistLoader) loadCSVSamplingPlan(
+func (dsp *DistSQLPlanner) loadCSVSamplingPlan(
 	ctx context.Context,
 	job *jobs.Job,
 	db *client.DB,
 	evalCtx *extendedEvalContext,
 	thisNode roachpb.NodeID,
-	nodes []roachpb.NodeDescriptor,
+	nodes []roachpb.NodeID,
 	from []string,
 	splitSize int64,
 	planCtx *planningCtx,
-	csvSpecs []*distsqlrun.ReadCSVSpec,
+	csvSpecs []*distsqlrun.ReadImportDataSpec,
 	sstSpecs []distsqlrun.SSTWriterSpec,
 ) ([][]byte, error) {
 	// splitSize is the target number of bytes at which to create SST files. We
@@ -379,11 +434,10 @@ func (l *DistLoader) loadCSVSamplingPlan(
 
 	p.ResultRouters = make([]distsqlplan.ProcessorIdx, len(csvSpecs))
 	for i, rcs := range csvSpecs {
-		node := nodes[i]
 		proc := distsqlplan.Processor{
-			Node: node.NodeID,
+			Node: nodes[i],
 			Spec: distsqlrun.ProcessorSpec{
-				Core:    distsqlrun.ProcessorCoreUnion{ReadCSV: rcs},
+				Core:    distsqlrun.ProcessorCoreUnion{ReadImport: rcs},
 				Output:  []distsqlrun.OutputRouterSpec{{Type: distsqlrun.OutputRouterSpec_PASS_THROUGH}},
 				StageID: stageID,
 			},
@@ -439,11 +493,11 @@ func (l *DistLoader) loadCSVSamplingPlan(
 
 	// TODO(dan): Consider making FinalizePlan take a map explicitly instead
 	// of this PlanCtx. https://reviewable.io/reviews/cockroachdb/cockroach/17279#-KqOrLpy9EZwbRKHLYe6:-KqOp00ntQEyzwEthAsl:bd4nzje
-	l.distSQLPlanner.FinalizePlan(planCtx, &p)
+	dsp.FinalizePlan(planCtx, &p)
 
 	recv := makeDistSQLReceiver(
 		ctx,
-		&rowResultWriter,
+		rowResultWriter,
 		tree.Rows,
 		nil, /* rangeCache */
 		nil, /* leaseCache */
@@ -456,7 +510,7 @@ func (l *DistLoader) loadCSVSamplingPlan(
 	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		// Clear the stage 2 data in case this function is ever restarted (it shouldn't be).
 		samples = nil
-		l.distSQLPlanner.Run(planCtx, txn, &p, recv, evalCtx)
+		dsp.Run(planCtx, txn, &p, recv, evalCtx)
 		return rowResultWriter.Err()
 	}); err != nil {
 		return nil, err

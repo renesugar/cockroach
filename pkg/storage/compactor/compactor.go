@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"time"
 
-	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -34,67 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-const (
-	// defaultCompactionMinInterval indicates the minimum period of
-	// time to wait before any compaction activity is considered, after
-	// suggestions are made. The intent is to allow sufficient time for
-	// all ranges to be cleared when a big table is dropped, so the
-	// compactor can determine contiguous stretches and efficient delete
-	// sstable files.
-	defaultCompactionMinInterval = 2 * time.Minute
-
-	// defaultThresholdBytes is the threshold in bytes of suggested
-	// reclamation, after which the compactor will begin processing
-	// (taking compactor min interval into account). Note that we want
-	// to target roughly the target size of an L6 SSTable (128MB) but
-	// these are logical bytes (as in, from MVCCStats) which can't be
-	// translated into SSTable-bytes. As a result, we conservatively set
-	// a higher threshold.
-	defaultThresholdBytes = 256 << 20 // more than 256MiB will trigger
-
-	// defaultThresholdBytesFraction is the fraction of total logical
-	// bytes used which are up for suggested reclamation, after which
-	// the compactor will begin processing (taking compactor min
-	// interval into account). Note that this threshold handles the case
-	// where a table is dropped which is a significant fraction of the
-	// total space in the database, but does not exceed the absolute
-	// defaultThresholdBytes threshold.
-	defaultThresholdBytesFraction = 0.10 // more than 10% of space will trigger
-
-	// defaultThresholdBytesAvailableFraction is the fraction of remaining
-	// available space on a disk, which, if exceeded by the size of a suggested
-	// compaction, should trigger the processing of said compaction. This
-	// threshold is meant to make compaction more aggressive when a store is
-	// nearly full, since reclaiming space is much more important in such
-	// scenarios.
-	defaultThresholdBytesAvailableFraction = 0.10
-
-	// defaultMaxSuggestedCompactionRecordAge is the maximum age of a
-	// suggested compaction record. If not processed within this time
-	// interval since the compaction was suggested, it will be deleted.
-	defaultMaxSuggestedCompactionRecordAge = 24 * time.Hour
-)
-
-// compactorOptions specify knobs to tune for compactor behavior.
-// These are intended for testing.
-type compactorOptions struct {
-	CompactionMinInterval           time.Duration
-	ThresholdBytes                  int64
-	ThresholdBytesFraction          float64
-	ThresholdBytesAvailableFraction float64
-	MaxSuggestedCompactionRecordAge time.Duration
-}
-
-func defaultCompactorOptions() compactorOptions {
-	return compactorOptions{
-		CompactionMinInterval:           defaultCompactionMinInterval,
-		ThresholdBytes:                  defaultThresholdBytes,
-		ThresholdBytesFraction:          defaultThresholdBytesFraction,
-		ThresholdBytesAvailableFraction: defaultThresholdBytesAvailableFraction,
-		MaxSuggestedCompactionRecordAge: defaultMaxSuggestedCompactionRecordAge,
-	}
-}
-
 type storeCapacityFunc func() (roachpb.StoreCapacity, error)
 
 type doneCompactingFunc func(ctx context.Context)
@@ -102,39 +41,84 @@ type doneCompactingFunc func(ctx context.Context)
 // A Compactor records suggested compactions and periodically
 // makes requests to the engine to reclaim storage space.
 type Compactor struct {
+	st      *cluster.Settings
 	eng     engine.WithSSTables
 	capFn   storeCapacityFunc
 	doneFn  doneCompactingFunc
 	ch      chan struct{}
-	opts    compactorOptions
 	Metrics Metrics
 }
 
 // NewCompactor returns a compactor for the specified storage engine.
 func NewCompactor(
-	eng engine.WithSSTables, capFn storeCapacityFunc, doneFn doneCompactingFunc,
+	st *cluster.Settings, eng engine.WithSSTables, capFn storeCapacityFunc, doneFn doneCompactingFunc,
 ) *Compactor {
 	return &Compactor{
+		st:      st,
 		eng:     eng,
 		capFn:   capFn,
 		doneFn:  doneFn,
 		ch:      make(chan struct{}, 1),
-		opts:    defaultCompactorOptions(),
 		Metrics: makeMetrics(),
+	}
+}
+
+func (c *Compactor) enabled() bool {
+	return enabled.Get(&c.st.SV)
+}
+
+func (c *Compactor) minInterval() time.Duration {
+	return minInterval.Get(&c.st.SV)
+}
+
+func (c *Compactor) thresholdBytes() int64 {
+	return thresholdBytes.Get(&c.st.SV)
+}
+
+func (c *Compactor) thresholdBytesUsedFraction() float64 {
+	return thresholdBytesUsedFraction.Get(&c.st.SV)
+}
+
+func (c *Compactor) thresholdBytesAvailableFraction() float64 {
+	return thresholdBytesAvailableFraction.Get(&c.st.SV)
+}
+
+func (c *Compactor) maxAge() time.Duration {
+	return maxSuggestedCompactionRecordAge.Get(&c.st.SV)
+}
+
+// poke instructs the compactor's main loop to react to new suggestions in a
+// timely manner.
+func (c *Compactor) poke() {
+	select {
+	case c.ch <- struct{}{}:
+	default:
 	}
 }
 
 // Start launches a compaction processing goroutine and exits when the
 // provided stopper indicates. Processing is done with a periodicity of
 // compactionMinInterval, but only if there are compactions pending.
-func (c *Compactor) Start(ctx context.Context, tracer opentracing.Tracer, stopper *stop.Stopper) {
+func (c *Compactor) Start(ctx context.Context, stopper *stop.Stopper) {
+	ctx = log.WithLogTagStr(ctx, "compactor", "")
+
 	// Wake up immediately to examine the queue and set the bytes queued metric.
-	c.ch <- struct{}{}
+	// Note that the compactor may have received suggestions before having been
+	// started (this isn't great, but it's how it is right now).
+	c.poke()
 
 	stopper.RunWorker(ctx, func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
-		var timerSet bool
+
+		// The above timer will either be on c.minInterval() or c.maxAge(). The
+		// former applies if we know there are new suggestions waiting to be
+		// inspected: we want to look at them soon, but also want to make sure
+		// "related" suggestions arrive before we start compacting. When no new
+		// suggestions have been made since the last inspection, the expectation
+		// is that all we have to do is clean up any previously skipped ones (at
+		// least after sufficient time has passed), and so we wait out the max age.
+		var isFast bool
 
 		for {
 			select {
@@ -147,35 +131,34 @@ func (c *Compactor) Start(ctx context.Context, tracer opentracing.Tracer, stoppe
 				if bytesQueued, err := c.examineQueue(ctx); err != nil {
 					log.Warningf(ctx, "failed check whether compaction suggestions exist: %s", err)
 				} else if bytesQueued > 0 {
-					log.VEventf(ctx, 3, "compactor starting in %s as there are suggested compactions pending", c.opts.CompactionMinInterval)
+					log.VEventf(ctx, 3, "compactor starting in %s as there are suggested compactions pending", c.minInterval())
 				} else {
 					// Queue is empty, don't set the timer. This can happen only at startup.
 					break
 				}
 				// Set the wait timer if not already set.
-				if !timerSet {
-					timer.Reset(c.opts.CompactionMinInterval)
-					timerSet = true
+				if !isFast {
+					isFast = true
+					timer.Reset(c.minInterval())
 				}
 
 			case <-timer.C:
 				timer.Read = true
-				spanCtx, cleanup := tracing.EnsureContext(ctx, tracer, "process suggested compactions")
-				ok, err := c.processSuggestions(spanCtx)
+				ok, err := c.processSuggestions(ctx)
 				if err != nil {
-					log.Warningf(spanCtx, "failed processing suggested compactions: %s", err)
+					log.Warningf(ctx, "failed processing suggested compactions: %s", err)
 				}
-				cleanup()
 				if ok {
-					// The queue was processed. Wait for the next suggested
-					// compaction before resetting timer.
-					timerSet = false
+					// The queue was processed, so either it's empty or contains suggestions
+					// that were skipped for now. Revisit when they are certainly expired.
+					isFast = false
+					timer.Reset(c.maxAge())
 					break
 				}
-				// Reset the timer to re-attempt processing after the minimum
-				// compaction interval.
-				timer.Reset(c.opts.CompactionMinInterval)
-				timerSet = true
+				// More work to do, revisit after minInterval. Note that basically
+				// `ok == (err == nil)` but this refactor is left for a future commit.
+				isFast = true
+				timer.Reset(c.minInterval())
 			}
 		}
 	})
@@ -218,6 +201,9 @@ func (aggr aggregatedCompaction) String() string {
 // older than maxSuggestedCompactionRecordAge. Returns a boolean
 // indicating whether the queue was successfully processed.
 func (c *Compactor) processSuggestions(ctx context.Context) (bool, error) {
+	ctx, cleanup := tracing.EnsureContext(ctx, c.st.Tracer, "process suggested compactions")
+	defer cleanup()
+
 	// Collect all suggestions.
 	var suggestions []storagebase.SuggestedCompaction
 	var totalBytes int64
@@ -304,25 +290,36 @@ func (c *Compactor) processSuggestions(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// processCompaction sends CompactRange requests to the storage engine
-// if the aggregated suggestion exceeds size threshold(s). Otherwise,
-// it either skips the compaction or skips the compaction *and* deletes
-// the suggested compaction records if they're too old. Returns the
-// number of bytes processed (either compacted or skipped and deleted
-// due to age).
+// processCompaction sends CompactRange requests to the storage engine if the
+// aggregated suggestion exceeds size threshold(s). Otherwise, it either skips
+// the compaction or skips the compaction *and* deletes the suggested compaction
+// records if they're too old (and in particular, if the compactor is disabled,
+// deletes any suggestions handed to it). Returns the number of bytes processed
+// (either compacted or skipped and deleted due to age).
 func (c *Compactor) processCompaction(
 	ctx context.Context,
 	aggr aggregatedCompaction,
 	capacity roachpb.StoreCapacity,
 	delBatch engine.Batch,
 ) (int64, error) {
-	shouldProcess := aggr.Bytes >= c.opts.ThresholdBytes ||
-		aggr.Bytes >= int64(float64(capacity.LogicalBytes)*c.opts.ThresholdBytesFraction) ||
-		aggr.Bytes >= int64(float64(capacity.Available)*c.opts.ThresholdBytesAvailableFraction)
+	aboveSizeThresh := aggr.Bytes >= c.thresholdBytes()
+	aboveUsedFracThresh := func() bool {
+		thresh := c.thresholdBytesUsedFraction()
+		return thresh > 0 && aggr.Bytes >= int64(float64(capacity.LogicalBytes)*thresh)
+	}()
+	aboveAvailFracThresh := func() bool {
+		thresh := c.thresholdBytesAvailableFraction()
+		return thresh > 0 && aggr.Bytes >= int64(float64(capacity.Available)*thresh)
+	}()
 
+	shouldProcess := c.enabled() && (aboveSizeThresh || aboveUsedFracThresh || aboveAvailFracThresh)
 	if shouldProcess {
 		startTime := timeutil.Now()
-		log.Infof(ctx, "processing compaction %s", aggr)
+		log.Infof(ctx,
+			"processing compaction %s (reasons: size=%t used=%t avail=%t)",
+			aggr, aboveSizeThresh, aboveUsedFracThresh, aboveAvailFracThresh,
+		)
+
 		if err := c.eng.CompactRange(aggr.StartKey, aggr.EndKey, false /* forceBottommost */); err != nil {
 			c.Metrics.CompactionFailures.Inc(1)
 			return 0, errors.Wrapf(err, "unable to compact range %+v", aggr)
@@ -342,13 +339,13 @@ func (c *Compactor) processCompaction(
 	// Delete suggested compaction records if appropriate.
 	for _, sc := range aggr.suggestions {
 		age := timeutil.Since(timeutil.Unix(0, sc.SuggestedAtNanos))
-		tooOld := age >= c.opts.MaxSuggestedCompactionRecordAge
+		tooOld := age >= c.maxAge() || !c.enabled()
 		// Delete unless we didn't process and the record isn't too old.
 		if !shouldProcess && !tooOld {
 			continue
 		}
 		if tooOld {
-			c.Metrics.BytesSkipped.Inc(aggr.Bytes)
+			c.Metrics.BytesSkipped.Inc(sc.Bytes)
 		}
 		key := keys.StoreSuggestedCompactionKey(sc.StartKey, sc.EndKey)
 		if err := delBatch.Clear(engine.MVCCKey{Key: key}); err != nil {
@@ -448,8 +445,5 @@ func (c *Compactor) Suggest(ctx context.Context, sc storagebase.SuggestedCompact
 
 	// Poke the compactor goroutine to reconsider compaction in light of
 	// this new suggested compaction.
-	select {
-	case c.ch <- struct{}{}:
-	default:
-	}
+	c.poke()
 }

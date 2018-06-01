@@ -75,6 +75,11 @@ type JSON interface {
 	// one per path through the receiver.
 	encodeInvertedIndexKeys(b []byte) ([][]byte, error)
 
+	// allPaths returns a slice of new JSON documents, each a path to a leaf
+	// through the receiver. Note that leaves include the empty object and array
+	// in addition to scalars.
+	allPaths() ([]JSON, error)
+
 	// FetchValKey implements the `->` operator for strings, returning nil if the
 	// key is not found.
 	FetchValKey(key string) (JSON, error)
@@ -88,9 +93,9 @@ type JSON interface {
 	// and tries to access the given index.
 	FetchValKeyOrIdx(key string) (JSON, error)
 
-	// RemoveKey implements the `-` operator for strings, returning JSON after removal,
+	// RemoveString implements the `-` operator for strings, returning JSON after removal,
 	// whether removal is valid and error message.
-	RemoveKey(key string) (JSON, bool, error)
+	RemoveString(s string) (JSON, bool, error)
 
 	// RemoveIndex implements the `-` operator for ints, returning JSON after removal,
 	// whether removal is valid and error message.
@@ -146,6 +151,10 @@ type JSON interface {
 	// Len returns the number of outermost elements in the JSON document if it is an object or an array.
 	// Otherwise, Len returns 0.
 	Len() int
+
+	// HasContainerLeaf returns whether this document contains in it somewhere
+	// either the empty array or the empty object.
+	HasContainerLeaf() (bool, error)
 }
 
 type jsonTrue struct{}
@@ -740,6 +749,67 @@ func (j jsonObject) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 	return outKeys, nil
 }
 
+// AllPaths returns a slice of new JSON documents, each a path to a leaf
+// through the input. Note that leaves include the empty object and array
+// in addition to scalars.
+func AllPaths(j JSON) ([]JSON, error) {
+	return j.allPaths()
+}
+
+func (j jsonNull) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonTrue) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonFalse) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonString) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonNumber) allPaths() ([]JSON, error) {
+	return []JSON{j}, nil
+}
+
+func (j jsonArray) allPaths() ([]JSON, error) {
+	if len(j) == 0 {
+		return []JSON{j}, nil
+	}
+	ret := make([]JSON, 0, len(j))
+	for i := range j {
+		paths, err := j[i].allPaths()
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range paths {
+			ret = append(ret, jsonArray{path})
+		}
+	}
+	return ret, nil
+}
+
+func (j jsonObject) allPaths() ([]JSON, error) {
+	if len(j) == 0 {
+		return []JSON{j}, nil
+	}
+	ret := make([]JSON, 0, len(j))
+	for i := range j {
+		paths, err := j[i].v.allPaths()
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range paths {
+			ret = append(ret, jsonObject{jsonKeyValuePair{k: j[i].k, v: path}})
+		}
+	}
+	return ret, nil
+}
+
 // FromDecimal returns a JSON value given a apd.Decimal.
 func FromDecimal(v apd.Decimal) JSON {
 	return jsonNumber(v)
@@ -1072,12 +1142,33 @@ func (jsonNumber) FetchValKeyOrIdx(string) (JSON, error) { return nil, nil }
 var errCannotDeleteFromScalar = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from scalar")
 var errCannotDeleteFromObject = pgerror.NewError(pgerror.CodeInvalidParameterValueError, "cannot delete from object using integer index")
 
-func (j jsonArray) RemoveKey(key string) (JSON, bool, error) {
+func (j jsonArray) RemoveString(s string) (JSON, bool, error) {
+	b := NewArrayBuilder(j.Len())
+	removed := false
+	for _, el := range j {
+		// We want to remove only elements of string type.
+		if el.Type() == StringJSONType {
+			t, err := el.AsText()
+			if err != nil {
+				return nil, false, err
+			}
+			if *t != s {
+				b.Add(el)
+			} else {
+				removed = true
+			}
+		} else {
+			b.Add(el)
+		}
+	}
+	if removed {
+		return b.Build(), removed, nil
+	}
 	return j, false, nil
 }
 
-func (j jsonObject) RemoveKey(key string) (JSON, bool, error) {
-	idx, ok := findPairIndexByKey(j, key)
+func (j jsonObject) RemoveString(s string) (JSON, bool, error) {
+	idx, ok := findPairIndexByKey(j, s)
 	if !ok {
 		return j, false, nil
 	}
@@ -1092,11 +1183,17 @@ func (j jsonObject) RemoveKey(key string) (JSON, bool, error) {
 	return jsonObject(newVal), true, nil
 }
 
-func (jsonNull) RemoveKey(string) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
-func (jsonTrue) RemoveKey(string) (JSON, bool, error)   { return nil, false, errCannotDeleteFromScalar }
-func (jsonFalse) RemoveKey(string) (JSON, bool, error)  { return nil, false, errCannotDeleteFromScalar }
-func (jsonString) RemoveKey(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
-func (jsonNumber) RemoveKey(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonNull) RemoveString(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonTrue) RemoveString(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonFalse) RemoveString(string) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromScalar
+}
+func (jsonString) RemoveString(string) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromScalar
+}
+func (jsonNumber) RemoveString(string) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromScalar
+}
 
 func (j jsonArray) RemoveIndex(idx int) (JSON, bool, error) {
 	if idx < 0 {
@@ -1455,9 +1552,11 @@ func (j jsonArray) doRemovePath(path []string) (JSON, bool, error) {
 	// from the `-` operator, where strings just never match on arrays).
 	idx, err := strconv.Atoi(path[0])
 	if err != nil {
-		// If we couldn't parse the key as an integer, the array couldn't
-		// have had it (note that we don't propagate the error here).
-		return j, false, nil
+		// TODO(yuzefovich): give the position of the path element to match psql.
+		return j, false, pgerror.NewErrorf(
+			pgerror.CodeInvalidTextRepresentationError,
+			"a path element is not an integer: %s",
+			path[0])
 	}
 	if len(path) == 1 {
 		return j.RemoveIndex(idx)
@@ -1491,7 +1590,7 @@ func (j jsonObject) doRemovePath(path []string) (JSON, bool, error) {
 		return j, false, nil
 	}
 	if len(path) == 1 {
-		return j.RemoveKey(path[0])
+		return j.RemoveString(path[0])
 	}
 	idx, ok := findPairIndexByKey(j, path[0])
 	if !ok {
@@ -1522,3 +1621,41 @@ func (j jsonTrue) doRemovePath([]string) (JSON, bool, error)   { return j, false
 func (j jsonFalse) doRemovePath([]string) (JSON, bool, error)  { return j, false, nil }
 func (j jsonString) doRemovePath([]string) (JSON, bool, error) { return j, false, nil }
 func (j jsonNumber) doRemovePath([]string) (JSON, bool, error) { return j, false, nil }
+
+func (j jsonObject) HasContainerLeaf() (bool, error) {
+	if j.Len() == 0 {
+		return true, nil
+	}
+	for _, c := range j {
+		child, err := c.v.HasContainerLeaf()
+		if err != nil {
+			return false, err
+		}
+		if child {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (j jsonArray) HasContainerLeaf() (bool, error) {
+	if j.Len() == 0 {
+		return true, nil
+	}
+	for _, c := range j {
+		child, err := c.HasContainerLeaf()
+		if err != nil {
+			return false, err
+		}
+		if child {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (j jsonNull) HasContainerLeaf() (bool, error)   { return false, nil }
+func (j jsonTrue) HasContainerLeaf() (bool, error)   { return false, nil }
+func (j jsonFalse) HasContainerLeaf() (bool, error)  { return false, nil }
+func (j jsonString) HasContainerLeaf() (bool, error) { return false, nil }
+func (j jsonNumber) HasContainerLeaf() (bool, error) { return false, nil }

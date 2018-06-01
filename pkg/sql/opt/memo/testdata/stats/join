@@ -1,0 +1,234 @@
+exec-ddl
+CREATE TABLE a (x INT PRIMARY KEY, y INT, s STRING, d DECIMAL NOT NULL, UNIQUE (s DESC, d))
+----
+TABLE a
+ ├── x int not null
+ ├── y int
+ ├── s string
+ ├── d decimal not null
+ ├── INDEX primary
+ │    └── x int not null
+ └── INDEX secondary
+      ├── s string desc
+      ├── d decimal not null
+      └── x int not null (storing)
+
+exec-ddl
+CREATE TABLE b (x INT, z INT NOT NULL)
+----
+TABLE b
+ ├── x int
+ ├── z int not null
+ ├── rowid int not null (hidden)
+ └── INDEX primary
+      └── rowid int not null (hidden)
+
+exec-ddl
+ALTER TABLE a INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 5000,
+    "distinct_count": 5000
+  },
+  {
+    "columns": ["y"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 4000,
+    "distinct_count": 400
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE b INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 500
+  },
+  {
+    "columns": ["z"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 100
+  },
+  {
+    "columns": ["rowid"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
+----
+
+build
+SELECT *, rowid FROM a INNER JOIN b ON a.x=b.x
+----
+inner-join
+ ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int) z:6(int!null) rowid:7(int!null)
+ ├── stats: [rows=4000000]
+ ├── scan a
+ │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1) weak(3,4)
+ ├── scan b
+ │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+ │    ├── stats: [rows=10000]
+ │    └── keys: (7)
+ └── filters [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+      └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+           ├── variable: a.x [type=int, outer=(1)]
+           └── variable: b.x [type=int, outer=(5)]
+
+build
+SELECT *, rowid FROM a LEFT JOIN b ON a.x=b.x
+----
+left-join
+ ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int) z:6(int) rowid:7(int)
+ ├── stats: [rows=4000000]
+ ├── scan a
+ │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1) weak(3,4)
+ ├── scan b
+ │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+ │    ├── stats: [rows=10000]
+ │    └── keys: (7)
+ └── filters [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+      └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+           ├── variable: a.x [type=int, outer=(1)]
+           └── variable: b.x [type=int, outer=(5)]
+
+build
+SELECT *, rowid FROM a RIGHT JOIN b ON a.x=b.x
+----
+right-join
+ ├── columns: x:1(int) y:2(int) s:3(string) d:4(decimal) x:5(int) z:6(int!null) rowid:7(int!null)
+ ├── stats: [rows=4000000]
+ ├── scan a
+ │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1) weak(3,4)
+ ├── scan b
+ │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+ │    ├── stats: [rows=10000]
+ │    └── keys: (7)
+ └── filters [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+      └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+           ├── variable: a.x [type=int, outer=(1)]
+           └── variable: b.x [type=int, outer=(5)]
+
+build
+SELECT *, rowid FROM a FULL JOIN b ON a.x=b.x
+----
+full-join
+ ├── columns: x:1(int) y:2(int) s:3(string) d:4(decimal) x:5(int) z:6(int) rowid:7(int)
+ ├── stats: [rows=4000000]
+ ├── scan a
+ │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1) weak(3,4)
+ ├── scan b
+ │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+ │    ├── stats: [rows=10000]
+ │    └── keys: (7)
+ └── filters [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+      └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ])]
+           ├── variable: a.x [type=int, outer=(1)]
+           └── variable: b.x [type=int, outer=(5)]
+
+build
+SELECT * FROM a, b
+----
+project
+ ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int) z:6(int!null)
+ ├── stats: [rows=40000000]
+ └── inner-join
+      ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) b.x:5(int) z:6(int!null) rowid:7(int!null)
+      ├── stats: [rows=40000000]
+      ├── scan a
+      │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+      │    ├── stats: [rows=4000]
+      │    └── keys: (1) weak(3,4)
+      ├── scan b
+      │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+      │    ├── stats: [rows=10000]
+      │    └── keys: (7)
+      └── true [type=bool]
+
+build
+SELECT * FROM a, a AS a
+----
+inner-join
+ ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int!null) y:6(int) s:7(string) d:8(decimal!null)
+ ├── stats: [rows=16000000]
+ ├── scan a
+ │    ├── columns: a.x:1(int!null) a.y:2(int) a.s:3(string) a.d:4(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1) weak(3,4)
+ ├── scan a
+ │    ├── columns: a.x:5(int!null) a.y:6(int) a.s:7(string) a.d:8(decimal!null)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (5) weak(7,8)
+ └── true [type=bool]
+
+build
+SELECT * FROM a, b WHERE b.z = 5
+----
+project
+ ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int) z:6(int!null)
+ ├── stats: [rows=400000]
+ └── select
+      ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) b.x:5(int) z:6(int!null) rowid:7(int!null)
+      ├── stats: [rows=400000, distinct(6)=1]
+      ├── inner-join
+      │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) b.x:5(int) z:6(int!null) rowid:7(int!null)
+      │    ├── stats: [rows=40000000, distinct(6)=100]
+      │    ├── scan a
+      │    │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+      │    │    ├── stats: [rows=4000]
+      │    │    └── keys: (1) weak(3,4)
+      │    ├── scan b
+      │    │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+      │    │    ├── stats: [rows=10000, distinct(6)=100]
+      │    │    └── keys: (7)
+      │    └── true [type=bool]
+      └── filters [type=bool, outer=(6), constraints=(/6: [/5 - /5]; tight)]
+           └── eq [type=bool, outer=(6), constraints=(/6: [/5 - /5]; tight)]
+                ├── variable: b.z [type=int, outer=(6)]
+                └── const: 5 [type=int]
+
+# Force calculation of the distinct count for the column set spanning both
+# tables in the join.
+build
+SELECT sum(b.z), a.x, b.z FROM a, b GROUP BY a.x, b.z
+----
+project
+ ├── columns: sum:8(decimal) x:1(int!null) z:6(int!null)
+ ├── stats: [rows=500000]
+ ├── keys: (1,6)
+ └── group-by
+      ├── columns: a.x:1(int!null) z:6(int!null) sum:8(decimal)
+      ├── grouping columns: a.x:1(int!null) z:6(int!null)
+      ├── stats: [rows=500000, distinct(1,6)=500000]
+      ├── keys: (1,6)
+      ├── project
+      │    ├── columns: a.x:1(int!null) z:6(int!null)
+      │    ├── stats: [rows=40000000, distinct(1,6)=500000]
+      │    └── inner-join
+      │         ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) b.x:5(int) z:6(int!null) rowid:7(int!null)
+      │         ├── stats: [rows=40000000, distinct(1,6)=500000]
+      │         ├── scan a
+      │         │    ├── columns: a.x:1(int!null) y:2(int) s:3(string) d:4(decimal!null)
+      │         │    ├── stats: [rows=4000, distinct(1)=5000]
+      │         │    └── keys: (1) weak(3,4)
+      │         ├── scan b
+      │         │    ├── columns: b.x:5(int) z:6(int!null) rowid:7(int!null)
+      │         │    ├── stats: [rows=10000, distinct(6)=100]
+      │         │    └── keys: (7)
+      │         └── true [type=bool]
+      └── aggregations [outer=(6)]
+           └── sum [type=decimal, outer=(6)]
+                └── variable: b.z [type=int, outer=(6)]

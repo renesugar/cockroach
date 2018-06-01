@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -472,10 +473,21 @@ func generatedFamilyName(familyID FamilyID, columnNames []string) string {
 	return buf.String()
 }
 
-// MaybeUpgradeFormatVersion transforms the TableDescriptor to the latest
+// MaybeFillInDescriptor performs any modifications needed to the table descriptor.
+// This includes format upgrades and optional changes that can be handled by all version
+// (for example: additional default privileges).
+// Returns true if any changes were made.
+func (desc *TableDescriptor) MaybeFillInDescriptor() bool {
+	changedVersion := desc.maybeUpgradeFormatVersion()
+	changedPrivileges := desc.Privileges.MaybeFixPrivileges(desc.ID)
+	return changedVersion || changedPrivileges
+}
+
+// maybeUpgradeFormatVersion transforms the TableDescriptor to the latest
 // FormatVersion (if it's not already there) and returns true if any changes
 // were made.
-func (desc *TableDescriptor) MaybeUpgradeFormatVersion() bool {
+// This method should be called through MaybeFillInDescriptor, not directly.
+func (desc *TableDescriptor) maybeUpgradeFormatVersion() bool {
 	if desc.FormatVersion >= InterleavedFormatVersion {
 		return false
 	}
@@ -584,9 +596,9 @@ func (desc *TableDescriptor) AllocateIDs() error {
 	// before AllocateIDs.
 	savedID := desc.ID
 	if desc.ID == 0 {
-		desc.ID = keys.MaxReservedDescID + 1
+		desc.ID = keys.MinUserDescID
 	}
-	err := desc.ValidateTable()
+	err := desc.ValidateTable(nil)
 	desc.ID = savedID
 	return err
 }
@@ -859,8 +871,10 @@ func (desc *TableDescriptor) allocateColumnFamilyIDs(columnNames map[string]Colu
 
 // Validate validates that the table descriptor is well formed. Checks include
 // both single table and cross table invariants.
-func (desc *TableDescriptor) Validate(ctx context.Context, txn *client.Txn) error {
-	err := desc.ValidateTable()
+func (desc *TableDescriptor) Validate(
+	ctx context.Context, txn *client.Txn, st *cluster.Settings,
+) error {
+	err := desc.ValidateTable(st)
 	if err != nil {
 		return err
 	}
@@ -1012,7 +1026,8 @@ func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *c
 // names and index names are unique and verifying that column IDs and index IDs
 // are consistent. Use Validate to validate that cross-table references are
 // correct.
-func (desc *TableDescriptor) ValidateTable() error {
+// If version is supplied, the descriptor is checked for version incompatibilities.
+func (desc *TableDescriptor) ValidateTable(st *cluster.Settings) error {
 	if err := validateName(desc.Name, "table"); err != nil {
 		return err
 	}
@@ -1026,6 +1041,12 @@ func (desc *TableDescriptor) ValidateTable() error {
 	}
 
 	if desc.IsSequence() {
+		if st != nil && st.Version.HasBeenInitialized() {
+			if err := st.Version.CheckVersion(cluster.Version2_0, "sequences"); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	}
 
@@ -1037,14 +1058,14 @@ func (desc *TableDescriptor) ValidateTable() error {
 
 	// We maintain forward compatibility, so if you see this error message with a
 	// version older that what this client supports, then there's a
-	// MaybeUpgradeFormatVersion missing from some codepath.
+	// MaybeFillInDescriptor missing from some codepath.
 	if v := desc.GetFormatVersion(); v != FamilyFormatVersion && v != InterleavedFormatVersion {
 		// TODO(dan): We're currently switching from FamilyFormatVersion to
 		// InterleavedFormatVersion. After a beta is released with this dual version
 		// support, then:
 		// - Upgrade the bidirectional reference version to that beta
 		// - Start constructing all TableDescriptors with InterleavedFormatVersion
-		// - Change MaybeUpgradeFormatVersion to output InterleavedFormatVersion
+		// - Change maybeUpgradeFormatVersion to output InterleavedFormatVersion
 		// - Change this check to only allow InterleavedFormatVersion
 		return fmt.Errorf(
 			"table %q is encoded using using version %d, but this client only supports version %d and %d",
@@ -1091,6 +1112,19 @@ func (desc *TableDescriptor) ValidateTable() error {
 		}
 	}
 
+	if st != nil && st.Version.HasBeenInitialized() {
+		if !st.Version.IsMinSupported(cluster.Version2_0) {
+			for _, def := range desc.Columns {
+				if def.Type.SemanticType == ColumnType_JSON {
+					return errors.New("cluster version does not support JSONB (>= 2.0 required)")
+				}
+				if def.ComputeExpr != nil {
+					return errors.New("cluster version does not support computed columns (>= 2.0 required)")
+				}
+			}
+		}
+	}
+
 	for _, m := range desc.Mutations {
 		unSetEnums := m.State == DescriptorMutation_UNKNOWN || m.Direction == DescriptorMutation_NONE
 		switch desc := m.Descriptor_.(type) {
@@ -1126,6 +1160,11 @@ func (desc *TableDescriptor) ValidateTable() error {
 			return err
 		}
 	}
+
+	// Fill in any incorrect privileges that may have been missed due to mixed-versions.
+	// TODO(mberhault): remove this in 2.1 (maybe 2.2) when privilege-fixing migrations have been
+	// run again and mixed-version clusters always write "good" descriptors.
+	desc.Privileges.MaybeFixPrivileges(desc.GetID())
 
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
@@ -1474,7 +1513,7 @@ func upperBoundColumnValueEncodedSize(col ColumnDescriptor) (int, bool) {
 	switch col.Type.SemanticType {
 	case ColumnType_BOOL:
 		typ = encoding.True
-	case ColumnType_INT, ColumnType_DATE, ColumnType_TIME, ColumnType_TIMESTAMP,
+	case ColumnType_INT, ColumnType_DATE, ColumnType_TIME, ColumnType_TIMETZ, ColumnType_TIMESTAMP,
 		ColumnType_TIMESTAMPTZ, ColumnType_OID:
 		typ, size = encoding.Int, int(col.Type.Width)
 	case ColumnType_FLOAT:
@@ -1770,6 +1809,16 @@ func (desc *TableDescriptor) FindColumnByName(name tree.Name) (ColumnDescriptor,
 	return ColumnDescriptor{}, false, NewUndefinedColumnError(string(name))
 }
 
+// ColumnIdxMap returns a map from Column ID to the ordinal position of that
+// column.
+func (desc *TableDescriptor) ColumnIdxMap() map[ColumnID]int {
+	colIdxMap := make(map[ColumnID]int, len(desc.Columns))
+	for i, c := range desc.Columns {
+		colIdxMap[c.ID] = i
+	}
+	return colIdxMap
+}
+
 // UpdateColumnDescriptor updates an existing column descriptor.
 func (desc *TableDescriptor) UpdateColumnDescriptor(column ColumnDescriptor) {
 	for i := range desc.Columns {
@@ -1857,21 +1906,25 @@ func (desc *TableDescriptor) FindIndexByName(name string) (IndexDescriptor, bool
 }
 
 // RenameIndexDescriptor renames an index descriptor.
-func (desc *TableDescriptor) RenameIndexDescriptor(index IndexDescriptor, name string) {
+func (desc *TableDescriptor) RenameIndexDescriptor(index IndexDescriptor, name string) error {
 	id := index.ID
+	if id == desc.PrimaryIndex.ID {
+		desc.PrimaryIndex.Name = name
+		return nil
+	}
 	for i := range desc.Indexes {
 		if desc.Indexes[i].ID == id {
 			desc.Indexes[i].Name = name
-			return
+			return nil
 		}
 	}
 	for _, m := range desc.Mutations {
 		if idx := m.GetIndex(); idx != nil && idx.ID == id {
 			idx.Name = name
-			return
+			return nil
 		}
 	}
-	panic(fmt.Sprintf("index with id = %d does not exist", id))
+	return fmt.Errorf("index with id = %d does not exist", id)
 }
 
 // FindIndexByID finds an index (active or inactive) with the specified ID.
@@ -2091,6 +2144,13 @@ func (c *ColumnType) elementColumnType() *ColumnType {
 	return &result
 }
 
+// Equivalent checks whether a column type is equivalent to another, excluding
+// its VisibleType type alias, which doesn't effect equality.
+func (c *ColumnType) Equivalent(other ColumnType) bool {
+	other.VisibleType = c.VisibleType
+	return c.Equal(other)
+}
+
 // SQLString returns the SQL string corresponding to the type.
 func (c *ColumnType) SQLString() string {
 	switch c.SemanticType {
@@ -2219,6 +2279,8 @@ func DatumTypeToColumnSemanticType(ptyp types.T) (ColumnType_SemanticType, error
 		return ColumnType_DATE, nil
 	case types.Time:
 		return ColumnType_TIME, nil
+	case types.TimeTZ:
+		return ColumnType_TIMETZ, nil
 	case types.Timestamp:
 		return ColumnType_TIMESTAMP, nil
 	case types.TimestampTZ:
@@ -2243,7 +2305,10 @@ func DatumTypeToColumnSemanticType(ptyp types.T) (ColumnType_SemanticType, error
 		if ptyp.FamilyEqual(types.FamCollatedString) {
 			return ColumnType_COLLATEDSTRING, nil
 		}
-		return -1, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "unsupported result type: %s", ptyp)
+		if wrapper, ok := ptyp.(types.TOidWrapper); ok {
+			return DatumTypeToColumnSemanticType(wrapper.T)
+		}
+		return -1, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "unsupported result type: %s, %T, %+v", ptyp, ptyp, ptyp)
 	}
 }
 
@@ -2293,6 +2358,8 @@ func columnSemanticTypeToDatumType(c *ColumnType, k ColumnType_SemanticType) typ
 		return types.Date
 	case ColumnType_TIME:
 		return types.Time
+	case ColumnType_TIMETZ:
+		return types.TimeTZ
 	case ColumnType_TIMESTAMP:
 		return types.Timestamp
 	case ColumnType_TIMESTAMPTZ:
@@ -2370,6 +2437,12 @@ func (desc *DatabaseDescriptor) Validate() error {
 	if desc.ID == 0 {
 		return fmt.Errorf("invalid database ID %d", desc.ID)
 	}
+
+	// Fill in any incorrect privileges that may have been missed due to mixed-versions.
+	// TODO(mberhault): remove this in 2.1 (maybe 2.2) when privilege-fixing migrations have been
+	// run again and mixed-version clusters always write "good" descriptors.
+	desc.Privileges.MaybeFixPrivileges(desc.GetID())
+
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
 }
@@ -2637,4 +2710,38 @@ func (desc *TableDescriptor) SetAuditMode(mode tree.AuditMode) (bool, error) {
 // This is a stub until per-database auditing is enabled.
 func (desc *DatabaseDescriptor) GetAuditMode() TableDescriptor_AuditMode {
 	return TableDescriptor_DISABLED
+}
+
+// FindAllReferences returns all the references from a table.
+func (desc *TableDescriptor) FindAllReferences() (map[ID]struct{}, error) {
+	refs := map[ID]struct{}{}
+	if err := desc.ForeachNonDropIndex(func(index *IndexDescriptor) error {
+		for _, a := range index.Interleave.Ancestors {
+			refs[a.TableID] = struct{}{}
+		}
+		for _, c := range index.InterleavedBy {
+			refs[c.Table] = struct{}{}
+		}
+
+		if index.ForeignKey.IsSet() {
+			to := index.ForeignKey.Table
+			refs[to] = struct{}{}
+		}
+
+		for _, c := range index.ReferencedBy {
+			refs[c.Table] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	for _, dest := range desc.DependsOn {
+		refs[dest] = struct{}{}
+	}
+
+	for _, c := range desc.DependedOnBy {
+		refs[c.ID] = struct{}{}
+	}
+	return refs, nil
 }

@@ -16,8 +16,6 @@ package constraint
 
 import (
 	"bytes"
-
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // SpanBoundary specifies whether a span endpoint is inclusive or exclusive of
@@ -59,6 +57,9 @@ type Span struct {
 	endBoundary SpanBoundary
 }
 
+// UnconstrainedSpan is the span without any boundaries.
+var UnconstrainedSpan = Span{}
+
 // IsUnconstrained is true if the span does not constrain the key range. Both
 // the start and end boundaries are empty. This is the default state of a Span
 // before Set is called. Unconstrained spans cannot be used in constraints,
@@ -67,44 +68,44 @@ func (sp *Span) IsUnconstrained() bool {
 	return sp.start.IsEmpty() && sp.end.IsEmpty()
 }
 
-// Set sets the boundaries of this span to the given values. The following
-// spans are not allowed (causes panic):
-//  1. Empty span (should never be used in a constraint)
-//  2. Unconstrained span (should never be used in a constraint)
-//  3. Exclusive empty key boundary (use inclusive instead)
-func (sp *Span) Set(
-	evalCtx *tree.EvalContext,
-	start Key,
-	startBoundary SpanBoundary,
-	end Key,
-	endBoundary SpanBoundary,
-) {
-	if start.IsEmpty() {
-		if end.IsEmpty() {
-			// Constraint should be discarded rather than using unconstrained
-			// span, because absence of constraint implies unconstrained span.
-			panic("unconstrained span should never be used")
-		}
-		if startBoundary == ExcludeBoundary {
-			// Enforce one representation for empty boundary.
-			panic("an empty start boundary must be inclusive")
-		}
-	} else if end.IsEmpty() {
-		if endBoundary == ExcludeBoundary {
-			// Enforce one representation for empty boundary.
-			panic("an empty end boundary must be inclusive")
-		}
+// StartKey returns the start key.
+func (sp *Span) StartKey() Key {
+	return sp.start
+}
+
+// StartBoundary returns whether the start key is included or excluded.
+func (sp *Span) StartBoundary() SpanBoundary {
+	return sp.startBoundary
+}
+
+// EndKey returns the end key.
+func (sp *Span) EndKey() Key {
+	return sp.end
+}
+
+// EndBoundary returns whether the end key is included or excluded.
+func (sp *Span) EndBoundary() SpanBoundary {
+	return sp.endBoundary
+}
+
+// Init sets the boundaries of this span to the given values. The following
+// spans are not allowed:
+//  1. Empty span (should never be used in a constraint); not verified.
+//  2. Exclusive empty key boundary (use inclusive instead); causes panic.
+func (sp *Span) Init(start Key, startBoundary SpanBoundary, end Key, endBoundary SpanBoundary) {
+	if start.IsEmpty() && startBoundary == ExcludeBoundary {
+		// Enforce one representation for empty boundary.
+		panic("an empty start boundary must be inclusive")
+	}
+	if end.IsEmpty() && endBoundary == ExcludeBoundary {
+		// Enforce one representation for empty boundary.
+		panic("an empty end boundary must be inclusive")
 	}
 
 	sp.start = start
 	sp.startBoundary = startBoundary
 	sp.end = end
 	sp.endBoundary = endBoundary
-
-	// Ensure that start boundary is less than end boundary.
-	if sp.start.Compare(evalCtx, sp.end, sp.startExt(), sp.endExt()) >= 0 {
-		panic("span cannot be empty")
-	}
 }
 
 // Compare returns an integer indicating the ordering of the two spans. The
@@ -132,15 +133,15 @@ func (sp *Span) Set(
 //   (/1   - /2/1)  =  /1/High   - /2/1/Low
 //   (/1   - /2/1]  =  /1/High   - /2/1/High
 //   (/1   -     ]  =  /1/High   - /High
-func (sp *Span) Compare(evalCtx *tree.EvalContext, other *Span) int {
+func (sp *Span) Compare(keyCtx *KeyContext, other *Span) int {
 	// Span with lowest start boundary is less than the other.
-	if cmp := sp.CompareStarts(evalCtx, other); cmp != 0 {
+	if cmp := sp.CompareStarts(keyCtx, other); cmp != 0 {
 		return cmp
 	}
 
 	// Start boundary is same, so span with lowest end boundary is less than
 	// the other.
-	if cmp := sp.CompareEnds(evalCtx, other); cmp != 0 {
+	if cmp := sp.CompareEnds(keyCtx, other); cmp != 0 {
 		return cmp
 	}
 
@@ -152,44 +153,51 @@ func (sp *Span) Compare(evalCtx *tree.EvalContext, other *Span) int {
 // boundaries of the two spans. The result will be 0 if the spans have the same
 // start boundary, -1 if this span has a smaller start boundary than the given
 // span, or 1 if this span has a bigger start boundary than the given span.
-func (sp *Span) CompareStarts(evalCtx *tree.EvalContext, other *Span) int {
-	return sp.start.Compare(evalCtx, other.start, sp.startExt(), other.startExt())
+func (sp *Span) CompareStarts(keyCtx *KeyContext, other *Span) int {
+	return sp.start.Compare(keyCtx, other.start, sp.startExt(), other.startExt())
 }
 
 // CompareEnds returns an integer indicating the ordering of the end boundaries
 // of the two spans. The result will be 0 if the spans have the same end
 // boundary, -1 if this span has a smaller end boundary than the given span, or
 // 1 if this span has a bigger end boundary than the given span.
-func (sp *Span) CompareEnds(evalCtx *tree.EvalContext, other *Span) int {
-	return sp.end.Compare(evalCtx, other.end, sp.endExt(), other.endExt())
+func (sp *Span) CompareEnds(keyCtx *KeyContext, other *Span) int {
+	return sp.end.Compare(keyCtx, other.end, sp.endExt(), other.endExt())
 }
 
 // StartsAfter returns true if this span is greater than the given span and
 // does not overlap it. In other words, this span's start boundary is greater
 // or equal to the given span's end boundary.
-func (sp *Span) StartsAfter(evalCtx *tree.EvalContext, other *Span) bool {
-	return sp.start.Compare(evalCtx, other.end, sp.startExt(), other.endExt()) >= 0
+func (sp *Span) StartsAfter(keyCtx *KeyContext, other *Span) bool {
+	return sp.start.Compare(keyCtx, other.end, sp.startExt(), other.endExt()) >= 0
+}
+
+// StartsStrictlyAfter returns true if this span is greater than the given span and
+// does not overlap or touch it. In other words, this span's start boundary is
+// strictly greater than the given span's end boundary.
+func (sp *Span) StartsStrictlyAfter(keyCtx *KeyContext, other *Span) bool {
+	return sp.start.Compare(keyCtx, other.end, sp.startExt(), other.endExt()) > 0
 }
 
 // TryIntersectWith finds the overlap between this span and the given span.
 // This span is updated to only cover the range that is common to both spans.
 // If there is no overlap, then this span will not be updated, and
 // TryIntersectWith will return false.
-func (sp *Span) TryIntersectWith(evalCtx *tree.EvalContext, other *Span) bool {
-	cmpStarts := sp.CompareStarts(evalCtx, other)
+func (sp *Span) TryIntersectWith(keyCtx *KeyContext, other *Span) bool {
+	cmpStarts := sp.CompareStarts(keyCtx, other)
 	if cmpStarts > 0 {
 		// If this span's start boundary is >= the other span's end boundary,
 		// then intersection is empty.
-		if sp.start.Compare(evalCtx, other.end, sp.startExt(), other.endExt()) >= 0 {
+		if sp.start.Compare(keyCtx, other.end, sp.startExt(), other.endExt()) >= 0 {
 			return false
 		}
 	}
 
-	cmpEnds := sp.CompareEnds(evalCtx, other)
+	cmpEnds := sp.CompareEnds(keyCtx, other)
 	if cmpEnds < 0 {
 		// If this span's end boundary is <= the other span's start boundary,
 		// then intersection is empty.
-		if sp.end.Compare(evalCtx, other.start, sp.endExt(), other.startExt()) <= 0 {
+		if sp.end.Compare(keyCtx, other.start, sp.endExt(), other.startExt()) <= 0 {
 			return false
 		}
 	}
@@ -215,20 +223,20 @@ func (sp *Span) TryIntersectWith(evalCtx *tree.EvalContext, other *Span) bool {
 // Otherwise, this span is updated to the merged span range and TryUnionWith
 // returns true. If the resulting span does not constrain the range [ - ], then
 // its IsUnconstrained method returns true, and it cannot be used as part of a
-// constraint.
-func (sp *Span) TryUnionWith(evalCtx *tree.EvalContext, other *Span) bool {
+// constraint in a constraint set.
+func (sp *Span) TryUnionWith(keyCtx *KeyContext, other *Span) bool {
 	// Determine the minimum start boundary.
-	cmpStartKeys := sp.CompareStarts(evalCtx, other)
+	cmpStartKeys := sp.CompareStarts(keyCtx, other)
 
 	var cmp int
 	if cmpStartKeys < 0 {
 		// This span is less, so see if there's any "space" after it and before
 		// the start of the other span.
-		cmp = sp.end.Compare(evalCtx, other.start, sp.endExt(), other.startExt())
+		cmp = sp.end.Compare(keyCtx, other.start, sp.endExt(), other.startExt())
 	} else if cmpStartKeys > 0 {
 		// This span is greater, so see if there's any "space" before it and
 		// after the end of the other span.
-		cmp = other.end.Compare(evalCtx, sp.start, other.endExt(), sp.startExt())
+		cmp = other.end.Compare(keyCtx, sp.start, other.endExt(), sp.startExt())
 	}
 	if cmp < 0 {
 		// There's "space" between spans, so union of these spans can't be
@@ -237,7 +245,7 @@ func (sp *Span) TryUnionWith(evalCtx *tree.EvalContext, other *Span) bool {
 	}
 
 	// Determine the maximum end boundary.
-	cmpEndKeys := sp.CompareEnds(evalCtx, other)
+	cmpEndKeys := sp.CompareEnds(keyCtx, other)
 
 	// Create the merged span.
 	if cmpStartKeys > 0 {
@@ -249,6 +257,40 @@ func (sp *Span) TryUnionWith(evalCtx *tree.EvalContext, other *Span) bool {
 		sp.endBoundary = other.endBoundary
 	}
 	return true
+}
+
+// PreferInclusive tries to convert exclusive keys to inclusive keys. This is
+// only possible if the relevant type supports Next/Prev.
+//
+// We prefer inclusive constraints because we can extend inclusive constraints
+// with more constraints on columns that follow.
+//
+// Examples:
+//  - for an integer column (/1 - /5)  =>  [/2 - /4].
+//  - for a descending integer column (/5 - /1) => (/4 - /2).
+//  - for a string column, we don't have Prev so
+//      (/foo - /qux)  =>  [/foo\x00 - /qux).
+//  - for a decimal column, we don't have either Next or Prev so we can't
+//    change anything.
+func (sp *Span) PreferInclusive(keyCtx *KeyContext) {
+	if sp.startBoundary == ExcludeBoundary {
+		if key, ok := sp.start.Next(keyCtx); ok {
+			sp.start = key
+			sp.startBoundary = IncludeBoundary
+		}
+	}
+	if sp.endBoundary == ExcludeBoundary {
+		if key, ok := sp.end.Prev(keyCtx); ok {
+			sp.end = key
+			sp.endBoundary = IncludeBoundary
+		}
+	}
+}
+
+// CutFront removes the first numCols columns in both keys.
+func (sp *Span) CutFront(numCols int) {
+	sp.start = sp.start.CutFront(numCols)
+	sp.end = sp.end.CutFront(numCols)
 }
 
 func (sp *Span) startExt() KeyExtension {

@@ -37,6 +37,14 @@ scan a
  ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
  └── ordering: +1
 
+# Order by additional column.
+opt
+SELECT * FROM a ORDER BY x, y DESC, z
+----
+scan a
+ ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
+ └── ordering: +1,-2,+3
+
 # Order by suffix (scan shouldn't be able to provide).
 opt
 SELECT * FROM a ORDER BY y DESC
@@ -45,17 +53,17 @@ sort
  ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
  ├── ordering: -2
  └── scan a
-      └── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal) a.s:4(string!null)
+      └── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
 
-# Order by additional column (scan shouldn't be able to provide for now).
+# Order by suffix, don't project prefix (scan shouldn't be able to provide).
 opt
-SELECT * FROM a ORDER BY x, y DESC, z
+SELECT y FROM a ORDER BY y DESC
 ----
 sort
- ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
- ├── ordering: +1,-2,+3
+ ├── columns: y:2(float!null)
+ ├── ordering: -2
  └── scan a
-      └── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal) a.s:4(string!null)
+      └── columns: y:2(float!null)
 
 # --------------------------------------------------
 # Select operator (pass through).
@@ -63,35 +71,30 @@ sort
 
 # Pass through ordering to scan operator that can support it.
 opt
-SELECT * FROM a WHERE x=1 ORDER BY x, y DESC
+SELECT * FROM a WHERE x>y ORDER BY x, y DESC
 ----
 select
  ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
  ├── ordering: +1,-2
  ├── scan a
- │    ├── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal) a.s:4(string!null)
+ │    ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
  │    └── ordering: +1,-2
- └── filters [type=bool, outer=(1)]
-      └── eq [type=bool, outer=(1)]
-           ├── variable: a.x [type=int, outer=(1)]
-           └── const: 1 [type=int]
+ └── filters [type=bool]
+      └── a.x > a.y [type=bool]
 
 # Pass through ordering to scan operator that can't support it.
 opt
-SELECT * FROM a WHERE x=1 ORDER BY z DESC
+SELECT * FROM a WHERE x>y ORDER BY z DESC
 ----
-select
+sort
  ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
  ├── ordering: -3
- ├── sort
- │    ├── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal) a.s:4(string!null)
- │    ├── ordering: -3
- │    └── scan a
- │         └── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal) a.s:4(string!null)
- └── filters [type=bool, outer=(1)]
-      └── eq [type=bool, outer=(1)]
-           ├── variable: a.x [type=int, outer=(1)]
-           └── const: 1 [type=int]
+ └── select
+      ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
+      ├── scan a
+      │    └── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
+      └── filters [type=bool]
+           └── a.x > a.y [type=bool]
 
 # --------------------------------------------------
 # Project operator (pass through).
@@ -102,52 +105,41 @@ opt
 SELECT x+1, y FROM a ORDER BY x, y DESC
 ----
 project
- ├── columns: column5:5(int) y:2(float!null)
+ ├── columns: "x + 1":5(int) y:2(float!null)
  ├── ordering: +1,-2
  ├── scan a
- │    ├── columns: a.x:1(int!null) a.y:2(float!null)
+ │    ├── columns: x:1(int!null) y:2(float!null)
  │    └── ordering: +1,-2
- └── projections [outer=(1,2)]
-      ├── plus [type=int, outer=(1)]
-      │    ├── variable: a.x [type=int, outer=(1)]
-      │    └── const: 1 [type=int]
-      ├── variable: a.y [type=float, outer=(2)]
-      └── variable: a.x [type=int, outer=(1)]
+ └── projections
+      └── a.x + 1 [type=int]
 
 # Pass through ordering to scan operator that can't support it.
 opt
 SELECT y, x, z+1 FROM a ORDER BY x, y
 ----
-project
- ├── columns: y:2(float!null) x:1(int!null) column5:5(decimal)
+sort
+ ├── columns: y:2(float!null) x:1(int!null) "z + 1":5(decimal)
  ├── ordering: +1,+2
- ├── sort
- │    ├── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal)
- │    ├── ordering: +1,+2
- │    └── scan a
- │         └── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal)
- └── projections [outer=(1-3)]
-      ├── variable: a.y [type=float, outer=(2)]
-      ├── variable: a.x [type=int, outer=(1)]
-      └── plus [type=decimal, outer=(3)]
-           ├── variable: a.z [type=decimal, outer=(3)]
-           └── const: 1 [type=decimal]
+ └── project
+      ├── columns: "z + 1":5(decimal) x:1(int!null) y:2(float!null)
+      ├── scan a
+      │    └── columns: x:1(int!null) y:2(float!null) z:3(decimal)
+      └── projections
+           └── a.z + 1 [type=decimal]
 
 # Ordering cannot be passed through because it includes computed column.
 opt
 SELECT x, 1 one, y FROM a ORDER BY x, one
 ----
 sort
- ├── columns: x:1(int!null) one:5(int) y:2(float!null)
+ ├── columns: x:1(int!null) one:5(int!null) y:2(float!null)
  ├── ordering: +1,+5
  └── project
-      ├── columns: a.x:1(int!null) one:5(int) a.y:2(float!null)
+      ├── columns: one:5(int!null) x:1(int!null) y:2(float!null)
       ├── scan a
-      │    └── columns: a.x:1(int!null) a.y:2(float!null)
-      └── projections [outer=(1,2)]
-           ├── variable: a.x [type=int, outer=(1)]
-           ├── const: 1 [type=int]
-           └── variable: a.y [type=float, outer=(2)]
+      │    └── columns: x:1(int!null) y:2(float!null)
+      └── projections
+           └── const: 1 [type=int]
 
 # --------------------------------------------------
 # Select + Project operators (pass through both).
@@ -155,108 +147,241 @@ sort
 
 # Pass through ordering to scan operator that can support it.
 opt
-SELECT y, x-1 FROM a WHERE x=1 ORDER BY x, y DESC
+SELECT y, x-1 FROM a WHERE x>y ORDER BY x, y DESC
 ----
 project
- ├── columns: y:2(float!null) column5:5(int)
+ ├── columns: y:2(float!null) "x - 1":5(int)
  ├── ordering: +1,-2
  ├── select
- │    ├── columns: a.x:1(int!null) a.y:2(float!null)
+ │    ├── columns: x:1(int!null) y:2(float!null)
  │    ├── ordering: +1,-2
  │    ├── scan a
- │    │    ├── columns: a.x:1(int!null) a.y:2(float!null)
+ │    │    ├── columns: x:1(int!null) y:2(float!null)
  │    │    └── ordering: +1,-2
- │    └── filters [type=bool, outer=(1)]
- │         └── eq [type=bool, outer=(1)]
- │              ├── variable: a.x [type=int, outer=(1)]
- │              └── const: 1 [type=int]
- └── projections [outer=(1,2)]
-      ├── variable: a.y [type=float, outer=(2)]
-      ├── minus [type=int, outer=(1)]
-      │    ├── variable: a.x [type=int, outer=(1)]
-      │    └── const: 1 [type=int]
-      └── variable: a.x [type=int, outer=(1)]
+ │    └── filters [type=bool]
+ │         └── a.x > a.y [type=bool]
+ └── projections
+      └── a.x - 1 [type=int]
 
 memo
-SELECT y, x-1 FROM a WHERE x=1 ORDER BY x, y DESC
+SELECT y, x-1 FROM a WHERE x>y ORDER BY x, y DESC
 ----
-[13: "p:y:2,column5:5 o:+1,-2"]
-memo
- ├── 13: (project 12 10)
- │    ├── "" [cost=0.0]
- │    │    └── best: (project 12 10)
- │    └── "p:y:2,column5:5 o:+1,-2" [cost=0.0]
- │         └── best: (project 12 10)
- ├── 12: (select 11 5)
- │    ├── "" [cost=0.0]
- │    │    └── best: (select 11 5)
- │    └── "o:+1,-2" [cost=0.0]
- │         └── best: (select 11 5)
- ├── 11: (scan a)
- │    ├── "" [cost=0.0]
- │    │    └── best: (scan a)
- │    └── "o:+1,-2" [cost=0.0]
- │         └── best: (scan a)
- ├── 10: (projections 7 9 2)
- ├── 9: (minus 2 8)
- ├── 8: (const 1)
- ├── 7: (variable a.y)
- ├── 6: (select 1 5)
- ├── 5: (filters 4)
- ├── 4: (eq 2 3)
- ├── 3: (const 1)
- ├── 2: (variable a.x)
- └── 1: (scan a)
+memo (optimized)
+ ├── G1: (project G2 G3)
+ │    ├── "[presentation: y:2,x - 1:5] [ordering: +1,-2]"
+ │    │    ├── best: (project G2="[ordering: +1,-2]" G3)
+ │    │    └── cost: 1010.00
+ │    └── ""
+ │         ├── best: (project G2 G3)
+ │         └── cost: 1010.00
+ ├── G2: (select G4 G5)
+ │    ├── ""
+ │    │    ├── best: (select G4 G5)
+ │    │    └── cost: 1010.00
+ │    └── "[ordering: +1,-2]"
+ │         ├── best: (select G4="[ordering: +1,-2]" G5)
+ │         └── cost: 1010.00
+ ├── G3: (projections G6 a.x a.y)
+ ├── G4: (scan a,cols=(1,2))
+ │    ├── ""
+ │    │    ├── best: (scan a,cols=(1,2))
+ │    │    └── cost: 1000.00
+ │    └── "[ordering: +1,-2]"
+ │         ├── best: (scan a,cols=(1,2))
+ │         └── cost: 1000.00
+ ├── G5: (filters G7)
+ ├── G6: (minus G9 G8)
+ ├── G7: (gt G9 G10)
+ ├── G8: (const 1)
+ ├── G9: (variable a.x)
+ └── G10: (variable a.y)
 
 # Pass through ordering to scan operator that can't support it.
 opt
-SELECT y, z FROM a WHERE x=1 ORDER BY y
+SELECT y, z FROM a WHERE x>y ORDER BY y
 ----
-project
+sort
  ├── columns: y:2(float!null) z:3(decimal)
  ├── ordering: +2
- ├── select
- │    ├── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal)
- │    ├── ordering: +2
- │    ├── sort
- │    │    ├── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal)
- │    │    ├── ordering: +2
- │    │    └── scan a
- │    │         └── columns: a.x:1(int!null) a.y:2(float!null) a.z:3(decimal)
- │    └── filters [type=bool, outer=(1)]
- │         └── eq [type=bool, outer=(1)]
- │              ├── variable: a.x [type=int, outer=(1)]
- │              └── const: 1 [type=int]
- └── projections [outer=(2,3)]
-      ├── variable: a.y [type=float, outer=(2)]
-      └── variable: a.z [type=decimal, outer=(3)]
+ └── project
+      ├── columns: y:2(float!null) z:3(decimal)
+      └── select
+           ├── columns: x:1(int!null) y:2(float!null) z:3(decimal)
+           ├── scan a
+           │    └── columns: x:1(int!null) y:2(float!null) z:3(decimal)
+           └── filters [type=bool]
+                └── a.x > a.y [type=bool]
 
 memo
-SELECT y, z FROM a WHERE x=1 ORDER BY y
+SELECT y, z FROM a WHERE x>y ORDER BY y
 ----
-[12: "p:y:2,z:3 o:+2"]
+memo (optimized)
+ ├── G1: (project G2 G3)
+ │    ├── "[presentation: y:2,z:3] [ordering: +2]"
+ │    │    ├── best: (sort G1)
+ │    │    └── cost: 1017.54
+ │    └── ""
+ │         ├── best: (project G2 G3)
+ │         └── cost: 1010.00
+ ├── G2: (select G4 G5)
+ │    ├── ""
+ │    │    ├── best: (select G4 G5)
+ │    │    └── cost: 1010.00
+ │    └── "[ordering: +2]"
+ │         ├── best: (sort G2)
+ │         └── cost: 1017.54
+ ├── G3: (projections a.y a.z)
+ ├── G4: (scan a,cols=(1-3))
+ │    ├── ""
+ │    │    ├── best: (scan a,cols=(1-3))
+ │    │    └── cost: 1000.00
+ │    └── "[ordering: +2]"
+ │         ├── best: (sort G4)
+ │         └── cost: 1099.66
+ ├── G5: (filters G6)
+ ├── G6: (gt G7 G8)
+ ├── G7: (variable a.x)
+ └── G8: (variable a.y)
+
+# --------------------------------------------------
+# Explain operator.
+# --------------------------------------------------
+opt
+EXPLAIN (VERBOSE) SELECT * FROM a ORDER BY y
+----
+explain
+ ├── columns: Tree:5(string) Field:8(string) Description:9(string) Columns:10(string) Ordering:11(string)
+ └── sort
+      ├── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
+      ├── ordering: +2
+      └── scan a
+           └── columns: x:1(int!null) y:2(float!null) z:3(decimal) s:4(string!null)
+
 memo
- ├── 12: (project 11 9)
- │    ├── "" [cost=0.0]
- │    │    └── best: (project 11 9)
- │    └── "p:y:2,z:3 o:+2" [cost=0.0]
- │         └── best: (project 11 9)
- ├── 11: (select 10 5)
- │    ├── "" [cost=0.0]
- │    │    └── best: (select 10 5)
- │    └── "o:+2" [cost=0.0]
- │         └── best: (select 10 5)
- ├── 10: (scan a)
- │    ├── "" [cost=0.0]
- │    │    └── best: (scan a)
- │    └── "o:+2" [cost=0.0]
- │         └── best: (sort 10)
- ├── 9: (projections 7 8)
- ├── 8: (variable a.z)
- ├── 7: (variable a.y)
- ├── 6: (select 1 5)
- ├── 5: (filters 4)
- ├── 4: (eq 2 3)
- ├── 3: (const 1)
- ├── 2: (variable a.x)
- └── 1: (scan a)
+EXPLAIN (VERBOSE) SELECT * FROM a ORDER BY y
+----
+memo (optimized)
+ ├── G1: (explain G2 [presentation: x:1,y:2,z:3,s:4] [ordering: +2])
+ │    └── "[presentation: Tree:5,Field:8,Description:9,Columns:10,Ordering:11]"
+ │         ├── best: (explain G2="[presentation: x:1,y:2,z:3,s:4] [ordering: +2]" [presentation: x:1,y:2,z:3,s:4] [ordering: +2])
+ │         └── cost: 1099.66
+ └── G2: (scan a)
+      ├── ""
+      │    ├── best: (scan a)
+      │    └── cost: 1000.00
+      └── "[presentation: x:1,y:2,z:3,s:4] [ordering: +2]"
+           ├── best: (sort G2)
+           └── cost: 1099.66
+
+# --------------------------------------------------
+# With Ordinality
+# --------------------------------------------------
+
+memo
+SELECT y FROM a WITH ORDINALITY ORDER BY ordinality
+----
+memo (optimized)
+ ├── G1: (row-number G2)
+ │    ├── "[presentation: y:2] [ordering: +5]"
+ │    │    ├── best: (row-number G2)
+ │    │    └── cost: 1000.00
+ │    └── ""
+ │         ├── best: (row-number G2)
+ │         └── cost: 1000.00
+ └── G2: (scan a,cols=(2))
+      └── ""
+           ├── best: (scan a,cols=(2))
+           └── cost: 1000.00
+
+memo
+SELECT y FROM a WITH ORDINALITY ORDER BY -ordinality
+----
+memo (optimized)
+ ├── G1: (project G2 G3)
+ │    ├── "[presentation: y:2] [ordering: +6]"
+ │    │    ├── best: (sort G1)
+ │    │    └── cost: 1099.66
+ │    └── ""
+ │         ├── best: (project G2 G3)
+ │         └── cost: 1000.00
+ ├── G2: (row-number G4)
+ │    └── ""
+ │         ├── best: (row-number G4)
+ │         └── cost: 1000.00
+ ├── G3: (projections G5 a.y)
+ ├── G4: (scan a,cols=(2))
+ │    └── ""
+ │         ├── best: (scan a,cols=(2))
+ │         └── cost: 1000.00
+ ├── G5: (unary-minus G6)
+ └── G6: (variable ordinality)
+
+memo
+SELECT y FROM a WITH ORDINALITY ORDER BY ordinality, x
+----
+memo (optimized)
+ ├── G1: (row-number G2)
+ │    ├── "[presentation: y:2] [ordering: +5,+1]"
+ │    │    ├── best: (row-number G2)
+ │    │    └── cost: 1000.00
+ │    └── ""
+ │         ├── best: (row-number G2)
+ │         └── cost: 1000.00
+ └── G2: (scan a,cols=(1,2))
+      └── ""
+           ├── best: (scan a,cols=(1,2))
+           └── cost: 1000.00
+
+memo
+SELECT y FROM (SELECT * FROM a ORDER BY y) WITH ORDINALITY ORDER BY y, ordinality
+----
+memo (optimized)
+ ├── G1: (row-number G2 ordering=+2)
+ │    ├── "[presentation: y:2] [ordering: +2,+5]"
+ │    │    ├── best: (row-number G2="[ordering: +2]" ordering=+2)
+ │    │    └── cost: 1099.66
+ │    └── ""
+ │         ├── best: (row-number G2="[ordering: +2]" ordering=+2)
+ │         └── cost: 1099.66
+ └── G2: (scan a,cols=(2))
+      ├── ""
+      │    ├── best: (scan a,cols=(2))
+      │    └── cost: 1000.00
+      └── "[ordering: +2]"
+           ├── best: (sort G2)
+           └── cost: 1099.66
+
+memo
+SELECT y FROM (SELECT * FROM a ORDER BY y) WITH ORDINALITY ORDER BY ordinality, y
+----
+memo (optimized)
+ ├── G1: (row-number G2 ordering=+2)
+ │    ├── "[presentation: y:2] [ordering: +5,+2]"
+ │    │    ├── best: (row-number G2="[ordering: +2]" ordering=+2)
+ │    │    └── cost: 1099.66
+ │    └── ""
+ │         ├── best: (row-number G2="[ordering: +2]" ordering=+2)
+ │         └── cost: 1099.66
+ └── G2: (scan a,cols=(2))
+      ├── ""
+      │    ├── best: (scan a,cols=(2))
+      │    └── cost: 1000.00
+      └── "[ordering: +2]"
+           ├── best: (sort G2)
+           └── cost: 1099.66
+
+memo
+SELECT y FROM a WITH ORDINALITY ORDER BY ordinality DESC
+----
+memo (optimized)
+ ├── G1: (row-number G2)
+ │    ├── "[presentation: y:2] [ordering: -5]"
+ │    │    ├── best: (sort G1)
+ │    │    └── cost: 1099.66
+ │    └── ""
+ │         ├── best: (row-number G2)
+ │         └── cost: 1000.00
+ └── G2: (scan a,cols=(2))
+      └── ""
+           ├── best: (scan a,cols=(2))
+           └── cost: 1000.00

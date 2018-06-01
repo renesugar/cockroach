@@ -3,11 +3,7 @@
 const path = require("path");
 const rimraf = require("rimraf");
 const webpack = require("webpack");
-
-const ForkTsCheckerWebpackPlugin = require("fork-ts-checker-webpack-plugin");
-const HtmlWebpackPlugin = require("html-webpack-plugin");
-
-const title = "Cockroach Console";
+const CopyWebpackPlugin = require("copy-webpack-plugin");
 
 // Remove a broken dependency that Yarn insists upon installing before every
 // Webpack compile. We also do this when installing dependencies via Make, but
@@ -27,6 +23,16 @@ try {
   DashboardPlugin = require("./opt/node_modules/webpack-dashboard/plugin");
 } catch (e) {
   DashboardPlugin = class { apply() { /* no-op */ } };
+}
+
+const proxyPrefixes = ["/_admin", "/_status", "/ts", "/login", "/logout"];
+function shouldProxy(reqPath) {
+  if (reqPath === "/") {
+    return true;
+  }
+  return proxyPrefixes.some((prefix) => (
+    reqPath.startsWith(prefix)
+  ));
 }
 
 // tslint:disable:object-literal-sort-keys
@@ -101,14 +107,6 @@ module.exports = (distDir, ...additionalRoots) => ({
 
   plugins: [
     new RemoveBrokenDependenciesPlugin(),
-    new HtmlWebpackPlugin({
-      title: title,
-      template: require("html-webpack-template"),
-      scripts: ["protos.dll.js", "vendor.dll.js"],
-      favicon: "favicon.ico",
-      inject: false,
-      appMountId: "react-layout",
-    }),
     // See "DLLs for speedy builds" in the README for details.
     new webpack.DllReferencePlugin({
       manifest: require("./protos-manifest.json"),
@@ -116,6 +114,7 @@ module.exports = (distDir, ...additionalRoots) => ({
     new webpack.DllReferencePlugin({
       manifest: require("./vendor-manifest.json"),
     }),
+    new CopyWebpackPlugin([{ from: "favicon.ico", to: "favicon.ico" }]),
     new DashboardPlugin(),
   ],
 
@@ -127,10 +126,21 @@ module.exports = (distDir, ...additionalRoots) => ({
 
   devServer: {
     contentBase: path.join(__dirname, distDir),
-    proxy: [{
-      context: ["/_admin", "/_status", "/ts"],
-      secure: false,
-      target: process.env.TARGET,
-    }],
+    index: "",
+    proxy: {
+      // Note: this shouldn't require a custom bypass function to work;
+      // docs say that setting `index: ''` is sufficient to proxy `/`.
+      // However, that did not work, and may require upgrading to webpack 4.x.
+      "/": {
+        secure: false,
+        target: process.env.TARGET,
+        bypass: (req) => {
+          if (shouldProxy(req.path)) {
+            return false;
+          }
+          return req.path;
+        },
+      },
+    },
   },
 });

@@ -35,11 +35,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
+	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -71,7 +71,7 @@ func backupRestoreTestSetupWithParams(
 	t testing.TB,
 	clusterSize int,
 	numAccounts int,
-	init func(*cluster.Settings),
+	init func(tc *testcluster.TestCluster),
 	params base.TestClusterArgs,
 ) (
 	ctx context.Context,
@@ -84,11 +84,9 @@ func backupRestoreTestSetupWithParams(
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	params.ServerArgs.ExternalIODir = dir
+	params.ServerArgs.UseDatabase = "data"
 	tc = testcluster.StartTestCluster(t, clusterSize, params)
-
-	for _, server := range tc.Servers {
-		init(server.ClusterSettings())
-	}
+	init(tc)
 
 	const payloadSize = 100
 	splits := 10
@@ -99,9 +97,9 @@ func backupRestoreTestSetupWithParams(
 
 	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
 	sqlDB.Exec(t, `CREATE DATABASE data`)
-	sqlDB.Exec(t, `USE data`)
 	const insertBatchSize = 1000
-	if _, err := workload.Setup(sqlDB.DB, bankData, insertBatchSize); err != nil {
+	const concurrency = 4
+	if _, err := workload.Setup(ctx, sqlDB.DB, bankData, insertBatchSize, concurrency); err != nil {
 		t.Fatalf("%+v", err)
 	}
 	if err := bank.Split(sqlDB.DB, bankData); err != nil {
@@ -141,7 +139,7 @@ func backupRestoreTestSetupWithParams(
 }
 
 func backupRestoreTestSetup(
-	t testing.TB, clusterSize int, numAccounts int, init func(*cluster.Settings),
+	t testing.TB, clusterSize int, numAccounts int, init func(*testcluster.TestCluster),
 ) (
 	ctx context.Context,
 	tc *testcluster.TestCluster,
@@ -472,11 +470,11 @@ func TestBackupRestoreSystemJobs(t *testing.T) {
 	sqlDB.Exec(t, `BACKUP DATABASE data TO $1`, fullDir)
 	sqlDB.Exec(t, `SET DATABASE = data`)
 
-	sqlDB.Exec(t, `BACKUP bank TO $1 INCREMENTAL FROM $2`, incDir, fullDir)
+	sqlDB.Exec(t, `BACKUP TABLE bank TO $1 INCREMENTAL FROM $2`, incDir, fullDir)
 	if err := jobutils.VerifySystemJob(t, sqlDB, baseNumJobs+1, jobs.TypeBackup, jobs.Record{
 		Username: security.RootUser,
 		Description: fmt.Sprintf(
-			`BACKUP bank TO '%s' INCREMENTAL FROM '%s'`,
+			`BACKUP TABLE bank TO '%s' INCREMENTAL FROM '%s'`,
 			sanitizedIncDir, sanitizedFullDir,
 		),
 		DescriptorIDs: sqlbase.IDs{
@@ -487,11 +485,11 @@ func TestBackupRestoreSystemJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sqlDB.Exec(t, `RESTORE bank FROM $1, $2 WITH OPTIONS ('into_db'='restoredb')`, fullDir, incDir)
+	sqlDB.Exec(t, `RESTORE TABLE bank FROM $1, $2 WITH OPTIONS ('into_db'='restoredb')`, fullDir, incDir)
 	if err := jobutils.VerifySystemJob(t, sqlDB, baseNumJobs+2, jobs.TypeRestore, jobs.Record{
 		Username: security.RootUser,
 		Description: fmt.Sprintf(
-			`RESTORE bank FROM '%s', '%s' WITH into_db = 'restoredb'`,
+			`RESTORE TABLE bank FROM '%s', '%s' WITH into_db = 'restoredb'`,
 			sanitizedFullDir, sanitizedIncDir,
 		),
 		DescriptorIDs: sqlbase.IDs{
@@ -657,27 +655,15 @@ func TestBackupRestoreCheckpointing(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		var payloadBytes []byte
-		if err := ip.QueryRow(
-			`SELECT payload FROM system.jobs WHERE id = $1`, jobID,
-		).Scan(&payloadBytes); err != nil {
+		lowWaterMark, err := getLowWaterMark(jobID, ip.DB)
+		if err != nil {
 			return err
 		}
-		var payload jobs.Payload
-		if err := protoutil.Unmarshal(payloadBytes, &payload); err != nil {
-			return err
-		}
-		switch d := payload.Details.(type) {
-		case *jobs.Payload_Restore:
-			lowWaterMark := d.Restore.LowWaterMark
-			low := keys.MakeTablePrefix(ip.backupTableID)
-			high := keys.MakeTablePrefix(ip.backupTableID + 1)
-			if bytes.Compare(lowWaterMark, low) <= 0 || bytes.Compare(lowWaterMark, high) >= 0 {
-				return errors.Errorf("expected low water mark %v to be between %v and %v",
-					roachpb.Key(lowWaterMark), roachpb.Key(low), roachpb.Key(high))
-			}
-		default:
-			return errors.Errorf("unexpected job details type %T", d)
+		low := keys.MakeTablePrefix(ip.backupTableID)
+		high := keys.MakeTablePrefix(ip.backupTableID + 1)
+		if bytes.Compare(lowWaterMark, low) <= 0 || bytes.Compare(lowWaterMark, high) >= 0 {
+			return errors.Errorf("expected low water mark %v to be between %v and %v",
+				lowWaterMark, roachpb.Key(low), roachpb.Key(high))
 		}
 		return nil
 	}
@@ -833,10 +819,33 @@ func TestBackupRestoreResume(t *testing.T) {
 	})
 }
 
+func getLowWaterMark(jobID int64, sqlDB *gosql.DB) (roachpb.Key, error) {
+	var payloadBytes []byte
+	if err := sqlDB.QueryRow(
+		`SELECT payload FROM system.jobs WHERE id = $1`, jobID,
+	).Scan(&payloadBytes); err != nil {
+		return nil, err
+	}
+	var payload jobs.Payload
+	if err := protoutil.Unmarshal(payloadBytes, &payload); err != nil {
+		return nil, err
+	}
+	switch d := payload.Details.(type) {
+	case *jobs.Payload_Restore:
+		return d.Restore.LowWaterMark, nil
+	default:
+		return nil, errors.Errorf("unexpected job details type %T", d)
+	}
+}
+
 // TestBackupRestoreControlJob tests that PAUSE JOB, RESUME JOB, and CANCEL JOB
 // work as intended on backup and restore jobs.
 func TestBackupRestoreControlJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Skip("#24637")
+
+	// force every call to update
+	jobs.TestingSetProgressThreshold(-1.0)
 
 	defer func(oldInterval time.Duration) {
 		jobs.DefaultAdoptInterval = oldInterval
@@ -869,8 +878,19 @@ func TestBackupRestoreControlJob(t *testing.T) {
 		TestingResponseFilter: jobutils.BulkOpResponseFilter(&allowResponse),
 	}
 
+	// We need lots of ranges to see what happens when they get chunked. Rather
+	// than make a huge table, dial down the zone config for the bank table.
+	init := func(tc *testcluster.TestCluster) {
+		config.TestingSetupZoneConfigHook(tc.Stopper())
+		v, err := tc.Servers[0].DB().Get(context.TODO(), keys.DescIDGenerator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := uint32(v.ValueInt())
+		config.TestingSetZoneConfig(last+1, config.ZoneConfig{RangeMaxBytes: 5000})
+	}
 	const numAccounts = 1000
-	_, _, outerDB, _, cleanup := backupRestoreTestSetupWithParams(t, multiNode, numAccounts, initNone, params)
+	_, _, outerDB, _, cleanup := backupRestoreTestSetupWithParams(t, multiNode, numAccounts, init, params)
 	defer cleanup()
 
 	sqlDB := sqlutils.MakeSQLRunner(outerDB.DB)
@@ -887,10 +907,10 @@ func TestBackupRestoreControlJob(t *testing.T) {
 		}
 
 		for i, query := range []string{
-			`BACKUP orig_fkdb.fk TO $1`,
-			`RESTORE orig_fkdb.fk FROM $1 WITH OPTIONS ('skip_missing_foreign_keys', 'into_db'='restore_fkdb')`,
+			`BACKUP TABLE orig_fkdb.fk TO $1`,
+			`RESTORE TABLE orig_fkdb.fk FROM $1 WITH OPTIONS ('skip_missing_foreign_keys', 'into_db'='restore_fkdb')`,
 		} {
-			jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, "PAUSE", query, foreignDir)
+			jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, []string{"PAUSE"}, query, foreignDir)
 			if !testutils.IsError(err, "job paused") {
 				t.Fatalf("%d: expected 'job paused' error, but got %+v", i, err)
 			}
@@ -912,9 +932,10 @@ func TestBackupRestoreControlJob(t *testing.T) {
 
 		for i, query := range []string{
 			`BACKUP DATABASE data TO $1`,
-			`RESTORE data.* FROM $1 WITH OPTIONS ('into_db'='pause')`,
+			`RESTORE TABLE data.* FROM $1 WITH OPTIONS ('into_db'='pause')`,
 		} {
-			jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, "PAUSE", query, pauseDir)
+			ops := []string{"PAUSE", "RESUME", "PAUSE"}
+			jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, ops, query, pauseDir)
 			if !testutils.IsError(err, "job paused") {
 				t.Fatalf("%d: expected 'job paused' error, but got %+v", i, err)
 			}
@@ -923,6 +944,10 @@ func TestBackupRestoreControlJob(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		sqlDB.CheckQueryResults(t,
+			`SELECT COUNT(*) FROM pause.bank`,
+			sqlDB.QueryStr(t, `SELECT COUNT(*) FROM data.bank`),
+		)
 
 		sqlDB.CheckQueryResults(t,
 			`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE pause.bank`,
@@ -936,9 +961,11 @@ func TestBackupRestoreControlJob(t *testing.T) {
 
 		for i, query := range []string{
 			`BACKUP DATABASE data TO $1`,
-			`RESTORE data.* FROM $1 WITH OPTIONS ('into_db'='cancel')`,
+			`RESTORE TABLE data.* FROM $1 WITH OPTIONS ('into_db'='cancel')`,
 		} {
-			if _, err := jobutils.RunJob(t, sqlDB, &allowResponse, "cancel", query, cancelDir); !testutils.IsError(err, "job canceled") {
+			if _, err := jobutils.RunJob(
+				t, sqlDB, &allowResponse, []string{"cancel"}, query, cancelDir,
+			); !testutils.IsError(err, "job canceled") {
 				t.Fatalf("%d: expected 'job canceled' error, but got %+v", i, err)
 			}
 			// Check that executing the same backup or restore succeeds. This won't
@@ -1146,7 +1173,7 @@ func TestBackupRestoreCrossTableReferences(t *testing.T) {
 		)`)
 
 		// and a few views for good measure.
-		origDB.Exec(t, `CREATE VIEW store.early_customers AS SELECT id from store.customers WHERE id < 5`)
+		origDB.Exec(t, `CREATE VIEW store.early_customers AS SELECT id, email from store.customers WHERE id < 5`)
 		origDB.Exec(t, `CREATE VIEW storestats.ordercounts AS
 			SELECT c.id, c.email, COUNT(o.id)
 			FROM store.customers AS c
@@ -1355,6 +1382,13 @@ func TestBackupRestoreCrossTableReferences(t *testing.T) {
 		tc := testcluster.StartTestCluster(t, singleNode, base.TestClusterArgs{ServerArgs: args})
 		defer tc.Stopper().Stop(context.TODO())
 		db := sqlutils.MakeSQLRunner(tc.Conns[0])
+
+		if _, err := db.DB.Exec(
+			`RESTORE DATABASE storestats FROM $1`, localFoo,
+		); !testutils.IsError(err, `cannot restore "ordercounts" without restoring referenced table`) {
+			t.Fatal(err)
+		}
+
 		db.Exec(t, createStore)
 		db.Exec(t, createStoreStats)
 
@@ -1388,6 +1422,25 @@ func TestBackupRestoreCrossTableReferences(t *testing.T) {
 		}
 
 		db.CheckQueryResults(t, `SELECT * FROM storestats.ordercounts ORDER BY id`, origOrderCounts)
+
+		db.Exec(t, `CREATE DATABASE otherstore`)
+		db.Exec(t, `RESTORE store.* FROM $1 WITH into_db = 'otherstore'`, localFoo)
+		// we want to observe just the view-related errors, not fk errors below.
+		db.Exec(t, `ALTER TABLE otherstore.orders DROP CONSTRAINT fk_customerid_ref_customers`)
+		db.Exec(t, `DROP TABLE otherstore.receipts`)
+
+		if _, err := db.DB.Exec(`DROP TABLE otherstore.customers`); !testutils.IsError(err,
+			`cannot drop relation "customers" because view "early_customers" depends on it`,
+		) {
+			t.Fatal(err)
+		}
+		if _, err := db.DB.Exec(`ALTER TABLE otherstore.customers DROP COLUMN email`); !testutils.IsError(
+			err, `cannot drop column "email" because view "early_customers" depends on it`) {
+			t.Fatal(err)
+		}
+		db.Exec(t, `DROP DATABASE store CASCADE`)
+		db.CheckQueryResults(t, `SELECT * FROM otherstore.early_customers ORDER BY id`, origEarlyCustomers)
+
 	})
 }
 
@@ -1916,8 +1969,8 @@ func TestRestoreAsOfSystemTimeGCBounds(t *testing.T) {
 
 	gcr := roachpb.GCRequest{
 		// Bogus span to make it a valid request.
-		Span: roachpb.Span{
-			Key:    keys.MakeTablePrefix(keys.MaxReservedDescID + 1),
+		RequestHeader: roachpb.RequestHeader{
+			Key:    keys.MakeTablePrefix(keys.MinUserDescID),
 			EndKey: keys.MaxKey,
 		},
 		Threshold: tc.Server(0).Clock().Now(),
@@ -2804,7 +2857,7 @@ func TestBackupRestoreSequence(t *testing.T) {
 
 		if _, err := newDB.DB.Exec(
 			`RESTORE TABLE t FROM $1`, localFoo,
-		); !testutils.IsError(err, "pq: cannot restore table \"t\" without referenced sequence 52 \\(or \"skip_missing_sequences\" option\\)") {
+		); !testutils.IsError(err, "pq: cannot restore table \"t\" without referenced sequence 54 \\(or \"skip_missing_sequences\" option\\)") {
 			t.Fatal(err)
 		}
 

@@ -107,10 +107,10 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 
 	k := MakeMVCCMetadataKey(testKey1)
 
-	before := b.NewIterator(false)
+	before := b.NewIterator(IterOptions{})
 	defer before.Close()
 
-	nonBatchBefore := db.NewIterator(false)
+	nonBatchBefore := db.NewIterator(IterOptions{})
 	defer nonBatchBefore.Close()
 
 	if err := b.Put(k, []byte("abc")); err != nil {
@@ -120,7 +120,7 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 	// We use a prefix iterator for after in order to workaround the restriction
 	// on concurrent use of more than 1 prefix or normal (non-prefix) iterator on
 	// a batch.
-	after := b.NewIterator(true /* prefix */)
+	after := b.NewIterator(IterOptions{Prefix: true})
 	defer after.Close()
 
 	after.Seek(k)
@@ -142,7 +142,7 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nonBatchAfter := db.NewIterator(false)
+	nonBatchAfter := db.NewIterator(IterOptions{})
 	defer nonBatchAfter.Close()
 
 	nonBatchBefore.Seek(k)
@@ -192,7 +192,7 @@ func TestBatchPrefixIter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	iter := b.NewIterator(true /* prefix */)
+	iter := b.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	iter.Seek(mvccKey("b"))
@@ -235,7 +235,7 @@ func benchmarkIterOnBatch(b *testing.B, writes int) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := makeKey(r.Intn(writes))
-		iter := batch.NewIterator(true)
+		iter := batch.NewIterator(IterOptions{Prefix: true})
 		iter.Seek(key)
 		iter.Close()
 	}
@@ -263,7 +263,7 @@ func benchmarkIterOnReadWriter(
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := makeKey(r.Intn(writes))
-		iter := readWriter.NewIterator(true)
+		iter := readWriter.NewIterator(IterOptions{Prefix: true})
 		iter.Seek(key)
 		iter.Close()
 	}
@@ -761,9 +761,7 @@ func TestRocksDBTimeBound(t *testing.T) {
 	batch := rocksdb.NewBatch()
 	defer batch.Close()
 
-	// Make a time bounded iterator that skips the SSTable containing our writes.
-	func() {
-		tbi := batch.NewTimeBoundIterator(maxTimestamp.Next(), maxTimestamp.Next().Next())
+	check := func(t *testing.T, tbi Iterator, keys, ssts int) {
 		defer tbi.Close()
 		tbi.Seek(NilKey)
 
@@ -780,14 +778,39 @@ func TestRocksDBTimeBound(t *testing.T) {
 		}
 
 		// Make sure the iterator sees no writes.
-		if expCount := 0; expCount != count {
-			t.Fatalf("saw %d values in time bounded iterator, but expected %d", count, expCount)
+		if keys != count {
+			t.Fatalf("saw %d values in time bounded iterator, but expected %d", count, keys)
 		}
-	}()
+		stats := tbi.Stats()
+		if a := stats.TimeBoundNumSSTs; a != ssts {
+			t.Fatalf("touched %d SSTs, expected %d", a, ssts)
+		}
+	}
+
+	testCases := []struct {
+		iter       Iterator
+		keys, ssts int
+	}{
+		// Completely to the right, not touching.
+		{iter: batch.NewTimeBoundIterator(maxTimestamp.Next(), maxTimestamp.Next().Next(), true /* withStats */), keys: 0, ssts: 0},
+		// Completely to the left, not touching.
+		{iter: batch.NewTimeBoundIterator(minTimestamp.Prev().Prev(), minTimestamp.Prev(), true /* withStats */), keys: 0, ssts: 0},
+		// Touching on the right.
+		{iter: batch.NewTimeBoundIterator(maxTimestamp, maxTimestamp, true /* withStats */), keys: len(times), ssts: 1},
+		// Touching on the left.
+		{iter: batch.NewTimeBoundIterator(minTimestamp, minTimestamp, true /* withStats */), keys: len(times), ssts: 1},
+		// Copy of last case, but confirm that we don't get SST stats if we don't ask for them.
+		{iter: batch.NewTimeBoundIterator(minTimestamp, minTimestamp, false /* withStats */), keys: len(times), ssts: 0}}
+
+	for _, test := range testCases {
+		t.Run("", func(t *testing.T) {
+			check(t, test.iter, test.keys, test.ssts)
+		})
+	}
 
 	// Make a regular iterator. Before #21721, this would accidentally pick up the
 	// time bounded iterator instead.
-	iter := batch.NewIterator(false)
+	iter := batch.NewIterator(IterOptions{})
 	defer iter.Close()
 	iter.Seek(NilKey)
 
@@ -863,7 +886,7 @@ func TestRocksDBDeleteRangeBug(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	iter := db.NewIterator(false)
+	iter := db.NewIterator(IterOptions{})
 	iter.Seek(key("a"))
 	if ok, _ := iter.Valid(); ok {
 		t.Fatalf("unexpected key: %s", iter.Key())
@@ -1027,5 +1050,66 @@ func TestRocksDBOptions(t *testing.T) {
 				t.Errorf("unable to find %s in %s", o, p)
 			}
 		}
+	}
+}
+
+func TestRocksDBFileNotFoundError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	dir, dirCleanup := testutils.TempDir(t)
+	defer dirCleanup()
+
+	db, err := NewRocksDB(
+		RocksDBConfig{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Dir:      dir,
+		},
+		RocksDBCache{},
+	)
+	if err != nil {
+		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
+	}
+	defer db.Close()
+
+	// Verify DeleteFile returns os.ErrNotExist if file does not exist.
+	if err := db.DeleteFile("/non/existent/file"); !os.IsNotExist(err) {
+		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
+	}
+
+	fname := filepath.Join(dir, "random.file")
+	data := "random data"
+	if f, err := db.OpenFile(fname); err != nil {
+		t.Fatalf("unable to open file with filename %s, got err %v", fname, err)
+	} else {
+		// Write data to file so we can read it later.
+		if err := f.Append([]byte(data)); err != nil {
+			t.Fatalf("error writing data: '%s' to file %s, got err %v", data, fname, err)
+		}
+		if err := f.Sync(); err != nil {
+			t.Fatalf("error syncing data, got err %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("error closing file %s, got err %v", fname, err)
+		}
+	}
+
+	if b, err := db.ReadFile(fname); err != nil {
+		t.Errorf("unable to read file with filename %s, got err %v", fname, err)
+	} else if string(b) != data {
+		t.Errorf("expected content in %s is '%s', got '%s'", fname, data, string(b))
+	}
+
+	if err := db.DeleteFile(fname); err != nil {
+		t.Errorf("unable to delete file with filename %s, got err %v", fname, err)
+	}
+
+	// Verify ReadFile returns os.ErrNotExist if reading an already deleted file.
+	if _, err := db.ReadFile(fname); !os.IsNotExist(err) {
+		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
+	}
+
+	// Verify DeleteFile returns os.ErrNotExist if deleting an already deleted file.
+	if err := db.DeleteFile(fname); !os.IsNotExist(err) {
+		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
 	}
 }

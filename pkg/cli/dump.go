@@ -26,10 +26,11 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 )
 
@@ -41,24 +42,18 @@ var dumpCmd = &cobra.Command{
 Dump SQL tables of a cockroach database. If the table name
 is omitted, dump all tables in the database.
 `,
+	Args: cobra.MinimumNArgs(1),
 	RunE: MaybeDecorateGRPCError(runDump),
 }
 
 func runDump(cmd *cobra.Command, args []string) error {
-	if len(args) < 1 {
-		return usageAndError(cmd)
-	}
-
-	conn, err := getPasswordAndMakeSQLClient()
+	conn, err := getPasswordAndMakeSQLClient("cockroach dump")
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	// NOTE: We too aggressively broke backwards compatibility in this command.
-	// Future changes should maintain compatibility with the last two released
-	// versions of CockroachDB.
-	if err := conn.requireServerVersion(">v2.0-alpha.20180212"); err != nil {
+	if err := conn.requireServerVersion(">v2.1.0-alpha.20180416"); err != nil {
 		return err
 	}
 
@@ -133,6 +128,32 @@ func runDump(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+	// Put FK ALTERs at the end.
+	if dumpCtx.dumpMode != dumpDataOnly {
+		hasRefs := false
+		for _, md := range mds {
+			for _, alter := range md.alter {
+				if !hasRefs {
+					hasRefs = true
+					if _, err := w.Write([]byte("\n")); err != nil {
+						return err
+					}
+				}
+				fmt.Fprintf(w, "%s;\n", alter)
+			}
+		}
+		if hasRefs {
+			const alterValidateMessage = `-- Validate foreign key constraints. These can fail if there was unvalidated data during the dump.`
+			if _, err := w.Write([]byte("\n" + alterValidateMessage + "\n")); err != nil {
+				return err
+			}
+			for _, md := range mds {
+				for _, validate := range md.validate {
+					fmt.Fprintf(w, "%s;\n", validate)
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -157,6 +178,8 @@ type basicMetadata struct {
 	createStmt string
 	dependsOn  []int64
 	kind       string // "string", "table", or "view"
+	alter      []string
+	validate   []string
 }
 
 // tableMetadata describes one table to dump.
@@ -248,8 +271,10 @@ func getBasicMetadata(conn *sqlConn, dbName, tableName string, ts string) (basic
 	vals, err := conn.QueryRow(fmt.Sprintf(`
 		SELECT
 			descriptor_id,
-			create_statement,
-			descriptor_type
+			create_nofks,
+			descriptor_type,
+			alter_statements,
+			validate_statements
 		FROM %s.crdb_internal.create_statements
 		AS OF SYSTEM TIME %s
 		WHERE database_name = $1
@@ -279,6 +304,14 @@ func getBasicMetadata(conn *sqlConn, dbName, tableName string, ts string) (basic
 	if !ok {
 		return basicMetadata{}, fmt.Errorf("unexpected value: %T", kindI)
 	}
+	alterStatements, err := extractArray(vals[3])
+	if err != nil {
+		return basicMetadata{}, err
+	}
+	validateStatements, err := extractArray(vals[4])
+	if err != nil {
+		return basicMetadata{}, err
+	}
 
 	// Get dependencies.
 	rows, err := conn.Query(fmt.Sprintf(`
@@ -306,13 +339,33 @@ func getBasicMetadata(conn *sqlConn, dbName, tableName string, ts string) (basic
 		return basicMetadata{}, err
 	}
 
-	return basicMetadata{
+	md := basicMetadata{
 		ID:         id,
 		name:       tree.NewTableName(tree.Name(dbName), tree.Name(tableName)),
 		createStmt: createStatement,
 		dependsOn:  refs,
 		kind:       kind,
-	}, nil
+		alter:      alterStatements,
+		validate:   validateStatements,
+	}
+
+	return md, nil
+}
+
+func extractArray(val interface{}) ([]string, error) {
+	b, ok := val.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("unexpected value: %T", b)
+	}
+	arr, err := tree.ParseDArrayFromString(tree.NewTestingEvalContext(serverCfg.Settings), string(b), coltypes.String)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]string, len(arr.Array))
+	for i, v := range arr.Array {
+		res[i] = string(*v.(*tree.DString))
+	}
+	return res, nil
 }
 
 func getMetadataForTable(conn *sqlConn, md basicMetadata, ts string) (tableMetadata, error) {
@@ -456,15 +509,14 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 	for i := range valArray {
 		valArray[i] = make([]driver.Value, len(cols))
 	}
-	g, ctx := errgroup.WithContext(context.Background())
-	done := ctx.Done()
+	g := ctxgroup.WithContext(context.Background())
 	valsCh := make(chan []driver.Value)
 	// stringsCh receives VALUES lines and batches them before writing to the
 	// output. Buffering this chan allows the val encoding to proceed during
 	// writes.
 	stringsCh := make(chan string, insertRows)
 
-	g.Go(func() error {
+	g.GoCtx(func(ctx context.Context) error {
 		// Fetch SQL rows and put them onto valsCh.
 		defer close(valsCh)
 		for i := 0; ; i++ {
@@ -475,13 +527,13 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				return err
 			}
 			select {
-			case <-done:
-				return ctx.Err()
+			case <-g.Done:
+				return g.Err()
 			case valsCh <- vals:
 			}
 		}
 	})
-	g.Go(func() error {
+	g.GoCtx(func(ctx context.Context) error {
 		// Convert SQL rows into VALUE strings.
 		defer close(stringsCh)
 		f := tree.NewFmtCtxWithBuf(tree.FmtParsable)
@@ -563,6 +615,8 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 					case "TIME":
 						// pq awkwardly represents TIME as a time.Time with date 0000-01-01.
 						d = tree.MakeDTime(timeofday.FromTime(t))
+					case "TIME WITH TIME ZONE", "TIMETZ":
+						d = tree.MakeDTimeTZ(timeofday.FromTime(t), t.Location())
 					case "TIMESTAMP":
 						d = tree.MakeDTimestamp(t, time.Nanosecond)
 					case "TIMESTAMP WITH TIME ZONE":
@@ -576,8 +630,8 @@ func dumpTableData(w io.Writer, conn *sqlConn, clusterTS string, bmd basicMetada
 				d.Format(&f.FmtCtx)
 			}
 			select {
-			case <-done:
-				return ctx.Err()
+			case <-g.Done:
+				return g.Err()
 			case stringsCh <- f.String():
 			}
 		}

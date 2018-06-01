@@ -21,11 +21,10 @@
 #             step in some important transformations (like eliminating
 #             subqueries).
 
-# Scan returns a result set containing every row in the specified table. The
-# private Def field is an *opt.ScanOpDef that identifies the table to scan, as
-# well as the subset of columns to project from it. Rows and columns are not
-# expected to have any particular ordering unless a physical property requires
-# it.
+# Scan returns a result set containing every row in the specified table, by
+# scanning one of the table's indexes according to its ordering. The private
+# Def field is an *opt.ScanOpDef that identifies the table and index to scan,
+# as well as the subset of columns to project from it.
 [Relational]
 define Scan {
     Def ScanOpDef
@@ -39,7 +38,7 @@ define Scan {
 # the same length (same with that of Cols).
 #
 # The Cols field contains the set of column indices returned by each row
-# as a *ColList. It is legal for Cols to be empty.
+# as an opt.ColList. It is legal for Cols to be empty.
 [Relational]
 define Values {
     Rows ExprList
@@ -59,13 +58,14 @@ define Select {
 
 # Project modifies the set of columns returned by the input result set. Columns
 # can be removed, reordered, or renamed. In addition, new columns can be
-# synthesized. Projections is a scalar Projections list operator that contains
-# the list of expressions that describe the output columns. The Cols field of
-# the Projections operator provides the indexes of each of the output columns.
+# synthesized.
+# Projections is a scalar Projections list operator that contains information
+# about the projected columns and any expressions that describe newly
+# synthesized output columns.
 [Relational]
 define Project {
-    Input       Expr
-    Projections Expr
+    Input           Expr
+    Projections     Expr
 }
 
 # InnerJoin creates a result set that combines columns from its left and right
@@ -113,6 +113,13 @@ define AntiJoin {
     Left  Expr
     Right Expr
     On    Expr
+}
+
+# LookupJoin represents a join between an input expression and an index.
+[Relational]
+define LookupJoin {
+    Input Expr
+    Def LookupJoinDef
 }
 
 # InnerJoinApply has the same join semantics as InnerJoin. However, unlike
@@ -286,7 +293,7 @@ define ExceptAll {
 
 # Limit returns a limited subset of the results in the input relation.
 # The limit expression is a scalar value; the operator returns at most this many
-# rows. The private field is an *opt.Ordering which indicates the desired
+# rows. The private field is an opt.Ordering which indicates the desired
 # row ordering (the first rows with respect to this ordering are returned).
 [Relational]
 define Limit {
@@ -302,4 +309,42 @@ define Offset {
     Input    Expr
     Offset   Expr
     Ordering Ordering
+}
+
+# Max1Row enforces that its input must return at most one row. It is used as
+# input to the Subquery operator. See the comment above Subquery for more
+# details.
+[Relational]
+define Max1Row {
+    Input Expr
+}
+
+# Explain returns information about the execution plan of the "input"
+# expression.
+[Relational]
+define Explain {
+    Input Expr
+    Def   ExplainOpDef
+}
+
+# ShowTrace runs the "input" expressions in a special tracing mode and returns
+# trace results.
+[Relational]
+define ShowTrace {
+    Input Expr
+    Def   ShowTraceOpDef
+}
+
+# ShowTraceForSession returns the current session traces.
+[Relational]
+define ShowTraceForSession {
+    Def   ShowTraceOpDef
+}
+
+# RowNumber adds a column to each row in its input containing a unique,
+# increasing number.
+[Relational]
+define RowNumber {
+    Input    Expr
+    Def      RowNumberDef
 }

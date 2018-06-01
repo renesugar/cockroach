@@ -31,11 +31,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -45,9 +47,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 )
 
 var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
@@ -64,6 +69,46 @@ func TestSelfBootstrap(t *testing.T) {
 
 	if s.RPCContext().ClusterID.Get() == uuid.Nil {
 		t.Error("cluster ID failed to be set on the RPC context")
+	}
+}
+
+// TestHealthCheck runs a basic sanity check on the health checker.
+func TestHealthCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+
+	ctx := context.Background()
+
+	recorder := s.(*TestServer).Server.recorder
+
+	{
+		summary := *recorder.GenerateNodeStatus(ctx)
+		result := recorder.CheckHealth(ctx, summary)
+		if len(result.Alerts) != 0 {
+			t.Fatal(result)
+		}
+	}
+
+	store, err := s.(*TestServer).Server.node.stores.GetStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.Metrics().UnavailableRangeCount.Inc(100)
+
+	{
+		summary := *recorder.GenerateNodeStatus(ctx)
+		result := recorder.CheckHealth(ctx, summary)
+		expAlerts := []status.HealthAlert{
+			{StoreID: 1, Category: status.HealthAlert_METRICS, Description: "ranges.unavailable", Value: 100.0},
+		}
+		if !reflect.DeepEqual(expAlerts, result.Alerts) {
+			t.Fatalf("expected %+v, got %+v", expAlerts, result.Alerts)
+		}
 	}
 }
 
@@ -91,7 +136,7 @@ func TestServerStartClock(t *testing.T) {
 	// actually not needed because other commands run during server
 	// initialization, but we cannot guarantee that's going to stay that way.
 	get := &roachpb.GetRequest{
-		Span: roachpb.Span{Key: roachpb.Key("a")},
+		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")},
 	}
 	if _, err := client.SendWrapped(
 		context.Background(), s.DB().GetSender(), get,
@@ -247,7 +292,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
 	get := &roachpb.GetRequest{
-		Span: roachpb.Span{Key: writes[0]},
+		RequestHeader: roachpb.RequestHeader{Key: writes[0]},
 	}
 	get.EndKey = writes[len(writes)-1]
 	if _, err := client.SendWrapped(context.Background(), tds, get); err == nil {
@@ -276,7 +321,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 
 	del := &roachpb.DeleteRangeRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key:    writes[0],
 			EndKey: writes[len(writes)-1].Next(),
 		},
@@ -539,6 +584,7 @@ func TestListenURLFileCreation(t *testing.T) {
 		t.Fatalf("expected URL %s to match host %s", u, s.ServingAddr())
 	}
 }
+
 func TestListenerFileCreation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -664,4 +710,348 @@ func TestClusterIDMismatch(t *testing.T) {
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected %s error, got %v", expected, err)
 	}
+}
+
+func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		name              string
+		prevHLCUpperBound int64
+		clockStartTime    int64
+		checkPersist      bool
+	}{
+		{
+			name:              "lower upper bound time",
+			prevHLCUpperBound: 100,
+			clockStartTime:    1000,
+			checkPersist:      true,
+		},
+		{
+			name:              "higher upper bound time",
+			prevHLCUpperBound: 10000,
+			clockStartTime:    1000,
+			checkPersist:      true,
+		},
+		{
+			name:              "significantly higher upper bound time",
+			prevHLCUpperBound: int64(3 * time.Hour),
+			clockStartTime:    int64(1 * time.Hour),
+			checkPersist:      true,
+		},
+		{
+			name:              "equal upper bound time",
+			prevHLCUpperBound: int64(time.Hour),
+			clockStartTime:    int64(time.Hour),
+			checkPersist:      true,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			a := assert.New(t)
+
+			const maxOffset = 500 * time.Millisecond
+			m := hlc.NewManualClock(test.clockStartTime)
+			c := hlc.NewClock(m.UnixNano, maxOffset)
+
+			sleepUntilFn := func(until int64, currentTime func() int64) {
+				delta := until - currentTime()
+				if delta > 0 {
+					m.Increment(delta)
+				}
+			}
+
+			wallTime1 := c.Now().WallTime
+			if test.clockStartTime < test.prevHLCUpperBound {
+				a.True(
+					wallTime1 < test.prevHLCUpperBound,
+					fmt.Sprintf(
+						"expected wall time %d < prev upper bound %d",
+						wallTime1,
+						test.prevHLCUpperBound,
+					),
+				)
+			}
+
+			ensureClockMonotonicity(
+				context.TODO(),
+				c,
+				c.PhysicalTime(),
+				test.prevHLCUpperBound,
+				sleepUntilFn,
+			)
+
+			wallTime2 := c.Now().WallTime
+			// After ensuring monotonicity, wall time should be greater than
+			// persisted upper bound
+			a.True(
+				wallTime2 > test.prevHLCUpperBound,
+				fmt.Sprintf(
+					"expected wall time %d > prev upper bound %d",
+					wallTime2,
+					test.prevHLCUpperBound,
+				),
+			)
+		})
+	}
+}
+
+func TestPersistHLCUpperBound(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var fatal bool
+	defer log.SetExitFunc(os.Exit)
+	log.SetExitFunc(func(r int) {
+		defer log.Flush()
+		if r != 0 {
+			fatal = true
+		}
+	})
+
+	testCases := []struct {
+		name            string
+		persistInterval time.Duration
+	}{
+		{
+			name:            "persist default delta",
+			persistInterval: 200 * time.Millisecond,
+		},
+		{
+			name:            "persist 100ms delta",
+			persistInterval: 50 * time.Millisecond,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			a := assert.New(t)
+			m := hlc.NewManualClock(int64(1))
+			c := hlc.NewClock(m.UnixNano, time.Nanosecond)
+
+			var persistErr error
+			var persistedUpperBound int64
+			var tickerDur time.Duration
+			persistUpperBoundFn := func(i int64) error {
+				if persistErr != nil {
+					return persistErr
+				}
+				persistedUpperBound = i
+				return nil
+			}
+
+			tickerCh := make(chan time.Time)
+			tickProcessedCh := make(chan struct{})
+			persistHLCUpperBoundIntervalCh := make(chan time.Duration, 1)
+			stopCh := make(chan struct{}, 1)
+			defer close(persistHLCUpperBoundIntervalCh)
+
+			go periodicallyPersistHLCUpperBound(
+				c,
+				persistHLCUpperBoundIntervalCh,
+				persistUpperBoundFn,
+				func(d time.Duration) *time.Ticker {
+					ticker := time.NewTicker(d)
+					ticker.Stop()
+					ticker.C = tickerCh
+					tickerDur = d
+					return ticker
+				},
+				stopCh,
+				func() {
+					tickProcessedCh <- struct{}{}
+				},
+			)
+
+			fatal = false
+			// persist an upper bound
+			m.Increment(100)
+			wallTime3 := c.Now().WallTime
+			persistHLCUpperBoundIntervalCh <- test.persistInterval
+			<-tickProcessedCh
+
+			a.True(
+				test.persistInterval == tickerDur,
+				fmt.Sprintf(
+					"expected persist interval %d = ticker duration %d",
+					test.persistInterval,
+					tickerDur,
+				),
+			)
+
+			// Updating persistInterval should have triggered a persist
+			firstPersist := persistedUpperBound
+			a.True(
+				persistedUpperBound > wallTime3,
+				fmt.Sprintf(
+					"expected persisted wall time %d > wall time %d",
+					persistedUpperBound,
+					wallTime3,
+				),
+			)
+			// ensure that in memory value and persisted value are same
+			a.Equal(c.WallTimeUpperBound(), persistedUpperBound)
+
+			// Increment clock by 100 and tick the timer.
+			// A persist should have happened
+			m.Increment(100)
+			tickerCh <- timeutil.Now()
+			<-tickProcessedCh
+			secondPersist := persistedUpperBound
+			a.True(
+				secondPersist == firstPersist+100,
+				fmt.Sprintf(
+					"expected persisted wall time %d to be 100 more than earlier persisted value %d",
+					secondPersist,
+					firstPersist,
+				),
+			)
+			a.Equal(c.WallTimeUpperBound(), persistedUpperBound)
+			a.False(fatal)
+			fatal = false
+
+			// After disabling persistHLCUpperBound, a value of 0 should be persisted
+			persistHLCUpperBoundIntervalCh <- 0
+			<-tickProcessedCh
+			a.Equal(
+				int64(0),
+				c.WallTimeUpperBound(),
+			)
+			a.Equal(int64(0), persistedUpperBound)
+			a.Equal(int64(0), c.WallTimeUpperBound())
+			a.False(fatal)
+			fatal = false
+
+			persistHLCUpperBoundIntervalCh <- test.persistInterval
+			<-tickProcessedCh
+			m.Increment(100)
+			tickerCh <- timeutil.Now()
+			<-tickProcessedCh
+			// If persisting fails, a fatal error is expected
+			persistErr = errors.New("test err")
+			fatal = false
+			tickerCh <- timeutil.Now()
+			<-tickProcessedCh
+			a.True(fatal)
+		})
+	}
+}
+
+func TestServeIndexHTML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const htmlTemplate = `<!DOCTYPE html>
+<html>
+	<head>
+		<title>Cockroach Console</title>
+		<meta charset="UTF-8">
+		<link href="favicon.ico" rel="shortcut icon">
+	</head>
+	<body>
+		<div id="react-layout"></div>
+
+		<script>
+			window.dataFromServer = %s;
+		</script>
+
+		<script src="protos.dll.js" type="text/javascript"></script>
+		<script src="vendor.dll.js" type="text/javascript"></script>
+		<script src="bundle.js" type="text/javascript"></script>
+	</body>
+</html>
+`
+
+	t.Run("Insecure mode", func(t *testing.T) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+			Insecure: true,
+			// This test server argument has the same effect as setting the environment variable
+			// `COCKROACH_EXPERIMENTAL_REQUIRE_WEB_SESSION` to false, or not setting it.
+			// In test servers, web sessions are required by default.
+			DisableWebSessionAuthentication: true,
+		})
+		defer s.Stopper().Stop(context.TODO())
+		tsrv := s.(*TestServer)
+
+		client, err := tsrv.GetHTTPClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := client.Get(s.AdminURL())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("expected status code 200; got %d", resp.StatusCode)
+		}
+		respBytes, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respString := string(respBytes)
+		expected := fmt.Sprintf(
+			htmlTemplate,
+			fmt.Sprintf(
+				`{"ExperimentalUseLogin":false,"LoginEnabled":false,"LoggedInUser":null,"Version":"%s"}`,
+				build.VersionPrefix(),
+			),
+		)
+		if respString != expected {
+			t.Fatalf("expected %s; got %s", expected, respString)
+		}
+	})
+
+	t.Run("Secure mode", func(t *testing.T) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		defer s.Stopper().Stop(context.TODO())
+		tsrv := s.(*TestServer)
+
+		loggedInClient, err := tsrv.GetAuthenticatedHTTPClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		loggedOutClient, err := tsrv.GetHTTPClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cases := []struct {
+			client http.Client
+			json   string
+		}{
+			{
+				loggedInClient,
+				fmt.Sprintf(
+					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":"authentic_user","Version":"%s"}`,
+					build.VersionPrefix(),
+				),
+			},
+			{
+				loggedOutClient,
+				fmt.Sprintf(
+					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":null,"Version":"%s"}`,
+					build.VersionPrefix(),
+				),
+			},
+		}
+
+		for _, testCase := range cases {
+			resp, err := testCase.client.Get(s.AdminURL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != 200 {
+				t.Fatalf("expected status code 200; got %d", resp.StatusCode)
+			}
+			respBytes, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			respString := string(respBytes)
+			expected := fmt.Sprintf(htmlTemplate, testCase.json)
+			if respString != expected {
+				t.Fatalf("expected %s; got %s", expected, respString)
+			}
+		}
+	})
 }

@@ -61,12 +61,10 @@ func (p *planner) ShowFingerprints(
 
 	var tableDesc *TableDescriptor
 	// We avoid the cache so that we can observe the fingerprints without
-	// taking a lease, like other SHOW commands. We also use
-	// allowAdding=true so we can look at the fingerprints of a table
-	// added in the same transaction.
+	// taking a lease, like other SHOW commands.
 	//
 	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
 	})
 	if err != nil {
@@ -152,14 +150,27 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	  XOR_AGG(FNV64(%s))::string AS fingerprint
 	  FROM [%d AS t]@{FORCE_INDEX=[%d],NO_INDEX_JOIN}
 	`, strings.Join(cols, `,`), n.tableDesc.ID, index.ID)
+	// If were'in in an AOST context, propagate it to the inner statement so that
+	// the inner statement gets planned with planner.avoidCachedDescriptors set,
+	// like the outter one.
+	if params.p.asOfSystemTime {
+		ts := params.p.txn.OrigTimestamp()
+		tsStr := fmt.Sprintf("%d.%d", ts.WallTime, ts.Logical)
+		sql = sql + " AS OF SYSTEM TIME " + tsStr
+	}
 
-	fingerprintCols, err := params.p.QueryRow(params.ctx, sql)
+	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(
+		params.ctx, "hash-fingerprint",
+		params.p.txn,
+		sql,
+	)
 	if err != nil {
 		return false, err
 	}
 
 	if len(fingerprintCols) != 1 {
-		return false, errors.Errorf("unexpected number of columns returned: 1 vs %d",
+		return false, errors.Errorf(
+			"programming error: unexpected number of columns returned: 1 vs %d",
 			len(fingerprintCols))
 	}
 	fingerprint := fingerprintCols[0]

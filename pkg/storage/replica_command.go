@@ -267,7 +267,7 @@ func evalEndTransaction(
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
-		return result.Result{}, roachpb.NewTransactionStatusError("does not exist")
+		return result.Result{}, roachpb.NewTransactionNotFoundStatusError()
 	}
 	// We're using existingTxn on the reply, although it can be stale
 	// compared to the Transaction in the request (e.g. the Sequence,
@@ -289,8 +289,10 @@ func evalEndTransaction(
 			// Do not return TransactionAbortedError since the client anyway
 			// wanted to abort the transaction.
 			desc := cArgs.EvalCtx.Desc()
-			externalIntents := resolveLocalIntents(ctx, desc,
-				batch, ms, *args, reply.Txn, cArgs.EvalCtx.EvalKnobs())
+			externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, *args, reply.Txn, cArgs.EvalCtx)
+			if err != nil {
+				return result.Result{}, err
+			}
 			if err := updateTxnWithExternalIntents(
 				ctx, batch, ms, *args, reply.Txn, externalIntents,
 			); err != nil {
@@ -298,7 +300,7 @@ func evalEndTransaction(
 			}
 			// Use alwaysReturn==true because the transaction is definitely
 			// aborted, no matter what happens to this command.
-			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */), nil
+			return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison), nil
 		}
 		// If the transaction was previously aborted by a concurrent writer's
 		// push, any intents written are still open. It's only now that we know
@@ -309,7 +311,7 @@ func evalEndTransaction(
 		// to abort, but the transaction is definitely aborted and its intents
 		// can go.
 		reply.Txn.Intents = args.IntentSpans
-		return result.FromEndTxn(reply.Txn, true /* alwaysReturn */), roachpb.NewTransactionAbortedError()
+		return result.FromEndTxn(reply.Txn, true /* alwaysReturn */, args.Poison), roachpb.NewTransactionAbortedError()
 
 	case roachpb.PENDING:
 		if h.Txn.Epoch < reply.Txn.Epoch {
@@ -369,8 +371,10 @@ func evalEndTransaction(
 	}
 
 	desc := cArgs.EvalCtx.Desc()
-	externalIntents := resolveLocalIntents(ctx, desc,
-		batch, ms, *args, reply.Txn, cArgs.EvalCtx.EvalKnobs())
+	externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, *args, reply.Txn, cArgs.EvalCtx)
+	if err != nil {
+		return result.Result{}, err
+	}
 	if err := updateTxnWithExternalIntents(ctx, batch, ms, *args, reply.Txn, externalIntents); err != nil {
 		return result.Result{}, err
 	}
@@ -404,7 +408,7 @@ func evalEndTransaction(
 	// We specify alwaysReturn==false because if the commit fails below Raft, we
 	// don't want the intents to be up for resolution. That should happen only
 	// if the commit actually happens; otherwise, we risk losing writes.
-	intentsResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */)
+	intentsResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */, args.Poison)
 	intentsResult.Local.UpdatedTxns = &[]*roachpb.Transaction{reply.Txn}
 	if err := pd.MergeAndDestroy(intentsResult); err != nil {
 		return result.Result{}, err
@@ -479,8 +483,8 @@ func resolveLocalIntents(
 	ms *enginepb.MVCCStats,
 	args roachpb.EndTransactionRequest,
 	txn *roachpb.Transaction,
-	knobs batcheval.TestingKnobs,
-) []roachpb.Span {
+	evalCtx batcheval.EvalContext,
+) ([]roachpb.Span, error) {
 	var preMergeDesc *roachpb.RangeDescriptor
 	if mergeTrigger := args.InternalCommitTrigger.GetMergeTrigger(); mergeTrigger != nil {
 		// If this is a merge, then use the post-merge descriptor to determine
@@ -491,7 +495,7 @@ func resolveLocalIntents(
 	}
 
 	min, max := txn.InclusiveTimeBounds()
-	iter := batch.NewTimeBoundIterator(min, max)
+	iter := batch.NewTimeBoundIterator(min, max, false)
 	iterAndBuf := engine.GetBufUsingIter(iter)
 	defer iterAndBuf.Cleanup()
 
@@ -533,8 +537,8 @@ func resolveLocalIntents(
 				if err != nil {
 					return err
 				}
-				if knobs.NumKeysEvaluatedForRangeIntentResolution != nil {
-					atomic.AddInt64(knobs.NumKeysEvaluatedForRangeIntentResolution, num)
+				if evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution != nil {
+					atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, num)
 				}
 				resolveAllowance -= num
 				if resumeSpan != nil {
@@ -553,7 +557,14 @@ func resolveLocalIntents(
 			panic(fmt.Sprintf("error resolving intent at %s on end transaction [%s]: %s", span, txn.Status, err))
 		}
 	}
-	return externalIntents
+	// If the poison arg is set, make sure to set the abort span entry.
+	if args.Poison && txn.Status == roachpb.ABORTED {
+		if err := batcheval.SetAbortSpan(ctx, evalCtx, batch, ms, txn.TxnMeta, true /* poison */); err != nil {
+			return nil, err
+		}
+	}
+
+	return externalIntents, nil
 }
 
 // updateTxnWithExternalIntents persists the transaction record with
@@ -705,11 +716,12 @@ func runCommitTrigger(
 // AdminSplit divides the range into into two ranges using args.SplitKey.
 func (r *Replica) AdminSplit(
 	ctx context.Context, args roachpb.AdminSplitRequest,
-) (reply roachpb.AdminSplitResponse, pErr *roachpb.Error) {
+) (reply roachpb.AdminSplitResponse, _ *roachpb.Error) {
 	if len(args.SplitKey) == 0 {
 		return roachpb.AdminSplitResponse{}, roachpb.NewErrorf("cannot split range with no key provided")
 	}
 
+	var lastErr error
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.MaxRetries = 10
 	for retryable := retry.StartWithCtx(ctx, retryOpts); retryable.Next(); {
@@ -718,22 +730,22 @@ func (r *Replica) AdminSplit(
 		// Without the lease, a replica's local descriptor can be arbitrarily
 		// stale, which will result in a ConditionFailedError. To avoid this,
 		// we make sure that we still have the lease before each attempt.
-		if _, pErr = r.redirectOnOrAcquireLease(ctx); pErr != nil {
+		if _, pErr := r.redirectOnOrAcquireLease(ctx); pErr != nil {
 			return roachpb.AdminSplitResponse{}, pErr
 		}
 
-		reply, _, pErr = r.adminSplitWithDescriptor(ctx, args, r.Desc())
+		reply, lastErr = r.adminSplitWithDescriptor(ctx, args, r.Desc())
 		// On seeing a ConditionFailedError or an AmbiguousResultError, retry the
 		// command with the updated descriptor.
-		switch pErr.GetDetail().(type) {
+		switch errors.Cause(lastErr).(type) {
 		case *roachpb.ConditionFailedError:
 		case *roachpb.AmbiguousResultError:
 		default:
-			return reply, pErr
+			return reply, roachpb.NewError(lastErr)
 		}
 	}
 	// If we broke out of the loop after MaxRetries, return the last error.
-	return roachpb.AdminSplitResponse{}, pErr
+	return roachpb.AdminSplitResponse{}, roachpb.NewError(lastErr)
 }
 
 func maybeDescriptorChangedError(desc *roachpb.RangeDescriptor, err error) (string, bool) {
@@ -771,7 +783,7 @@ func maybeDescriptorChangedError(desc *roachpb.RangeDescriptor, err error) (stri
 // See the comment on splitTrigger for details on the complexities.
 func (r *Replica) adminSplitWithDescriptor(
 	ctx context.Context, args roachpb.AdminSplitRequest, desc *roachpb.RangeDescriptor,
-) (_ roachpb.AdminSplitResponse, validSplitKey bool, _ *roachpb.Error) {
+) (roachpb.AdminSplitResponse, error) {
 	var reply roachpb.AdminSplitResponse
 
 	// Determine split key if not provided with args. This scan is
@@ -794,54 +806,54 @@ func (r *Replica) adminSplitWithDescriptor(
 			foundSplitKey, err = engine.MVCCFindSplitKey(
 				ctx, r.store.engine, desc.StartKey, desc.EndKey, targetSize, allowMeta2Splits)
 			if err != nil {
-				return reply, false, roachpb.NewErrorf("unable to determine split key: %s", err)
+				return reply, errors.Errorf("unable to determine split key: %s", err)
 			}
 			if foundSplitKey == nil {
 				// No suitable split key could be found.
-				return reply, false, nil
+				return reply, unsplittableRangeError{}
 			}
 		} else {
 			// If the key that routed this request to this range is now out of this
 			// range's bounds, return an error for the client to try again on the
 			// correct range.
-			if !containsKey(*desc, args.Span.Key) {
-				return reply, false,
-					roachpb.NewError(roachpb.NewRangeKeyMismatchError(args.Span.Key, args.Span.Key, desc))
+			if !containsKey(*desc, args.Key) {
+				return reply, roachpb.NewRangeKeyMismatchError(args.Key, args.Key, desc)
 			}
 			foundSplitKey = args.SplitKey
 		}
 
 		if !containsKey(*desc, foundSplitKey) {
-			return reply, false,
-				roachpb.NewErrorf("requested split key %s out of bounds of %s", args.SplitKey, r)
+			return reply, errors.Errorf("requested split key %s out of bounds of %s", args.SplitKey, r)
 		}
 
 		var err error
 		splitKey, err = keys.Addr(foundSplitKey)
 		if err != nil {
-			return reply, false, roachpb.NewError(err)
+			return reply, err
 		}
 		if !splitKey.Equal(foundSplitKey) {
-			return reply, false, roachpb.NewErrorf("cannot split range at range-local key %s", splitKey)
+			return reply, errors.Errorf("cannot split range at range-local key %s", splitKey)
 		}
 		if !engine.IsValidSplitKey(foundSplitKey, allowMeta2Splits) {
-			return reply, false, roachpb.NewErrorf("cannot split range at key %s", splitKey)
+			return reply, errors.Errorf("cannot split range at key %s", splitKey)
 		}
 	}
 
 	// If the range starts at the splitKey, we treat the AdminSplit
 	// as a no-op and return success instead of throwing an error.
 	if desc.StartKey.Equal(splitKey) {
+		if len(args.SplitKey) == 0 {
+			log.Fatal(ctx, "MVCCFindSplitKey returned start key of range")
+		}
 		log.Event(ctx, "range already split")
-		return reply, false, nil
+		return reply, nil
 	}
 	log.Event(ctx, "found split key")
 
 	// Create right hand side range descriptor with the newly-allocated Range ID.
 	rightDesc, err := r.store.NewRangeDescriptor(ctx, splitKey, desc.EndKey, desc.Replicas)
 	if err != nil {
-		return reply, true,
-			roachpb.NewErrorf("unable to allocate right hand side range descriptor: %s", err)
+		return reply, errors.Errorf("unable to allocate right hand side range descriptor: %s", err)
 	}
 
 	// Init updated version of existing range descriptor.
@@ -926,15 +938,12 @@ func (r *Replica) adminSplitWithDescriptor(
 		// range descriptors are picked outside the transaction. Return
 		// ConditionFailedError in the error detail so that the command can be
 		// retried.
-		pErr := roachpb.NewError(err)
 		if msg, ok := maybeDescriptorChangedError(desc, err); ok {
-			pErr.Message = fmt.Sprintf("split at key %s failed: %s", splitKey, msg)
-		} else {
-			pErr.Message = fmt.Sprintf("split at key %s failed: %s", splitKey, err)
+			err = errors.Wrap(err, msg)
 		}
-		return reply, true, pErr
+		return reply, errors.Wrapf(err, "split at key %s failed", splitKey)
 	}
-	return reply, true, nil
+	return reply, nil
 }
 
 // splitTrigger is called on a successful commit of a transaction
@@ -1189,11 +1198,6 @@ func splitTrigger(
 	// both sides, we need to update it as well.
 	{
 		preRightMS := rightMS // for bothDeltaMS
-
-		// Account for MVCCStats' own contribution to the RHS range's statistics.
-		if err := engine.AccountForSelf(&rightMS, split.RightDesc.RangeID); err != nil {
-			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to account for enginepb.MVCCStats's own stats impact")
-		}
 
 		// Various pieces of code rely on a replica's lease never being unitialized,
 		// but it's more than that - it ensures that we properly initialize the
@@ -1492,7 +1496,7 @@ func mergeTrigger(
 	}
 
 	// Add in the stats for the RHS range's range keys.
-	iter := batch.NewIterator(false)
+	iter := batch.NewIterator(engine.IterOptions{})
 	defer iter.Close()
 	localRangeKeyStart := engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(merge.RightDesc.StartKey))
 	localRangeKeyEnd := engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(merge.RightDesc.EndKey))
@@ -1892,6 +1896,7 @@ func (r *Replica) sendSnapshot(
 		// Recipients can choose to decline preemptive snapshots.
 		CanDecline: snapType == snapTypePreemptive,
 		Priority:   priority,
+		Strategy:   SnapshotRequest_KV_BATCH,
 	}
 	sent := func() {
 		r.store.metrics.RangeSnapshotsGenerated.Inc(1)

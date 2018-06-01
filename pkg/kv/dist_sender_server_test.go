@@ -15,6 +15,7 @@
 package kv_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -1551,7 +1552,7 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 	)
 	for _, key := range []string{"c"} {
 		req := &roachpb.AdminSplitRequest{
-			Span: roachpb.Span{
+			RequestHeader: roachpb.RequestHeader{
 				Key: roachpb.Key(key),
 			},
 			SplitKey: roachpb.Key(key),
@@ -1631,48 +1632,6 @@ func TestBadRequest(t *testing.T) {
 
 	if err := db.DelRange(ctx, "", "z"); !testutils.IsError(err, "must be greater than LocalMax") {
 		t.Fatalf("unexpected error on deletion on [KeyMin, z): %v", err)
-	}
-}
-
-// TestNoSequenceCachePutOnRangeMismatchError verifies that the
-// sequence cache is not updated with RangeKeyMismatchError. This is a
-// higher-level version of TestSequenceCacheShouldCache.
-func TestNoSequenceCachePutOnRangeMismatchError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _ := startNoSplitServer(t)
-	ctx := context.TODO()
-	defer s.Stopper().Stop(ctx)
-	db := s.DB()
-	if err := setupMultipleRanges(ctx, db, "b", "c"); err != nil {
-		t.Fatal(err)
-	}
-
-	// The requests in the transaction below will be chunked and
-	// sent to replicas in the following way:
-	// 1) A batch request containing a BeginTransaction and a
-	//    put on "a" are sent to a replica owning range ["a","b").
-	// 2) A next batch request containing a put on "b" and a put
-	//    on "c" are sent to a replica owning range ["b","c").
-	//   (The range cache has a stale range descriptor.)
-	// 3) The put request on "c" causes a RangeKeyMismatchError.
-	// 4) The dist sender re-sends a request to the same replica.
-	//    This time the request contains only the put on "b" to the
-	//    same replica.
-	// 5) The command succeeds since the sequence cache has not yet been updated.
-	epoch := 0
-	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		epoch++
-		b := txn.NewBatch()
-		b.Put("a", "val")
-		b.Put("b", "val")
-		b.Put("c", "val")
-		return txn.CommitInBatch(ctx, b)
-	}); err != nil {
-		t.Errorf("unexpected error on transactional Puts: %s", err)
-	}
-
-	if epoch != 1 {
-		t.Errorf("unexpected epoch; the txn must not be retried, but got %d retries", epoch)
 	}
 }
 
@@ -1812,6 +1771,106 @@ func TestTxnStarvation(t *testing.T) {
 	}
 }
 
+// TestTxnCoordSenderHeartbeatFailurePostSplit verifies that on
+// heartbeat timeout, the transaction is aborted asynchronously,
+// leaving abort span entries which cause concurrent reads to fail
+// with txn aborted errors on both the range the transaction started
+// on and a separate range involved in the same transaction.
+//
+// Note that this is a post-split version of TestTxnCoordSenderGCTimeout.
+func TestTxnCoordSenderHeartbeatFailurePostSplit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Add a testing request filter which pauses a get request for the
+	// key until after the signal channel is closed.
+	var storeKnobs storage.StoreTestingKnobs
+	keyA := roachpb.Key("a")
+	keyB := roachpb.Key("b")
+	signal := make(chan struct{})
+	storeKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+		for _, req := range ba.Requests {
+			switch r := req.GetInner().(type) {
+			case *roachpb.GetRequest:
+				if r.Key.Equal(keyA) || r.Key.Equal(keyB) {
+					log.VEventf(context.TODO(), 1, "waiting on read of key %s", r.Key)
+					<-signal
+				}
+			case *roachpb.HeartbeatTxnRequest:
+				if bytes.Equal(ba.Txn.Key, keyA) {
+					log.VEventf(context.TODO(), 1, "failing heartbeat of txn %s", r.Key)
+					return roachpb.NewErrorf("induced heartbeat failure")
+				}
+			}
+		}
+		return nil
+	}
+	s, _, _ := serverutils.StartServer(t,
+		base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	// Setup two userspace ranges: /Min-b, b-/Max.
+	db := s.DB()
+	if err := setupMultipleRanges(ctx, db, "b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write values to keys "a" and "b", on separate ranges.
+	txn := client.NewTxn(db, 0 /* gatewayNodeID */, client.RootTxn)
+	b := txn.NewBatch()
+	b.Put(keyA, []byte("value"))
+	b.Put(keyB, []byte("value"))
+	if err := txn.Run(context.TODO(), b); err != nil {
+		t.Fatal(err)
+	}
+
+	startReader := func(key roachpb.Key) chan error {
+		errCh := make(chan error)
+		go func() {
+			if _, err := txn.Get(context.TODO(), key); err != nil {
+				log.Infof(context.TODO(), "read of key %s: %s", key, err)
+				errCh <- err
+			} else {
+				errCh <- errors.New("expected error")
+			}
+		}()
+		return errCh
+	}
+	errChA := startReader(keyA)
+	errChB := startReader(keyB)
+
+	stores := s.GetStores().(*storage.Stores)
+	store, err := stores.GetStore(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the transaction to fail the heartbeat and cleanup
+	// intents (and poison the abort span for the txn ID).
+	testutils.SucceedsSoon(t, func() error {
+		for _, key := range []roachpb.Key{keyA, keyB} {
+			meta := &enginepb.MVCCMetadata{}
+			ok, _, _, err := store.Engine().GetProto(engine.MakeMVCCMetadataKey(key), meta)
+			if err != nil {
+				return fmt.Errorf("error getting MVCC metadata: %s", err)
+			}
+			if ok && meta.Txn != nil {
+				return fmt.Errorf("found unexpected write intent: %s", meta)
+			}
+		}
+		return nil
+	})
+
+	// Now signal the inflight readers to continue; they should witness
+	// abort span entries.
+	close(signal)
+	if err := <-errChA; !testutils.IsError(err, "txn aborted") {
+		t.Errorf("expected transaction aborted error reading %s; got %s", keyA, err)
+	}
+	if err := <-errChB; !testutils.IsError(err, "txn aborted") {
+		t.Errorf("expected transaction aborted error reading %s; got %s", keyB, err)
+	}
+}
+
 // TestTxnCoordSenderRetries verifies that the txn coord sender
 // can automatically retry transactions in many different cases,
 // but still fail in others, depending on different conditions.
@@ -1836,7 +1895,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	newUncertaintyFilter := func(key roachpb.Key) func(storagebase.FilterArgs) *roachpb.Error {
 		var count int32
 		return func(fArgs storagebase.FilterArgs) *roachpb.Error {
-			if (fArgs.Req.Header().Key.Equal(key) || fArgs.Req.Header().ContainsKey(key)) && fArgs.Hdr.Txn != nil {
+			if (fArgs.Req.Header().Key.Equal(key) ||
+				fArgs.Req.Header().Span().ContainsKey(key)) && fArgs.Hdr.Txn != nil {
 				if atomic.AddInt32(&count, 1) > 1 {
 					return nil
 				}

@@ -15,6 +15,7 @@
 #include "db.h"
 #include <algorithm>
 #include <rocksdb/convenience.h>
+#include <rocksdb/perf_context.h>
 #include <rocksdb/sst_file_writer.h>
 #include <rocksdb/table.h>
 #include <stdarg.h>
@@ -24,7 +25,8 @@
 #include "defines.h"
 #include "encoding.h"
 #include "engine.h"
-#include "env_switching.h"
+#include "env_manager.h"
+#include "eventlistener.h"
 #include "fmt.h"
 #include "getter.h"
 #include "godefs.h"
@@ -39,7 +41,8 @@ using namespace cockroach;
 namespace cockroach {
 
 // DBOpenHook in OSS mode only verifies that no extra options are specified.
-__attribute__((weak)) rocksdb::Status DBOpenHook(const std::string& db_dir, const DBOptions opts) {
+__attribute__((weak)) rocksdb::Status DBOpenHook(const std::string& db_dir, const DBOptions opts,
+                                                 EnvManager* env_ctx) {
   if (opts.extra_options.len != 0) {
     return rocksdb::Status::InvalidArgument(
         "DBOptions has extra_options, but OSS code cannot handle them");
@@ -55,6 +58,23 @@ DBKey ToDBKey(const rocksdb::Slice& s) {
     key.key = ToDBSlice(tmp);
   }
   return key;
+}
+
+ScopedStats::ScopedStats(DBIterator* iter)
+    : iter_(iter),
+      internal_delete_skipped_count_base_(
+          rocksdb::get_perf_context()->internal_delete_skipped_count) {
+  if (iter_->stats != nullptr) {
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+  }
+}
+ScopedStats::~ScopedStats() {
+  if (iter_->stats != nullptr) {
+    iter_->stats->internal_delete_skipped_count +=
+        (rocksdb::get_perf_context()->internal_delete_skipped_count -
+         internal_delete_skipped_count_base_);
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
+  }
 }
 
 }  // namespace cockroach
@@ -74,6 +94,7 @@ DBIterState DBIterGetState(DBIterator* iter) {
       state.value = ToDBSlice(iter->rep->value());
     }
   }
+
   return state;
 }
 
@@ -99,30 +120,60 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
 
   const std::string db_dir = ToString(dir);
 
+  // Make the default options.env the default. It points to Env::Default which does not
+  // need to be deleted.
+  std::unique_ptr<cockroach::EnvManager> env_ctx(new cockroach::EnvManager(options.env));
+
+  if (dir.len == 0) {
+    // In-memory database: use a MemEnv as the base Env.
+    auto memenv = rocksdb::NewMemEnv(rocksdb::Env::Default());
+    // Register it for deletion.
+    env_ctx->TakeEnvOwnership(memenv);
+    // Make it the env that all other Envs must wrap.
+    env_ctx->base_env = memenv;
+    // Make it the env for rocksdb.
+    env_ctx->db_env = memenv;
+  }
+
+  // Create the file registry. It uses the base_env to access the registry file.
+  auto file_registry = std::unique_ptr<FileRegistry>(new FileRegistry(env_ctx->base_env, db_dir));
+
+  if (db_opts.use_file_registry) {
+    // We're using the file registry.
+    auto status = file_registry->Load();
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+
+    // EnvManager takes ownership of the file registry.
+    env_ctx->file_registry.swap(file_registry);
+  } else {
+    // File registry format not enabled: check whether we have a registry file (we shouldn't).
+    // The file_registry is not passed to anyone, it is deleted when it goes out of scope.
+    auto status = file_registry->CheckNoRegistryFile();
+    if (!status.ok()) {
+      return ToDBStatus(status);
+    }
+  }
+
   // Call hooks to handle db_opts.extra_options.
-  auto hook_status = DBOpenHook(db_dir, db_opts);
+  auto hook_status = DBOpenHook(db_dir, db_opts, env_ctx.get());
   if (!hook_status.ok()) {
     return ToDBStatus(hook_status);
   }
+
+  // TODO(mberhault):
+  // - check available ciphers somehow?
+  //   We may have a encrypted files in the registry file but running without encryption flags.
+  // - pass read-only flag though, we should not be modifying file/key registries (including key
+  //   rotation) in read-only mode.
 
   // Register listener for tracking RocksDB stats.
   std::shared_ptr<DBEventListener> event_listener(new DBEventListener);
   options.listeners.emplace_back(event_listener);
 
-  // TODO(mberhault): we shouldn't need two separate env objects,
-  // options.env should be sufficient with SwitchingEnv owning any
-  // underlying Env.
-  std::unique_ptr<rocksdb::Env> memenv;
-  if (dir.len == 0) {
-    memenv.reset(rocksdb::NewMemEnv(rocksdb::Env::Default()));
-    options.env = memenv.get();
-  }
-
-  std::unique_ptr<rocksdb::Env> switching_env;
-  if (db_opts.use_switching_env) {
-    switching_env.reset(NewSwitchingEnv(options.env, options.info_log));
-    options.env = switching_env.get();
-  }
+  // Point rocksdb to the env to use.
+  options.env = env_ctx->db_env;
 
   rocksdb::DB* db_ptr;
 
@@ -136,9 +187,8 @@ DBStatus DBOpen(DBEngine** db, DBSlice dir, DBOptions db_opts) {
   if (!status.ok()) {
     return ToDBStatus(status);
   }
-  *db =
-      new DBImpl(db_ptr, memenv.release(), db_opts.cache != nullptr ? db_opts.cache->rep : nullptr,
-                 event_listener, switching_env.release());
+  *db = new DBImpl(db_ptr, std::move(env_ctx),
+                   db_opts.cache != nullptr ? db_opts.cache->rep : nullptr, event_listener);
   return kSuccess;
 }
 
@@ -370,53 +420,118 @@ DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents) {
   return db->EnvWriteFile(path, contents);
 }
 
-DBIterator* DBNewIter(DBEngine* db, bool prefix) {
+DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path, DBWritableFile* file) {
+  return db->EnvOpenFile(path, (rocksdb::WritableFile**)file);
+}
+
+DBStatus DBEnvReadFile(DBEngine* db, DBSlice path, DBSlice* contents) {
+  return db->EnvReadFile(path, contents);
+}
+
+DBStatus DBEnvCloseFile(DBEngine* db, DBWritableFile file) {
+  return db->EnvCloseFile((rocksdb::WritableFile*)file);
+}
+
+DBStatus DBEnvSyncFile(DBEngine* db, DBWritableFile file) {
+  return db->EnvSyncFile((rocksdb::WritableFile*)file);
+}
+
+DBStatus DBEnvAppendFile(DBEngine* db, DBWritableFile file, DBSlice contents) {
+  return db->EnvAppendFile((rocksdb::WritableFile*)file, contents);
+}
+
+DBStatus DBEnvDeleteFile(DBEngine* db, DBSlice path) {
+  return db->EnvDeleteFile(path);
+}
+
+DBIterator* DBNewIter(DBEngine* db, bool prefix, bool stats) {
   rocksdb::ReadOptions opts;
   opts.prefix_same_as_start = prefix;
   opts.total_order_seek = !prefix;
-  return db->NewIter(&opts);
+  auto db_iter = db->NewIter(&opts);
+
+  if (stats) {
+    db_iter->stats.reset(new IteratorStats);
+    *db_iter->stats = {};
+  }
+
+  return db_iter;
 }
 
-DBIterator* DBNewTimeBoundIter(DBEngine* db, DBTimestamp min_ts, DBTimestamp max_ts) {
+DBIterator* DBNewTimeBoundIter(DBEngine* db, DBTimestamp min_ts, DBTimestamp max_ts,
+                               bool with_stats) {
+  IteratorStats* stats = nullptr;
+  if (with_stats) {
+    stats = new IteratorStats;
+    *stats = {};
+  }
+
   const std::string min = EncodeTimestamp(min_ts);
   const std::string max = EncodeTimestamp(max_ts);
   rocksdb::ReadOptions opts;
   opts.total_order_seek = true;
-  opts.table_filter = [min, max](const rocksdb::TableProperties& props) {
+  opts.table_filter = [min, max, stats](const rocksdb::TableProperties& props) {
     auto userprops = props.user_collected_properties;
     auto tbl_min = userprops.find("crdb.ts.min");
     if (tbl_min == userprops.end() || tbl_min->second.empty()) {
+      if (stats != nullptr) {
+        ++stats->timebound_num_ssts;
+      }
       return true;
     }
     auto tbl_max = userprops.find("crdb.ts.max");
     if (tbl_max == userprops.end() || tbl_max->second.empty()) {
+      if (stats != nullptr) {
+        ++stats->timebound_num_ssts;
+      }
       return true;
     }
     // If the timestamp range of the table overlaps with the timestamp range we
     // want to iterate, the table might contain timestamps we care about.
-    return max.compare(tbl_min->second) >= 0 && min.compare(tbl_max->second) <= 0;
+    bool used = max.compare(tbl_min->second) >= 0 && min.compare(tbl_max->second) <= 0;
+    if (used && stats != nullptr) {
+      ++stats->timebound_num_ssts;
+    }
+    return used;
   };
-  return db->NewIter(&opts);
+
+  auto db_iter = db->NewIter(&opts);
+  if (stats != nullptr) {
+    db_iter->stats.reset(stats);
+  }
+  return db_iter;
 }
 
 void DBIterDestroy(DBIterator* iter) { delete iter; }
 
+IteratorStats DBIterStats(DBIterator* iter) {
+  IteratorStats stats = {};
+  if (iter->stats != nullptr) {
+    stats = *iter->stats;
+  }
+  return stats;
+}
+
 DBIterState DBIterSeek(DBIterator* iter, DBKey key) {
+  ScopedStats stats(iter);
   iter->rep->Seek(EncodeKey(key));
   return DBIterGetState(iter);
 }
 
 DBIterState DBIterSeekToFirst(DBIterator* iter) {
+  ScopedStats stats(iter);
   iter->rep->SeekToFirst();
   return DBIterGetState(iter);
 }
 
 DBIterState DBIterSeekToLast(DBIterator* iter) {
+  ScopedStats stats(iter);
   iter->rep->SeekToLast();
   return DBIterGetState(iter);
 }
 
 DBIterState DBIterNext(DBIterator* iter, bool skip_current_key_versions) {
+  ScopedStats stats(iter);
   // If we're skipping the current key versions, remember the key the
   // iterator was pointing out.
   std::string old_key;
@@ -459,6 +574,7 @@ DBIterState DBIterNext(DBIterator* iter, bool skip_current_key_versions) {
 }
 
 DBIterState DBIterPrev(DBIterator* iter, bool skip_current_key_versions) {
+  ScopedStats stats(iter);
   // If we're skipping the current key versions, remember the key the
   // iterator was pointed out.
   std::string old_key;
@@ -520,17 +636,23 @@ DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) { return db->GetStats(st
 
 DBString DBGetCompactionStats(DBEngine* db) { return db->GetCompactionStats(); }
 
+DBStatus DBGetEnvStats(DBEngine* db, DBEnvStatsResult* stats) { return db->GetEnvStats(stats); }
+
 DBSSTable* DBGetSSTables(DBEngine* db, int* n) { return db->GetSSTables(n); }
 
 DBString DBGetUserProperties(DBEngine* db) { return db->GetUserProperties(); }
 
-DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file,
-                              bool allow_file_modification) {
-  const std::vector<std::string> paths = {ToString(path)};
+DBStatus DBIngestExternalFiles(DBEngine* db, char** paths, size_t len, bool move_files,
+                               bool allow_file_modifications) {
+  std::vector<std::string> paths_vec;
+  for (size_t i = 0; i < len; i++) {
+    paths_vec.push_back(paths[i]);
+  }
+
   rocksdb::IngestExternalFileOptions ingest_options;
   // If move_files is true and the env supports it, RocksDB will hard link.
   // Otherwise, it will copy.
-  ingest_options.move_files = move_file;
+  ingest_options.move_files = move_files;
   // If snapshot_consistency is true and there is an outstanding RocksDB
   // snapshot, a global sequence number is forced (see the allow_global_seqno
   // option).
@@ -540,12 +662,12 @@ DBStatus DBIngestExternalFile(DBEngine* db, DBSlice path, bool move_file,
   // ingest runs, then after moving/copying the file, RocksDB will edit it
   // (overwrite some of the bytes) to have a global sequence number. If this is
   // false, it will error in these cases instead.
-  ingest_options.allow_global_seqno = allow_file_modification;
+  ingest_options.allow_global_seqno = allow_file_modifications;
   // If there are mutations in the memtable for the keyrange covered by the file
   // being ingested, this option is checked. If true, the memtable is flushed
   // and the ingest run. If false, an error is returned.
   ingest_options.allow_blocking_flush = true;
-  rocksdb::Status status = db->rep->IngestExternalFile(paths, ingest_options);
+  rocksdb::Status status = db->rep->IngestExternalFile(paths_vec, ingest_options);
   if (!status.ok()) {
     return ToDBStatus(status);
   }
@@ -634,8 +756,8 @@ DBStatus DBSstFileWriterFinish(DBSstFileWriter* fw, DBString* data) {
     return ToDBStatus(status);
   }
   if (sst_contents.size() != file_size) {
-    return FmtStatus("expected to read %" PRIu64 " bytes but got %zu",
-      file_size, sst_contents.size());
+    return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
+                     sst_contents.size());
   }
 
   // The contract of the SequentialFile.Read call above is that it _might_ use

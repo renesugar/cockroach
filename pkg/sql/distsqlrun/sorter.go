@@ -19,7 +19,6 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -30,8 +29,6 @@ import (
 // sorter sorts the input rows according to the specified ordering.
 type sorterBase struct {
 	processorBase
-
-	evalCtx *tree.EvalContext
 
 	input    RowSource
 	ordering sqlbase.ColumnOrdering
@@ -45,9 +42,16 @@ type sorterBase struct {
 	tempStorage engine.Engine
 }
 
-func newSorterBase(
-	flowCtx *FlowCtx, spec *SorterSpec, input RowSource, post *PostProcessSpec, output RowReceiver,
-) (*sorterBase, error) {
+func (s *sorterBase) init(
+	flowCtx *FlowCtx,
+	processorID int32,
+	input RowSource,
+	post *PostProcessSpec,
+	output RowReceiver,
+	ordering sqlbase.ColumnOrdering,
+	matchLen uint32,
+	opts procStateOpts,
+) error {
 	count := int64(0)
 	if post.Limit != 0 {
 		// The sorter needs to produce Offset + Limit rows. The ProcOutputHelper
@@ -55,42 +59,44 @@ func newSorterBase(
 		count = int64(post.Limit) + int64(post.Offset)
 	}
 
-	s := &sorterBase{
-		input:       input,
-		ordering:    convertToColumnOrdering(spec.OutputOrdering),
-		matchLen:    spec.OrderingMatchLen,
-		count:       count,
-		tempStorage: flowCtx.TempStorage,
-		evalCtx:     flowCtx.NewEvalCtx(),
-	}
-	if err := s.init(post, input.OutputTypes(), flowCtx, s.evalCtx, output); err != nil {
-		return nil, err
-	}
-	return s, nil
+	s.input = input
+	s.ordering = ordering
+	s.matchLen = matchLen
+	s.count = count
+	s.tempStorage = flowCtx.TempStorage
+	return s.processorBase.init(post, input.OutputTypes(), flowCtx, processorID, output, opts)
 }
 
 func newSorter(
-	flowCtx *FlowCtx, spec *SorterSpec, input RowSource, post *PostProcessSpec, output RowReceiver,
+	ctx context.Context,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *SorterSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	output RowReceiver,
 ) (Processor, error) {
-	s, err := newSorterBase(flowCtx, spec, input, post, output)
-	if err != nil {
-		return nil, err
+	count := int64(0)
+	if post.Limit != 0 {
+		// The sorter needs to produce Offset + Limit rows. The ProcOutputHelper
+		// will discard the first Offset ones.
+		count = int64(post.Limit) + int64(post.Offset)
 	}
 
 	// Choose the optimal processor.
-	if s.matchLen == 0 {
-		if s.count == 0 {
+	if spec.OrderingMatchLen == 0 {
+		if count == 0 {
 			// No specified ordering match length and unspecified limit; no
 			// optimizations are possible so we simply load all rows into memory and
 			// sort all values in-place. It has a worst-case time complexity of
 			// O(n*log(n)) and a worst-case space complexity of O(n).
-			return newSortAllProcessor(s), nil
+			return newSortAllProcessor(ctx, flowCtx, processorID, spec, input, post, output)
 		}
 		// No specified ordering match length but specified limit; we can optimize
 		// our sort procedure by maintaining a max-heap populated with only the
 		// smallest k rows seen. It has a worst-case time complexity of
 		// O(n*log(k)) and a worst-case space complexity of O(k).
-		return newSortTopKProcessor(s, s.count), nil
+		return newSortTopKProcessor(flowCtx, processorID, spec, input, post, output, count)
 	}
 	// Ordering match length is specified. We will be able to use existing
 	// ordering in order to avoid loading all the rows into memory. If we're
@@ -99,8 +105,7 @@ func newSorter(
 	// chunk and then output.
 	// TODO(irfansharif): Add optimization for case where both ordering match
 	// length and limit is specified.
-	return newSortChunksProcessor(s), nil
-
+	return newSortChunksProcessor(flowCtx, processorID, spec, input, post, output)
 }
 
 // sortAllProcessor reads in all values into the wrapped rows and
@@ -109,155 +114,192 @@ func newSorter(
 //
 // This processor is intended to be used when all values need to be sorted.
 type sortAllProcessor struct {
-	*sorterBase
+	sorterBase
 
 	useTempStorage  bool
 	diskContainer   *diskRowContainer
-	rows            *memRowContainer
+	rows            memRowContainer
 	rowContainerMon *mon.BytesMonitor
 
 	// The following variables are used by the state machine, and are used by Next()
 	// to determine where to resume emitting rows.
-	i      rowIterator
-	closed bool
-
-	// sortAllProcessor first calls Next() on its input stream to completion before
-	// outputting a single row. Thus when it receives ProducerMetadata, it has to
-	// cache it and output the rows its received so far, before emitting that metadata.
-	meta []ProducerMetadata
+	i rowIterator
 }
 
 var _ Processor = &sortAllProcessor{}
 var _ RowSource = &sortAllProcessor{}
 
-func newSortAllProcessor(s *sorterBase) Processor {
-	useTempStorage := settingUseTempStorageSorts.Get(&s.flowCtx.Settings.SV) ||
-		s.flowCtx.testingKnobs.MemoryLimitBytes > 0
+const sortAllProcName = "sortAll"
 
-	return &sortAllProcessor{
-		sorterBase:     s,
-		rows:           &memRowContainer{},
-		useTempStorage: useTempStorage,
+func newSortAllProcessor(
+	ctx context.Context,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *SorterSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	out RowReceiver,
+) (Processor, error) {
+	ordering := convertToColumnOrdering(spec.OutputOrdering)
+	useTempStorage := settingUseTempStorageSorts.Get(&flowCtx.Settings.SV) ||
+		flowCtx.testingKnobs.MemoryLimitBytes > 0
+
+	rowContainerMon := flowCtx.EvalCtx.Mon
+	if useTempStorage {
+		// We will use the sortAllProcessor in this case and potentially fall
+		// back to disk.
+		// Limit the memory use by creating a child monitor with a hard limit.
+		// The processor will overflow to disk if this limit is not enough.
+		limit := flowCtx.testingKnobs.MemoryLimitBytes
+		if limit <= 0 {
+			limit = settingWorkMemBytes.Get(&flowCtx.Settings.SV)
+		}
+		limitedMon := mon.MakeMonitorInheritWithLimit(
+			"sortall-limited", limit, flowCtx.EvalCtx.Mon,
+		)
+		limitedMon.Start(ctx, rowContainerMon, mon.BoundAccount{})
+		rowContainerMon = &limitedMon
 	}
+
+	proc := &sortAllProcessor{
+		rowContainerMon: rowContainerMon,
+		useTempStorage:  useTempStorage,
+	}
+	if err := proc.sorterBase.init(
+		flowCtx, processorID, input, post, out,
+		convertToColumnOrdering(spec.OutputOrdering),
+		spec.OrderingMatchLen,
+		procStateOpts{
+			inputsToDrain: []RowSource{input},
+			trailingMetaCallback: func() []ProducerMetadata {
+				proc.close()
+				return nil
+			},
+		},
+	); err != nil {
+		return nil, err
+	}
+	proc.rows.initWithMon(ordering, input.OutputTypes(), proc.evalCtx, rowContainerMon)
+	return proc, nil
 }
 
+// Start is part of the RowSource interface.
+func (s *sortAllProcessor) Start(ctx context.Context) context.Context {
+	s.input.Start(ctx)
+	ctx = s.startInternal(ctx, sortAllProcName)
+
+	valid, err := s.fill()
+	if !valid || err != nil {
+		s.moveToDraining(err)
+	}
+	return ctx
+}
+
+// Next is part of the RowSource interface.
 func (s *sortAllProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if s.maybeStart("sortAllProcessor", "sortAllProcessor") {
-		s.rowContainerMon = s.flowCtx.EvalCtx.Mon
-		if s.useTempStorage {
-			// We will use the sortAllProcessor in this case and potentially fall
-			// back to disk.
-			// Limit the memory use by creating a child monitor with a hard limit.
-			// The processor will overflow to disk if this limit is not enough.
-			limit := s.flowCtx.testingKnobs.MemoryLimitBytes
-			if limit <= 0 {
-				limit = settingWorkMemBytes.Get(&s.flowCtx.Settings.SV)
-			}
-			limitedMon := mon.MakeMonitorInheritWithLimit(
-				"sortall-limited", limit, s.flowCtx.EvalCtx.Mon,
-			)
-			limitedMon.Start(s.flowCtx.Ctx, s.flowCtx.EvalCtx.Mon, mon.BoundAccount{})
-
-			s.rowContainerMon = &limitedMon
-		}
-		s.rows.initWithMon(s.ordering, s.input.OutputTypes(), s.flowCtx.NewEvalCtx(), s.rowContainerMon)
-
-		if err := s.fill(); err != nil {
-			return nil, s.producerMeta(err)
-		}
-	}
-	if s.closed {
-		return nil, s.producerMeta(nil /* err */)
-	}
-
-	for {
+	for s.state == stateRunning {
 		if ok, err := s.i.Valid(); err != nil || !ok {
-			return nil, s.producerMeta(err)
+			s.moveToDraining(err)
+			break
 		}
 
 		row, err := s.i.Row()
 		if err != nil {
-			return nil, s.producerMeta(err)
+			s.moveToDraining(err)
+			break
 		}
 		s.i.Next()
 
-		outRow, status, err := s.out.ProcessRow(s.evalCtx.Ctx(), row)
-		if outRow != nil {
+		if outRow := s.processRowHelper(row); outRow != nil {
 			return outRow, nil
 		}
-		if outRow == nil && err == nil && status == NeedMoreRows {
-			continue
-		}
-		return nil, s.producerMeta(err)
 	}
+	return nil, s.drainHelper()
 }
 
-func (s *sortAllProcessor) fill() error {
+// fill fills the container with the input's rows.
+//
+// It returns true if the container is valid, false otherwise. If false is
+// returned, the caller is expected to drain.
+// It is possible for ok to be false even if no error is returned - in case an
+// error metadata was received.
+func (s *sortAllProcessor) fill() (ok bool, _ error) {
 	ctx := s.evalCtx.Ctx()
 	// Attempt an in memory implementation of a sort. If this run fails with a
 	// memory error, fall back to use disk.
-	row, err := s.fillWithContainer(ctx, s.rows)
-	if err != nil {
-		// TODO(asubiotto): A memory error could also be returned if a limit other
-		// than the COCKROACH_WORK_MEM was reached. We should distinguish between
-		// these cases and log the event to facilitate debugging of queries that
-		// may be slow for this reason.
-		// We return the memory error if the row is nil because this case implies
-		// that we received the memory error from a code path that was not adding
-		// a row (e.g. from an upstream processor).
-		if pgErr, ok := pgerror.GetPGCause(err); !(ok && pgErr.Code == pgerror.CodeOutOfMemoryError) || row == nil {
-			return err
-		}
-		if !s.useTempStorage {
-			return errors.Wrap(err, "external storage for large queries disabled")
-		}
-		log.VEventf(ctx, 2, "falling back to disk")
-		diskContainer := makeDiskRowContainer(
-			ctx, s.flowCtx.diskMonitor, s.rows.types, s.rows.ordering, s.tempStorage,
-		)
-		s.diskContainer = &diskContainer
+	valid, row, err := s.fillWithContainer(ctx, &s.rows)
+	if err == nil {
+		return valid, nil
+	}
+	// TODO(asubiotto): A memory error could also be returned if a limit other
+	// than the COCKROACH_WORK_MEM was reached. We should distinguish between
+	// these cases and log the event to facilitate debugging of queries that
+	// may be slow for this reason.
+	// We return the memory error if the row is nil because this case implies
+	// that we received the memory error from a code path that was not adding
+	// a row (e.g. from an upstream processor).
+	if pgErr, ok := pgerror.GetPGCause(err); !(ok && pgErr.Code == pgerror.CodeOutOfMemoryError) || row == nil {
+		return false, err
+	}
+	if !s.useTempStorage {
+		return false, errors.Wrap(err, "external storage for large queries disabled")
+	}
+	log.VEventf(ctx, 2, "falling back to disk")
+	diskContainer := makeDiskRowContainer(
+		ctx, s.flowCtx.diskMonitor, s.rows.types, s.rows.ordering, s.tempStorage,
+	)
+	s.diskContainer = &diskContainer
 
-		// Transfer the rows from memory to disk. This frees up the memory taken up by s.rows.
-		i := s.rows.NewIterator(ctx)
-		for i.Rewind(); ; i.Next() {
-			if ok, err := i.Valid(); err != nil {
-				return err
-			} else if !ok {
-				break
-			}
-			memRow, err := i.Row()
-			if err != nil {
-				return err
-			}
-			if err := s.diskContainer.AddRow(ctx, memRow); err != nil {
-				return err
-			}
+	// Transfer the rows from memory to disk. This frees up the memory taken up by s.rows.
+	i := s.rows.NewIterator(ctx)
+	for i.Rewind(); ; i.Next() {
+		if ok, err := i.Valid(); err != nil {
+			return false, err
+		} else if !ok {
+			break
 		}
-		s.i = nil
-
-		// Add the row that caused the memory container to run out of memory.
-		if err := s.diskContainer.AddRow(ctx, row); err != nil {
-			return err
+		memRow, err := i.Row()
+		if err != nil {
+			return false, err
 		}
-
-		// Continue and fill the rest of the rows from the input.
-		if _, err := s.fillWithContainer(ctx, s.diskContainer); err != nil {
-			return err
+		if err := s.diskContainer.AddRow(ctx, memRow); err != nil {
+			return false, err
 		}
 	}
-	return nil
+	s.i = nil
+
+	// Add the row that caused the memory container to run out of memory.
+	if err := s.diskContainer.AddRow(ctx, row); err != nil {
+		return false, err
+	}
+
+	// Continue and fill the rest of the rows from the input.
+	valid, _ /* row */, err = s.fillWithContainer(ctx, s.diskContainer)
+	return valid, err
 }
 
-// fill the rows from the input into the given container. If an error occurs,
-// or the input sends metadata while adding a row to the given container, the
-// row is returned in order to not lose it.
+// fill the rows from the input into the given container.
+//
+// Metadata is buffered in s.trailingMeta.
+//
+// If an error occurs, while adding a row to the given container, the row is
+// returned together with the error in order to not lose it.
+//
+// The ok retval is true if the container is valid, false otherwise (if an
+// error occurred or if the input returned an error metadata record). The caller
+// is expected to inspect the error (if any) and drain if it's not recoverable.
+// It is possible for ok to be false even if no error is returned - in case an
+// error metadata was received.
 func (s *sortAllProcessor) fillWithContainer(
 	ctx context.Context, r sortableRowContainer,
-) (sqlbase.EncDatumRow, error) {
+) (ok bool, _ sqlbase.EncDatumRow, _ error) {
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			s.meta = append(s.meta, *meta)
+			s.trailingMeta = append(s.trailingMeta, *meta)
+			if meta.Err != nil {
+				return false, nil, nil
+			}
 			continue
 		}
 		if row == nil {
@@ -265,7 +307,7 @@ func (s *sortAllProcessor) fillWithContainer(
 		}
 
 		if err := r.AddRow(ctx, row); err != nil {
-			return row, err
+			return false, row, err
 		}
 	}
 	r.Sort(ctx)
@@ -273,14 +315,15 @@ func (s *sortAllProcessor) fillWithContainer(
 	s.i = r.NewIterator(ctx)
 	s.i.Rewind()
 
-	return nil, nil
+	return true, nil, nil
 }
 
-func (s *sortAllProcessor) Run(wg *sync.WaitGroup) {
+func (s *sortAllProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if s.out.output == nil {
 		panic("sorter output not initialized for emitting rows")
 	}
-	Run(s.flowCtx.Ctx, s, s.out.output)
+	ctx = s.Start(ctx)
+	Run(ctx, s, s.out.output)
 	if wg != nil {
 		wg.Done()
 	}
@@ -289,7 +332,7 @@ func (s *sortAllProcessor) Run(wg *sync.WaitGroup) {
 func (s *sortAllProcessor) close() {
 	// We are done sorting rows, close the iterators we have open. The row
 	// containers require a context, so must be called before internalClose().
-	if !s.closed {
+	if s.internalClose() {
 		if s.i != nil {
 			s.i.Close()
 		}
@@ -299,10 +342,6 @@ func (s *sortAllProcessor) close() {
 		}
 		s.rows.Close(ctx)
 		s.rowContainerMon.Stop(ctx)
-	}
-	if s.internalClose() {
-		s.input.ConsumerClosed()
-		s.closed = true
 	}
 }
 
@@ -315,33 +354,6 @@ func (s *sortAllProcessor) ConsumerDone() {
 func (s *sortAllProcessor) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	s.close()
-}
-
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (s *sortAllProcessor) producerMeta(err error) *ProducerMetadata {
-	if !s.closed {
-		var meta *ProducerMetadata
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-			// We need to close as soon as we send error metadata as we're done
-			// sending rows. The consumer is allowed to not call ConsumerDone().
-		} else if trace := getTraceData(s.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		s.close()
-		if meta != nil {
-			return meta
-		}
-	}
-	if len(s.meta) > 0 {
-		meta := &s.meta[0]
-		s.meta = s.meta[1:]
-		return meta
-	}
-	return nil
 }
 
 // sortTopKProcessor creates a max-heap in its wrapped rows and keeps
@@ -366,91 +378,115 @@ func (s *sortAllProcessor) producerMeta(err error) *ProducerMetadata {
 type sortTopKProcessor struct {
 	sorterBase
 
-	rows            *memRowContainer
+	rows            memRowContainer
 	rowContainerMon *mon.BytesMonitor
 	k               int64
-
-	meta []ProducerMetadata
 }
 
 var _ Processor = &sortTopKProcessor{}
 var _ RowSource = &sortTopKProcessor{}
 
-func newSortTopKProcessor(s *sorterBase, k int64) Processor {
-	var rows memRowContainer
-	rowContainerMon := s.flowCtx.EvalCtx.Mon
-	rows.initWithMon(s.ordering, s.input.OutputTypes(), s.flowCtx.NewEvalCtx(), rowContainerMon)
-	return &sortTopKProcessor{
-		sorterBase:      *s,
-		rows:            &rows,
+const sortTopKProcName = "sortTopK"
+
+func newSortTopKProcessor(
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *SorterSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	out RowReceiver,
+	k int64,
+) (Processor, error) {
+	rowContainerMon := flowCtx.EvalCtx.Mon
+	ordering := convertToColumnOrdering(spec.OutputOrdering)
+	proc := &sortTopKProcessor{
 		rowContainerMon: rowContainerMon,
 		k:               k,
 	}
+	if err := proc.sorterBase.init(
+		flowCtx, processorID, input, post, out,
+		ordering, spec.OrderingMatchLen,
+		procStateOpts{
+			inputsToDrain: []RowSource{input},
+			trailingMetaCallback: func() []ProducerMetadata {
+				proc.close()
+				return nil
+			},
+		},
+	); err != nil {
+		return nil, err
+	}
+	proc.rows.initWithMon(ordering, input.OutputTypes(), proc.evalCtx, rowContainerMon)
+	return proc, nil
 }
 
-func (s *sortTopKProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if s.maybeStart("sortTopK", "SortTopK") {
-		// The execution loop for the SortTopK processor is similar to that of the
-		// SortAll processor; the difference is that we push rows into a max-heap
-		// of size at most K, and only sort those.
-		ctx := s.evalCtx.Ctx()
+// Start is part of the RowSource interface.
+func (s *sortTopKProcessor) Start(ctx context.Context) context.Context {
+	s.input.Start(ctx)
+	ctx = s.startInternal(ctx, sortTopKProcName)
 
-		heapCreated := false
-		for {
-			row, meta := s.input.Next()
-			if meta != nil {
-				s.meta = append(s.meta, *meta)
-				continue
-			}
-			if row == nil {
+	// The execution loop for the SortTopK processor is similar to that of the
+	// SortAll processor; the difference is that we push rows into a max-heap
+	// of size at most K, and only sort those.
+	heapCreated := false
+	for {
+		row, meta := s.input.Next()
+		if meta != nil {
+			s.trailingMeta = append(s.trailingMeta, *meta)
+			continue
+		}
+		if row == nil {
+			break
+		}
+
+		if int64(s.rows.Len()) < s.k {
+			// Accumulate up to k values.
+			if err := s.rows.AddRow(ctx, row); err != nil {
+				s.moveToDraining(err)
 				break
 			}
-
-			if int64(s.rows.Len()) < s.k {
-				// Accumulate up to k values.
-				if err := s.rows.AddRow(ctx, row); err != nil {
-					return nil, s.producerMeta(err)
-				}
-			} else {
-				if !heapCreated {
-					// Arrange the k values into a max-heap.
-					s.rows.InitMaxHeap()
-					heapCreated = true
-				}
-				// Replace the max value if the new row is smaller, maintaining the
-				// max-heap.
-				if err := s.rows.MaybeReplaceMax(ctx, row); err != nil {
-					return nil, s.producerMeta(err)
-				}
+		} else {
+			if !heapCreated {
+				// Arrange the k values into a max-heap.
+				s.rows.InitMaxHeap()
+				heapCreated = true
+			}
+			// Replace the max value if the new row is smaller, maintaining the
+			// max-heap.
+			if err := s.rows.MaybeReplaceMax(ctx, row); err != nil {
+				s.moveToDraining(err)
+				break
 			}
 		}
-		s.rows.Sort(ctx)
 	}
+	s.rows.Sort(ctx)
+	return ctx
+}
 
-	if s.closed || s.rows.Len() == 0 {
-		return nil, s.producerMeta(nil /* err */)
-	}
+// Next is part of the RowSource interface.
+func (s *sortTopKProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+	for s.state == stateRunning {
+		if s.rows.Len() == 0 {
+			s.moveToDraining(nil /* err */)
+			break
+		}
 
-	for {
 		row := s.rows.EncRow(0)
 		s.rows.PopFirst()
 
-		outRow, status, err := s.out.ProcessRow(s.evalCtx.Ctx(), row)
-		if outRow != nil {
+		if outRow := s.processRowHelper(row); outRow != nil {
 			return outRow, nil
 		}
-		if outRow == nil && err == nil && status == NeedMoreRows {
-			continue
-		}
-		return nil, s.producerMeta(err)
 	}
+	return nil, s.drainHelper()
 }
 
-func (s *sortTopKProcessor) Run(wg *sync.WaitGroup) {
+func (s *sortTopKProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if s.out.output == nil {
 		panic("sorter output not initialized for emitting rows")
 	}
-	Run(s.flowCtx.Ctx, s, s.out.output)
+	ctx = s.Start(ctx)
+	Run(ctx, s, s.out.output)
 	if wg != nil {
 		wg.Done()
 	}
@@ -475,39 +511,12 @@ func (s *sortTopKProcessor) ConsumerClosed() {
 	s.close()
 }
 
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (s *sortTopKProcessor) producerMeta(err error) *ProducerMetadata {
-	if !s.closed {
-		var meta *ProducerMetadata
-		if err != nil {
-			// We need to close as soon as we send error metadata as we're done
-			// sending rows. The consumer is allowed to not call ConsumerDone().
-			meta = &ProducerMetadata{Err: err}
-		} else if trace := getTraceData(s.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		s.close()
-		if meta != nil {
-			return meta
-		}
-	}
-	if len(s.meta) > 0 {
-		meta := &s.meta[0]
-		s.meta = s.meta[1:]
-		return meta
-	}
-	return nil
-}
-
 // If we're scanning an index with a prefix matching an ordering prefix, we only accumulate values
 // for equal fields in this prefix, sort the accumulated chunk and then output.
 type sortChunksProcessor struct {
 	sorterBase
 
-	rows            *memRowContainer
+	rows            memRowContainer
 	rowContainerMon *mon.BytesMonitor
 	alloc           sqlbase.DatumAlloc
 
@@ -515,22 +524,41 @@ type sortChunksProcessor struct {
 	// encounters a row that is greater. It stores that greater row in nextChunkRow
 	prefix       sqlbase.EncDatumRow
 	nextChunkRow sqlbase.EncDatumRow
-	meta         []ProducerMetadata
 }
 
 var _ Processor = &sortChunksProcessor{}
 var _ RowSource = &sortChunksProcessor{}
 
-func newSortChunksProcessor(s *sorterBase) Processor {
-	var rows memRowContainer
-	rowContainerMon := s.flowCtx.EvalCtx.Mon
-	rows.initWithMon(s.ordering, s.input.OutputTypes(), s.flowCtx.NewEvalCtx(), rowContainerMon)
+const sortChunksProcName = "sortChunks"
 
-	return &sortChunksProcessor{
-		sorterBase:      *s,
-		rows:            &rows,
+func newSortChunksProcessor(
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *SorterSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	out RowReceiver,
+) (Processor, error) {
+	rowContainerMon := flowCtx.EvalCtx.Mon
+	ordering := convertToColumnOrdering(spec.OutputOrdering)
+
+	proc := &sortChunksProcessor{
 		rowContainerMon: rowContainerMon,
 	}
+	if err := proc.sorterBase.init(
+		flowCtx, processorID, input, post, out, ordering, spec.OrderingMatchLen,
+		procStateOpts{
+			inputsToDrain: []RowSource{input},
+			trailingMetaCallback: func() []ProducerMetadata {
+				proc.close()
+				return nil
+			},
+		},
+	); err != nil {
+		return nil, err
+	}
+	proc.rows.initWithMon(ordering, input.OutputTypes(), proc.evalCtx, rowContainerMon)
+	return proc, nil
 }
 
 // chunkCompleted is a helper function that determines if the given row shares the same
@@ -547,7 +575,12 @@ func (s *sortChunksProcessor) chunkCompleted() (bool, error) {
 }
 
 // fill one chunk of rows from the input and sort them.
-func (s *sortChunksProcessor) fill() error {
+//
+// Metadata is buffered in s.trailingMeta. Returns true if a valid chunk of rows
+// has been read and sorted, false otherwise (if the input had no more rows or
+// if a metadata record was encountered). The caller is expected to drain when
+// this returns false.
+func (s *sortChunksProcessor) fill() (bool, error) {
 	ctx := s.evalCtx.Ctx()
 
 	var meta *ProducerMetadata
@@ -555,10 +588,13 @@ func (s *sortChunksProcessor) fill() error {
 	for s.nextChunkRow == nil {
 		s.nextChunkRow, meta = s.input.Next()
 		if meta != nil {
-			s.meta = append(s.meta, *meta)
+			s.trailingMeta = append(s.trailingMeta, *meta)
+			if meta.Err != nil {
+				return false, nil
+			}
 			continue
 		} else if s.nextChunkRow == nil {
-			return nil
+			return false, nil
 		}
 		break
 	}
@@ -566,7 +602,7 @@ func (s *sortChunksProcessor) fill() error {
 
 	// Add the chunk
 	if err := s.rows.AddRow(ctx, s.nextChunkRow); err != nil {
-		return err
+		return false, err
 	}
 
 	defer s.rows.Sort(ctx)
@@ -577,7 +613,7 @@ func (s *sortChunksProcessor) fill() error {
 		s.nextChunkRow, meta = s.input.Next()
 
 		if meta != nil {
-			s.meta = append(s.meta, *meta)
+			s.trailingMeta = append(s.trailingMeta, *meta)
 			continue
 		}
 		if s.nextChunkRow == nil {
@@ -587,33 +623,36 @@ func (s *sortChunksProcessor) fill() error {
 		chunkCompleted, err := s.chunkCompleted()
 
 		if err != nil {
-			return err
+			return false, err
 		}
 		if chunkCompleted {
 			break
 		}
 
 		if err := s.rows.AddRow(ctx, s.nextChunkRow); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
-func (s *sortChunksProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	s.maybeStart("sortChunks", "SortChunks")
-	if s.closed {
-		return nil, s.producerMeta(nil /* err */)
-	}
+// Start is part of the RowSource interface.
+func (s *sortChunksProcessor) Start(ctx context.Context) context.Context {
+	s.input.Start(ctx)
+	return s.startInternal(ctx, sortChunksProcName)
+}
 
-	for {
+// Next is part of the RowSource interface.
+func (s *sortChunksProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+	for s.state == stateRunning {
 		// If we don't have an active chunk, clear and refill it.
 		if s.rows.Len() == 0 {
 			s.rows.Clear(s.rows.evalCtx.Ctx())
-			// If that errored or didn't result in an active chunk, we are done.
-			if err := s.fill(); err != nil || s.rows.Len() == 0 {
-				return nil, s.producerMeta(err)
+			valid, err := s.fill()
+			if !valid || err != nil {
+				s.moveToDraining(err)
+				break
 			}
 		}
 
@@ -621,22 +660,19 @@ func (s *sortChunksProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		row := s.rows.EncRow(0)
 		s.rows.PopFirst()
 
-		outRow, status, err := s.out.ProcessRow(s.evalCtx.Ctx(), row)
-		if outRow != nil {
+		if outRow := s.processRowHelper(row); outRow != nil {
 			return outRow, nil
 		}
-		if outRow == nil && err == nil && status == NeedMoreRows {
-			continue
-		}
-		return nil, s.producerMeta(err)
 	}
+	return nil, s.drainHelper()
 }
 
-func (s *sortChunksProcessor) Run(wg *sync.WaitGroup) {
+func (s *sortChunksProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if s.out.output == nil {
 		panic("sorter output not initialized for emitting rows")
 	}
-	Run(s.flowCtx.Ctx, s, s.out.output)
+	ctx = s.Start(ctx)
+	Run(ctx, s, s.out.output)
 	if wg != nil {
 		wg.Done()
 	}
@@ -652,38 +688,11 @@ func (s *sortChunksProcessor) close() {
 
 // ConsumerDone is part of the RowSource interface.
 func (s *sortChunksProcessor) ConsumerDone() {
-	s.input.ConsumerDone()
+	s.moveToDraining(nil /* err */)
 }
 
 // ConsumerClosed is part of the RowSource interface.
 func (s *sortChunksProcessor) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
 	s.close()
-}
-
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (s *sortChunksProcessor) producerMeta(err error) *ProducerMetadata {
-	if !s.closed {
-		var meta *ProducerMetadata
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-			// We need to close as soon as we send error metadata as we're done
-			// sending rows. The consumer is allowed to not call ConsumerDone().
-		} else if trace := getTraceData(s.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		s.close()
-		if meta != nil {
-			return meta
-		}
-	}
-	if len(s.meta) > 0 {
-		meta := &s.meta[0]
-		s.meta = s.meta[1:]
-		return meta
-	}
-	return nil
 }

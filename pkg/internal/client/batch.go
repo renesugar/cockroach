@@ -20,7 +20,6 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 const (
@@ -272,10 +271,13 @@ func (b *Batch) fillResults(ctx context.Context) {
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
 				result.ResumeSpan = *reply.Header().ResumeSpan
-				if reply.Header().ResumeReason == roachpb.RESUME_UNKNOWN {
-					log.Fatalf(ctx, "reply has ResumeSpan but no ResumeReason: %s", result)
-				}
 				result.ResumeReason = reply.Header().ResumeReason
+				// The ResumeReason might be missing when talking to a 1.1 node; assume
+				// it's the key limit (which was the only reason why 1.1 would return a
+				// resume span). This can be removed in 2.1.
+				if result.ResumeReason == roachpb.RESUME_UNKNOWN {
+					result.ResumeReason = roachpb.RESUME_KEY_LIMIT
+				}
 			}
 			// Fill up the RangeInfos, in case we got any.
 			if result.Err == nil && reply != nil {
@@ -582,7 +584,7 @@ func (b *Batch) adminMerge(key interface{}) {
 		return
 	}
 	req := &roachpb.AdminMergeRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
 	}
@@ -604,7 +606,7 @@ func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
 		return
 	}
 	req := &roachpb.AdminSplitRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: spanKey,
 		},
 	}
@@ -622,7 +624,7 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 		return
 	}
 	req := &roachpb.AdminTransferLeaseRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
 		Target: target,
@@ -642,7 +644,7 @@ func (b *Batch) adminChangeReplicas(
 		return
 	}
 	req := &roachpb.AdminChangeReplicasRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: k,
 		},
 		ChangeType: changeType,
@@ -666,9 +668,9 @@ func (b *Batch) writeBatch(s, e interface{}, data []byte) {
 	}
 	span := roachpb.Span{Key: begin, EndKey: end}
 	req := &roachpb.WriteBatchRequest{
-		Span:     span,
-		DataSpan: span,
-		Data:     data,
+		RequestHeader: roachpb.RequestHeaderFromSpan(span),
+		DataSpan:      span,
+		Data:          data,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
@@ -686,9 +688,11 @@ func (b *Batch) addSSTable(s, e interface{}, data []byte) {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
-	span := roachpb.Span{Key: begin, EndKey: end}
 	req := &roachpb.AddSSTableRequest{
-		Span: span,
+		RequestHeader: roachpb.RequestHeader{
+			Key:    begin,
+			EndKey: end,
+		},
 		Data: data,
 	}
 	b.appendReqs(req)

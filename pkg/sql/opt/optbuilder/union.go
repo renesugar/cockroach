@@ -15,7 +15,11 @@
 package optbuilder
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
@@ -25,17 +29,18 @@ import (
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
-func (b *Builder) buildUnion(
-	clause *tree.UnionClause, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
-	left, leftScope := b.buildSelect(clause.Left, inScope)
-	right, rightScope := b.buildSelect(clause.Right, inScope)
+func (b *Builder) buildUnion(clause *tree.UnionClause, inScope *scope) (outScope *scope) {
+	leftScope := b.buildSelect(clause.Left, inScope)
+	rightScope := b.buildSelect(clause.Right, inScope)
 	outScope = leftScope
 
 	// Check that the number of columns matches.
 	if len(leftScope.cols) != len(rightScope.cols) {
-		panic(errorf("each %v query must have the same number of columns: %d vs %d",
-			clause.Type, len(leftScope.cols), len(rightScope.cols)))
+		panic(builderError{pgerror.NewErrorf(
+			pgerror.CodeSyntaxError,
+			"each %v query must have the same number of columns: %d vs %d",
+			clause.Type, len(leftScope.cols), len(rightScope.cols),
+		)})
 	}
 
 	// newColsNeeded indicates whether or not we need to synthesize output
@@ -56,7 +61,7 @@ func (b *Builder) buildUnion(
 	if newColsNeeded {
 		// Create a new scope to hold the new synthesized columns.
 		outScope = leftScope.push()
-		outScope.cols = make([]columnProps, 0, len(leftScope.cols))
+		outScope.cols = make([]scopeColumn, 0, len(leftScope.cols))
 	}
 
 	// Build map from left columns to right columns.
@@ -67,10 +72,12 @@ func (b *Builder) buildUnion(
 		// but Postgres is more lenient:
 		// http://www.postgresql.org/docs/9.5/static/typeconv-union-case.html.
 		if !(l.typ.Equivalent(r.typ) || l.typ == types.Unknown || r.typ == types.Unknown) {
-			panic(errorf("%v types %s and %s cannot be matched", clause.Type, l.typ, r.typ))
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+				"%v types %s and %s cannot be matched", clause.Type, l.typ, r.typ)})
 		}
 		if l.hidden != r.hidden {
-			panic(errorf("%v types cannot be matched", clause.Type))
+			// This should never happen.
+			panic(fmt.Errorf("%v types cannot be matched", clause.Type))
 		}
 
 		if newColsNeeded {
@@ -81,7 +88,7 @@ func (b *Builder) buildUnion(
 				typ = r.typ
 			}
 
-			b.synthesizeColumn(outScope, string(l.name), typ, nil)
+			b.synthesizeColumn(outScope, string(l.name), typ, nil, 0 /* group */)
 		}
 	}
 
@@ -95,28 +102,28 @@ func (b *Builder) buildUnion(
 	} else {
 		newCols = leftCols
 	}
-	setOpColMap := opt.SetOpColMap{Left: leftCols, Right: rightCols, Out: newCols}
-	private := b.factory.InternPrivate(&setOpColMap)
+	setOpColMap := memo.SetOpColMap{Left: leftCols, Right: rightCols, Out: newCols}
+	private := b.factory.InternSetOpColMap(&setOpColMap)
 
 	if clause.All {
 		switch clause.Type {
 		case tree.UnionOp:
-			out = b.factory.ConstructUnionAll(left, right, private)
+			outScope.group = b.factory.ConstructUnionAll(leftScope.group, rightScope.group, private)
 		case tree.IntersectOp:
-			out = b.factory.ConstructIntersectAll(left, right, private)
+			outScope.group = b.factory.ConstructIntersectAll(leftScope.group, rightScope.group, private)
 		case tree.ExceptOp:
-			out = b.factory.ConstructExceptAll(left, right, private)
+			outScope.group = b.factory.ConstructExceptAll(leftScope.group, rightScope.group, private)
 		}
 	} else {
 		switch clause.Type {
 		case tree.UnionOp:
-			out = b.factory.ConstructUnion(left, right, private)
+			outScope.group = b.factory.ConstructUnion(leftScope.group, rightScope.group, private)
 		case tree.IntersectOp:
-			out = b.factory.ConstructIntersect(left, right, private)
+			outScope.group = b.factory.ConstructIntersect(leftScope.group, rightScope.group, private)
 		case tree.ExceptOp:
-			out = b.factory.ConstructExcept(left, right, private)
+			outScope.group = b.factory.ConstructExcept(leftScope.group, rightScope.group, private)
 		}
 	}
 
-	return out, outScope
+	return outScope
 }

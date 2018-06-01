@@ -199,14 +199,13 @@ func (t *leaseTest) node(nodeID uint32) *sql.LeaseManager {
 		nc.Set(context.TODO(), roachpb.NodeID(nodeID))
 		// Hack the ExecutorConfig that we pass to the LeaseManager to have a
 		// different node id.
-		cfgCpy := *t.server.InternalExecutor().(*sql.InternalExecutor).ExecCfg
+		cfgCpy := t.server.ExecutorConfig().(sql.ExecutorConfig)
 		cfgCpy.NodeInfo.NodeID = nc
 		mgr = sql.NewLeaseManager(
 			log.AmbientContext{Tracer: tracing.NewTracer()},
 			&cfgCpy,
 			t.leaseManagerTestingKnobs,
 			t.server.Stopper(),
-			&sql.MemoryMetrics{},
 			t.cfg,
 		)
 		t.nodes[nodeID] = mgr
@@ -760,6 +759,88 @@ SELECT EXISTS(SELECT * FROM t.foo);
 	}
 }
 
+// TestDescriptorRefreshOnRetry tests that all descriptors acquired by
+// a query are properly released before the query is retried.
+func TestDescriptorRefreshOnRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+
+	fooAcquiredCount := int32(0)
+	fooReleaseCount := int32(0)
+
+	params.Knobs = base.TestingKnobs{
+		SQLLeaseManager: &sql.LeaseManagerTestingKnobs{
+			LeaseStoreTestingKnobs: sql.LeaseStoreTestingKnobs{
+				// Set this so we observe a release event from the cache
+				// when the API releases the descriptor.
+				RemoveOnceDereferenced: true,
+				LeaseAcquiredEvent: func(table sqlbase.TableDescriptor, _ error) {
+					if table.Name == "foo" {
+						atomic.AddInt32(&fooAcquiredCount, 1)
+					}
+				},
+				LeaseReleasedEvent: func(table sqlbase.TableDescriptor, _ error) {
+					if table.Name == "foo" {
+						atomic.AddInt32(&fooReleaseCount, 1)
+					}
+				},
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.foo (v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if atomic.LoadInt32(&fooAcquiredCount) > 0 {
+		t.Fatalf("CREATE TABLE has acquired a descriptor")
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This select can be retried in which case the descriptor gets reacquired.
+	if _, err := tx.Exec(`
+		SELECT * FROM t.foo;
+		`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Descriptor has been acquired one more time than it has been released.
+	aCount, rCount := atomic.LoadInt32(&fooAcquiredCount), atomic.LoadInt32(&fooReleaseCount)
+	if aCount != rCount+1 {
+		t.Fatalf("invalid descriptor acquisition counts = %d, %d", aCount, rCount)
+	}
+
+	if _, err := tx.Exec(
+		"SELECT CRDB_INTERNAL.FORCE_RETRY('1s':::INTERVAL)"); !testutils.IsError(
+		err, `forced by crdb_internal\.force_retry\(\)`) {
+		t.Fatal(err)
+	}
+
+	if cnt := atomic.LoadInt32(&fooAcquiredCount); cnt != aCount {
+		t.Fatalf("descriptor reacquired, %d != %d", cnt, aCount)
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		if cnt := atomic.LoadInt32(&fooReleaseCount); cnt != aCount {
+			return errors.Errorf("didnt release descriptor, %d != %d", cnt, aCount)
+		}
+		return nil
+	})
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Test that a transaction created way in the past will use the correct
 // table descriptor and will thus obey the modififcation time of the
 // table descriptor.
@@ -1003,28 +1084,40 @@ func TestLeaseRenewedAutomatically(testingT *testing.T) {
 	params.LeaseManagerConfig.TableDescriptorLeaseRenewalTimeout =
 		params.LeaseManagerConfig.TableDescriptorLeaseDuration
 
+	ctx := context.Background()
 	t := newLeaseTest(testingT, params)
 	defer t.cleanup()
 
 	if _, err := t.db.Exec(`
 CREATE DATABASE t;
-CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
+CREATE TABLE t.test1 (k CHAR PRIMARY KEY, v CHAR);
+CREATE TABLE t.test2 ();
 `); err != nil {
 		t.Fatal(err)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test")
-	dbID := tableDesc.ParentID
-	tableName := tableDesc.Name
+	test2Desc := sqlbase.GetTableDescriptor(t.kvDB, "t", "test2")
+	dbID := test2Desc.ParentID
 
-	// Acquire the first lease.
-	ts, e1, err := t.node(1).AcquireByName(context.TODO(), t.server.Clock().Now(), dbID, tableName)
+	// Acquire a lease on test1 by name.
+	ts1, eo1, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "test1")
 	if err != nil {
 		t.Fatal(err)
-	} else if err := t.release(1, ts); err != nil {
+	} else if err := t.release(1, ts1); err != nil {
 		t.Fatal(err)
 	} else if count := atomic.LoadInt32(&testAcquiredCount); count != 1 {
 		t.Fatalf("expected 1 lease to be acquired, but acquired %d times",
+			count)
+	}
+
+	// Acquire a lease on test2 by ID.
+	ts2, eo2, err := t.node(1).Acquire(ctx, t.server.Clock().Now(), test2Desc.ID)
+	if err != nil {
+		t.Fatal(err)
+	} else if err := t.release(1, ts2); err != nil {
+		t.Fatal(err)
+	} else if count := atomic.LoadInt32(&testAcquiredCount); count != 2 {
+		t.Fatalf("expected 2 leases to be acquired, but acquired %d times",
 			count)
 	}
 
@@ -1032,15 +1125,15 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	atomic.StoreInt32(&testAcquisitionBlockCount, 0)
 
 	testutils.SucceedsSoon(t, func() error {
-		// Acquire another lease. At first this will be the same lease, but
-		// eventually we will asynchronously renew a lease and our acquire will get
-		// a newer lease.
-		ts, e2, err := t.node(1).AcquireByName(context.TODO(), t.server.Clock().Now(), dbID, tableName)
+		// Acquire another lease by name on test1. At first this will be the
+		// same lease, but eventually we will asynchronously renew a lease and
+		// our acquire will get a newer lease.
+		ts1, en1, err := t.node(1).AcquireByName(ctx, t.server.Clock().Now(), dbID, "test1")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() {
-			if err := t.release(1, ts); err != nil {
+			if err := t.release(1, ts1); err != nil {
 				t.Fatal(err)
 			}
 		}()
@@ -1048,15 +1141,42 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		// We check for the new expiry time because if our past acquire triggered
 		// the background renewal, the next lease we get will be the result of the
 		// background renewal.
-		if e2.WallTime <= e1.WallTime {
+		if en1.WallTime <= eo1.WallTime {
 			return errors.Errorf("expected new lease expiration (%s) to be after old lease expiration (%s)",
-				e2, e1)
+				en1, eo1)
 		} else if count := atomic.LoadInt32(&testAcquiredCount); count < 2 {
 			return errors.Errorf("expected at least 2 leases to be acquired, but acquired %d times",
 				count)
 		} else if blockCount := atomic.LoadInt32(&testAcquisitionBlockCount); blockCount > 0 {
 			t.Fatalf("expected repeated lease acquisition to not block, but blockCount is: %d", blockCount)
 		}
+
+		// Acquire another lease by ID on test2. At first this will be the same
+		// lease, but eventually we will asynchronously renew a lease and our
+		// acquire will get a newer lease.
+		ts2, en2, err := t.node(1).Acquire(ctx, t.server.Clock().Now(), test2Desc.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := t.release(1, ts2); err != nil {
+				t.Fatal(err)
+			}
+		}()
+
+		// We check for the new expiry time because if our past acquire triggered
+		// the background renewal, the next lease we get will be the result of the
+		// background renewal.
+		if en2.WallTime <= eo2.WallTime {
+			return errors.Errorf("expected new lease expiration (%s) to be after old lease expiration (%s)",
+				en2, eo2)
+		} else if count := atomic.LoadInt32(&testAcquiredCount); count < 3 {
+			return errors.Errorf("expected at least 3 leases to be acquired, but acquired %d times",
+				count)
+		} else if blockCount := atomic.LoadInt32(&testAcquisitionBlockCount); blockCount > 0 {
+			t.Fatalf("expected repeated lease acquisition to not block, but blockCount is: %d", blockCount)
+		}
+
 		return nil
 	})
 }

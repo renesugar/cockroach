@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: default opt
 
 query T colnames
 SELECT * FROM [SHOW client_encoding]
@@ -31,6 +31,7 @@ default_transaction_isolation   serializable
 default_transaction_read_only   off
 distsql                         off
 experimental_force_lookup_join  off
+experimental_force_zigzag_join  off
 experimental_opt                off
 extra_float_digits              ·
 intervalstyle                   postgres
@@ -78,6 +79,8 @@ query T colnames
 SELECT * FROM [SHOW DATABASES]
 ----
 Database
+defaultdb
+postgres
 system
 test
 

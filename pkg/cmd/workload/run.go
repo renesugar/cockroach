@@ -18,14 +18,15 @@ package main
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"testing"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -33,17 +34,16 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/tylertreat/hdrhistogram-writer"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 )
 
-var runCmd = &cobra.Command{
+var runCmd = setCmdDefaults(&cobra.Command{
 	Use:   `run`,
 	Short: `Run a workload's operations against a cluster`,
-}
+})
 
 var runFlags = pflag.NewFlagSet(`run`, pflag.ContinueOnError)
 var tolerateErrors = runFlags.Bool("tolerate-errors", false, "Keep running on error")
@@ -52,20 +52,19 @@ var maxRate = runFlags.Float64(
 var maxOps = runFlags.Uint64("max-ops", 0, "Maximum number of operations to run")
 var duration = runFlags.Duration("duration", 0, "The duration to run. If 0, run forever.")
 var doInit = runFlags.Bool("init", false, "Automatically run init")
+var ramp = runFlags.Duration("ramp", 0*time.Second, "The duration over which to ramp up load.")
 
-var initCmd = &cobra.Command{
+var initCmd = setCmdDefaults(&cobra.Command{
 	Use:   `init`,
 	Short: `Set up tables for a workload`,
-}
+})
 
 var initFlags = pflag.NewFlagSet(`init`, pflag.ContinueOnError)
 var drop = initFlags.Bool("drop", false, "Drop the existing database, if it exists")
 
-// Output in HdrHistogram Plotter format. See
-// https://hdrhistogram.github.io/HdrHistogram/plotFiles.html
-var histFile = runFlags.String(
-	"hist-file", "",
-	"Write histogram data to file for HdrHistogram Plotter, or stdout if - is specified.")
+var histograms = runFlags.String(
+	"histograms", "",
+	"File to write per-op incremental and cumulative histogram data.")
 
 func init() {
 	for _, meta := range workload.Registered() {
@@ -75,13 +74,21 @@ func init() {
 			genFlags = f.Flags().FlagSet
 		}
 
-		genInitCmd := &cobra.Command{Use: meta.Name, Short: meta.Description}
+		genInitCmd := setCmdDefaults(&cobra.Command{
+			Use:   meta.Name,
+			Short: meta.Description,
+			Args:  cobra.ArbitraryArgs,
+		})
 		genInitCmd.Flags().AddFlagSet(initFlags)
 		genInitCmd.Flags().AddFlagSet(genFlags)
 		genInitCmd.Run = cmdHelper(gen, runInit)
 		initCmd.AddCommand(genInitCmd)
 
-		genRunCmd := &cobra.Command{Use: meta.Name, Short: meta.Description}
+		genRunCmd := setCmdDefaults(&cobra.Command{
+			Use:   meta.Name,
+			Short: meta.Description,
+			Args:  cobra.ArbitraryArgs,
+		})
 		genRunCmd.Flags().AddFlagSet(runFlags)
 		genRunCmd.Flags().AddFlagSet(genFlags)
 		initFlags.VisitAll(func(initFlag *pflag.Flag) {
@@ -127,6 +134,23 @@ func cmdHelper(
 	})
 }
 
+// setCmdDefaults ensures that the provided Cobra command will properly report
+// an error if the user specifies an invalid subcommand. It is safe to call on
+// any Cobra command.
+//
+// This is a wontfix bug in Cobra: https://github.com/spf13/cobra/pull/329
+func setCmdDefaults(cmd *cobra.Command) *cobra.Command {
+	if cmd.Run == nil && cmd.RunE == nil {
+		cmd.Run = func(cmd *cobra.Command, args []string) {
+			_ = cmd.Usage()
+		}
+	}
+	if cmd.Args == nil {
+		cmd.Args = cobra.NoArgs
+	}
+	return cmd
+}
+
 // numOps keeps a global count of successful operations.
 var numOps uint64
 
@@ -162,26 +186,34 @@ func workerRun(
 }
 
 func runInit(gen workload.Generator, urls []string, dbName string) error {
+	ctx := context.Background()
+
 	initDB, err := gosql.Open(`cockroach`, strings.Join(urls, ` `))
 	if err != nil {
 		return err
 	}
 
-	return runInitImpl(gen, initDB, dbName)
+	return runInitImpl(ctx, gen, initDB, dbName)
 }
 
-func runInitImpl(gen workload.Generator, initDB *gosql.DB, dbName string) error {
+func runInitImpl(
+	ctx context.Context, gen workload.Generator, initDB *gosql.DB, dbName string,
+) error {
 	if *drop {
-		if _, err := initDB.Exec(`DROP DATABASE IF EXISTS ` + dbName); err != nil {
+		if _, err := initDB.ExecContext(ctx, `DROP DATABASE IF EXISTS `+dbName); err != nil {
 			return err
 		}
 	}
-	if _, err := initDB.Exec(`CREATE DATABASE IF NOT EXISTS ` + dbName); err != nil {
+	if _, err := initDB.ExecContext(ctx, `CREATE DATABASE IF NOT EXISTS `+dbName); err != nil {
 		return err
 	}
 
 	const batchSize = -1
-	_, err := workload.Setup(initDB, gen, batchSize)
+	// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
+	// hooked up to a flag directly once once more of run.go moves inside
+	// workload.
+	const concurrency = 16
+	_, err := workload.Setup(ctx, initDB, gen, batchSize, concurrency)
 	return err
 }
 
@@ -194,7 +226,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	}
 	if *doInit || *drop {
 		for {
-			err = runInitImpl(gen, initDB, dbName)
+			err = runInitImpl(ctx, gen, initDB, dbName)
 			if err == nil {
 				break
 			}
@@ -231,11 +263,15 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	start := timeutil.Now()
 	errCh := make(chan error)
 	var wg sync.WaitGroup
-	for _, workFn := range ops.WorkerFns {
-		workFn := workFn
-		wg.Add(1)
-		go workerRun(ctx, errCh, &wg, limiter, workFn)
-	}
+	sleepTime := *ramp / time.Duration(len(ops.WorkerFns))
+	wg.Add(len(ops.WorkerFns))
+	go func() {
+		for _, workFn := range ops.WorkerFns {
+			workFn := workFn
+			go workerRun(ctx, errCh, &wg, limiter, workFn)
+			time.Sleep(sleepTime)
+		}
+	}()
 
 	var numErr int
 	tick := time.Tick(time.Second)
@@ -252,6 +288,16 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			time.Sleep(*duration)
 			done <- syscall.Signal(0)
 		}()
+	}
+
+	var jsonEnc *json.Encoder
+	if *histograms != "" {
+		_ = os.MkdirAll(filepath.Dir(*histograms), 0755)
+		jsonF, err := os.Create(*histograms)
+		if err != nil {
+			return err
+		}
+		jsonEnc = json.NewEncoder(jsonF)
 	}
 
 	for i := 0; ; {
@@ -274,14 +320,17 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 				fmt.Printf("%8s %8d %14.1f %14.1f %8.1f %8.1f %8.1f %8.1f %s\n",
 					time.Duration(startElapsed.Seconds()+0.5)*time.Second,
 					numErr,
-					float64(t.Ops-t.LastOps)/t.Elapsed.Seconds(),
-					float64(t.Ops)/startElapsed.Seconds(),
+					float64(t.Hist.TotalCount())/t.Elapsed.Seconds(),
+					float64(t.Cumulative.TotalCount())/startElapsed.Seconds(),
 					time.Duration(t.Hist.ValueAtQuantile(50)).Seconds()*1000,
 					time.Duration(t.Hist.ValueAtQuantile(95)).Seconds()*1000,
 					time.Duration(t.Hist.ValueAtQuantile(99)).Seconds()*1000,
 					time.Duration(t.Hist.ValueAtQuantile(100)).Seconds()*1000,
 					t.Name,
 				)
+				if jsonEnc != nil {
+					_ = jsonEnc.Encode(t.Snapshot())
+				}
 			})
 
 		case <-done:
@@ -289,12 +338,13 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			fmt.Println(totalHeader + `__total`)
 			startElapsed := timeutil.Since(start)
 			printTotalHist := func(t workload.HistogramTick) {
-				if t.Ops == 0 {
+				if t.Cumulative.TotalCount() == 0 {
 					return
 				}
 				fmt.Printf("%7.1fs %8d %14d %14.1f %8.1f %8.1f %8.1f %8.1f %8.1f  %s\n",
 					startElapsed.Seconds(), numErr,
-					t.Ops, float64(t.Ops)/startElapsed.Seconds(),
+					t.Cumulative.TotalCount(),
+					float64(t.Cumulative.TotalCount())/startElapsed.Seconds(),
 					time.Duration(t.Cumulative.Mean()).Seconds()*1000,
 					time.Duration(t.Cumulative.ValueAtQuantile(50)).Seconds()*1000,
 					time.Duration(t.Cumulative.ValueAtQuantile(95)).Seconds()*1000,
@@ -307,9 +357,15 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			resultTick := workload.HistogramTick{Name: ops.ResultHist}
 			reg.Tick(func(t workload.HistogramTick) {
 				printTotalHist(t)
+				if jsonEnc != nil {
+					// Note that we're outputting the delta from the last tick. The
+					// cumulative histogram can be computed by merging all of the
+					// per-tick histograms.
+					_ = jsonEnc.Encode(t.Snapshot())
+				}
 				if ops.ResultHist == `` || ops.ResultHist == t.Name {
-					resultTick.Ops += t.Ops
 					if resultTick.Cumulative == nil {
+						resultTick.Now = t.Now
 						resultTick.Cumulative = t.Cumulative
 					} else {
 						resultTick.Cumulative.Merge(t.Cumulative)
@@ -320,36 +376,14 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 			fmt.Println(totalHeader + `__result`)
 			printTotalHist(resultTick)
 
-			// Output results that mimic Go's built-in benchmark format.
-			benchmarkName := strings.Join([]string{
-				"BenchmarkWorkload",
-				fmt.Sprintf("generator=%s", gen.Meta().Name),
-			}, "/")
-			if *duration != time.Duration(0) {
-				benchmarkName += `/duration=` + duration.String()
+			if h, ok := gen.(workload.Hookser); ok {
+				if h.Hooks().PostRun != nil {
+					if err := h.Hooks().PostRun(start); err != nil {
+						fmt.Printf("failed post-run hook: %v\n", err)
+					}
+				}
 			}
-			if f, ok := gen.(workload.Flagser); ok {
-				// NB: This visits in a deterministic order.
-				f.Flags().Visit(func(f *pflag.Flag) {
-					benchmarkName += fmt.Sprintf(`/%s=%s`, f.Name, f.Value)
-				})
-			}
-			result := testing.BenchmarkResult{N: int(resultTick.Ops), T: startElapsed}
-			fmt.Printf("\n%s\t%s\n", benchmarkName, result)
 
-			if *histFile == "-" {
-				if err := histwriter.WriteDistribution(
-					resultTick.Cumulative, nil, 1, os.Stdout,
-				); err != nil {
-					fmt.Printf("failed to write histogram to stdout: %v\n", err)
-				}
-			} else if *histFile != "" {
-				if err := histwriter.WriteDistributionFile(
-					resultTick.Cumulative, nil, 1, *histFile,
-				); err != nil {
-					fmt.Printf("failed to write histogram file: %v\n", err)
-				}
-			}
 			return nil
 		}
 	}

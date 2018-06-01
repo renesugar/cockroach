@@ -31,10 +31,8 @@ RUN apt-get update \
 # The forward reference version is the oldest version from which we support
 # upgrading. The bidirectional reference version is the oldest version that we
 # support upgrading from and downgrading to.
-#
-# v1.1.0 has the wrong cluster version, so we need v1.1.1.
-ENV FORWARD_REFERENCE_VERSION="v1.1.1"
-ENV BIDIRECTIONAL_REFERENCE_VERSION="v1.1.1"
+ENV FORWARD_REFERENCE_VERSION="v2.0.0"
+ENV BIDIRECTIONAL_REFERENCE_VERSION="v2.0.0"
 RUN mkdir /opt/forward-reference-version /opt/bidirectional-reference-version \
  && curl -fsSL https://binaries.cockroachdb.com/cockroach-${FORWARD_REFERENCE_VERSION}.linux-amd64.tgz \
     | tar xz -C /opt/forward-reference-version --strip-components=1 \
@@ -59,6 +57,7 @@ RUN curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg > /etc/apt/trusted.gpg.d
     libc6-dev \
     libpq-dev \
     libpqtypes-dev \
+    make \
     maven \
     nodejs \
     gcc \

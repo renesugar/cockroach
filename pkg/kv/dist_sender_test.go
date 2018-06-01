@@ -1422,7 +1422,7 @@ func TestRangeLookupOptionOnReverseScan(t *testing.T) {
 	}
 	ds := NewDistSender(cfg, g)
 	rScan := &roachpb.ReverseScanRequest{
-		Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")},
+		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")},
 	}
 	if _, err := client.SendWrapped(context.Background(), ds, rScan); err != nil {
 		t.Fatal(err)
@@ -1723,181 +1723,6 @@ func TestTruncateWithLocalSpanAndDescriptor(t *testing.T) {
 	}
 }
 
-// TestSequenceUpdate verifies txn sequence number is incremented
-// on successive commands.
-func TestSequenceUpdate(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-
-	g, clock := makeGossip(t, stopper)
-	if err := g.SetNodeDescriptor(&roachpb.NodeDescriptor{NodeID: 1}); err != nil {
-		t.Fatal(err)
-	}
-	nd := &roachpb.NodeDescriptor{
-		NodeID:  roachpb.NodeID(1),
-		Address: util.MakeUnresolvedAddr(testAddress.Network(), testAddress.String()),
-	}
-	if err := g.AddInfoProto(gossip.MakeNodeIDKey(roachpb.NodeID(1)), nd, time.Hour); err != nil {
-		t.Fatal(err)
-
-	}
-
-	var expSequence int32 = 1 // sequence numbers are 1-based.
-	var testFn rpcSendFn = func(
-		_ context.Context,
-		_ SendOptions,
-		_ ReplicaSlice,
-		ba roachpb.BatchRequest,
-		_ *rpc.Context,
-	) (*roachpb.BatchResponse, error) {
-		expSequence++
-		if expSequence != ba.Txn.Sequence {
-			t.Errorf("expected sequence %d; got %d", expSequence, ba.Txn.Sequence)
-		}
-		br := ba.CreateReply()
-		br.Txn = ba.Txn
-		return br, nil
-	}
-
-	cfg := DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Clock:      clock,
-		TestingKnobs: DistSenderTestingKnobs{
-			TransportFactory: adaptLegacyTransport(testFn),
-		},
-		RangeDescriptorDB: defaultMockRangeDescriptorDB,
-	}
-	ds := NewDistSender(cfg, g)
-
-	// Send 5 puts and verify sequence number increase.
-	txn := roachpb.MakeTransaction(
-		"test", nil /* baseKey */, roachpb.NormalUserPriority,
-		enginepb.SERIALIZABLE,
-		clock.Now(),
-		clock.MaxOffset().Nanoseconds(),
-	)
-	for i := 0; i < 5; i++ {
-		var ba roachpb.BatchRequest
-		ba.Txn = &txn
-		ba.Add(roachpb.NewPut(roachpb.Key("a"), roachpb.MakeValueFromString("foo")).(*roachpb.PutRequest))
-		br, pErr := ds.Send(context.Background(), ba)
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		txn = *br.Txn
-	}
-}
-
-// TestSequenceUpdateOnMultiRangeQueryLoop reproduces #3206 and
-// verifies that the sequence is updated in the DistSender
-// multi-range-query loop.
-//
-// More specifically, the issue was that DistSender might send
-// multiple batch requests to the same replica when it finds a
-// post-split range descriptor in the cache while the split has not
-// yet been fully completed. By giving a higher sequence to the second
-// request, we can avoid an infinite txn restart error (otherwise
-// caused by hitting the sequence cache).
-func TestSequenceUpdateOnMultiRangeQueryLoop(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.TODO())
-
-	g, clock := makeGossip(t, stopper)
-	if err := g.SetNodeDescriptor(&roachpb.NodeDescriptor{NodeID: 1}); err != nil {
-		t.Fatal(err)
-	}
-	nd := &roachpb.NodeDescriptor{
-		NodeID:  roachpb.NodeID(1),
-		Address: util.MakeUnresolvedAddr(testAddress.Network(), testAddress.String()),
-	}
-	if err := g.AddInfoProto(gossip.MakeNodeIDKey(roachpb.NodeID(1)), nd, time.Hour); err != nil {
-		t.Fatal(err)
-
-	}
-
-	// Fill MockRangeDescriptorDB with two descriptors.
-	var descriptor1 = roachpb.RangeDescriptor{
-		RangeID:  2,
-		StartKey: testMetaEndKey,
-		EndKey:   roachpb.RKey("b"),
-		Replicas: []roachpb.ReplicaDescriptor{
-			{
-				NodeID:  1,
-				StoreID: 1,
-			},
-		},
-	}
-	var descriptor2 = roachpb.RangeDescriptor{
-		RangeID:  3,
-		StartKey: roachpb.RKey("b"),
-		EndKey:   roachpb.RKeyMax,
-		Replicas: []roachpb.ReplicaDescriptor{
-			{
-				NodeID:  1,
-				StoreID: 1,
-			},
-		},
-	}
-	descDB := mockRangeDescriptorDBForDescs(
-		testMetaRangeDescriptor,
-		descriptor1,
-		descriptor2,
-	)
-
-	// Define our rpcSend stub which checks the span of the batch
-	// requests. Because of parallelization, the requests for the
-	// two batches won't necessarily arrive in a stable order. The
-	// request to "a" should have a sequence number that immediately
-	// precedes the request to "b".
-	var aSequence, bSequence int32
-	var testFn rpcSendFn = func(
-		_ context.Context,
-		_ SendOptions,
-		_ ReplicaSlice,
-		ba roachpb.BatchRequest,
-		_ *rpc.Context,
-	) (*roachpb.BatchResponse, error) {
-		rs, err := keys.Range(ba)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rs.Key.Equal(roachpb.RKey("a")) && rs.EndKey.Equal(roachpb.RKey("a").Next()) {
-			aSequence = ba.Txn.Sequence
-		} else if rs.Key.Equal(roachpb.RKey("b")) && rs.EndKey.Equal(roachpb.RKey("b").Next()) {
-			bSequence = ba.Txn.Sequence
-		} else {
-			t.Fatalf("unexpected request for span %s", rs)
-		}
-		return ba.CreateReply(), nil
-	}
-
-	cfg := DistSenderConfig{
-		AmbientCtx: log.AmbientContext{Tracer: tracing.NewTracer()},
-		Clock:      clock,
-		TestingKnobs: DistSenderTestingKnobs{
-			TransportFactory: adaptLegacyTransport(testFn),
-		},
-		RangeDescriptorDB: descDB,
-	}
-	ds := NewDistSender(cfg, g)
-
-	// Send a batch request containing two puts.
-	var ba roachpb.BatchRequest
-	ba.Txn = &roachpb.Transaction{Name: "test"}
-	val := roachpb.MakeValueFromString("val")
-	ba.Add(roachpb.NewPut(roachpb.Key("a"), val))
-	val = roachpb.MakeValueFromString("val")
-	ba.Add(roachpb.NewPut(roachpb.Key("b"), val))
-	if _, pErr := ds.Send(context.Background(), ba); pErr != nil {
-		t.Fatal(pErr)
-	}
-	if bSequence != aSequence+1 {
-		t.Errorf("unexpected sequence; expected %d, but got %d", aSequence+1, bSequence)
-	}
-}
-
 type batchMethods struct {
 	sequence int32
 	methods  []roachpb.Method
@@ -2025,7 +1850,7 @@ func TestMultiRangeSplitEndTransaction(t *testing.T) {
 		ba.Add(roachpb.NewPut(test.put1, val))
 		val = roachpb.MakeValueFromString("val")
 		ba.Add(roachpb.NewPut(test.put2, val))
-		ba.Add(&roachpb.EndTransactionRequest{Span: roachpb.Span{Key: test.et}})
+		ba.Add(&roachpb.EndTransactionRequest{RequestHeader: roachpb.RequestHeader{Key: test.et}})
 
 		if _, pErr := ds.Send(context.Background(), ba); pErr != nil {
 			t.Fatal(pErr)
@@ -2124,7 +1949,7 @@ func TestSenderTransport(t *testing.T) {
 			) (r *roachpb.BatchResponse, e *roachpb.Error) {
 				return
 			},
-		))(SendOptions{}, &rpc.Context{}, nil, roachpb.BatchRequest{})
+		))(SendOptions{}, &rpc.Context{}, ReplicaSlice{{}}, roachpb.BatchRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,6 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 )
 
+// For a high-level overview of the keyspace layout, see the package comment in
+// doc.go.
+
 // These constants are single bytes for performance. They allow single-byte
 // comparisons which are considerably faster than bytes.HasPrefix.
 const (
@@ -36,27 +39,7 @@ const (
 //
 // Note: preserve group-wise ordering when adding new constants.
 var (
-	// localPrefix is the prefix for keys which hold data local to a
-	// RocksDB instance, such as store and range-specific metadata which
-	// must not pollute the user key space, but must be collocated with
-	// the store and/or ranges which they refer to. Storing this
-	// information in the normal system keyspace would place the data on
-	// an arbitrary set of stores, with no guarantee of collocation.
-	// Local data includes store metadata, range metadata, abort
-	// cache values, transaction records, range-spanning binary tree
-	// node pointers, and message queues.
-	//
-	// The local key prefix has been deliberately chosen to sort before
-	// the SystemPrefix, because these local keys are not addressable
-	// via the meta range addressing indexes.
-	//
-	// Some local data are not replicated, such as the store's 'ident'
-	// record. Most local data are replicated, such as AbortSpan
-	// entries and transaction rows, but are not addressable as normal
-	// MVCC values as part of transactions. Finally, some local data are
-	// stored as MVCC values and are addressable as part of distributed
-	// transactions, such as range metadata, range-spanning binary tree
-	// node pointers, and message queues.
+	// localPrefix is the prefix for all local keys.
 	localPrefix = roachpb.Key{localPrefixByte}
 	// LocalMax is the end of the local key range. It is itself a global
 	// key.
@@ -87,6 +70,9 @@ var (
 	// is to allow a restarting node to discover approximately how long it has
 	// been down without needing to retrieve liveness records from the cluster.
 	localStoreLastUpSuffix = []byte("uptm")
+	// localHLCUpperBoundSuffix stores an upper bound to the wall time used by
+	// the HLC
+	localHLCUpperBoundSuffix = []byte("hlcu")
 	// localStoreSuggestedCompactionSuffix stores suggested compactions to
 	// be aggregated and processed on the store.
 	localStoreSuggestedCompactionSuffix = []byte("comp")
@@ -109,12 +95,12 @@ var (
 	// in storage/engine/rocksdb/db.cc.
 	LocalRangeIDPrefix = roachpb.RKey(makeKey(localPrefix, roachpb.Key("i")))
 
-	// localRangeIDReplicatedInfix is the post-Range ID specifier for all Raft
+	// LocalRangeIDReplicatedInfix is the post-Range ID specifier for all Raft
 	// replicated per-range data. By appending this after the Range ID, these
 	// keys will be sorted directly before the local unreplicated keys for the
 	// same Range ID, so they can be manipulated either together or individually
 	// in a single scan.
-	localRangeIDReplicatedInfix = []byte("r")
+	LocalRangeIDReplicatedInfix = []byte("r")
 	// LocalAbortSpanSuffix is the suffix for AbortSpan entries. The
 	// AbortSpan protects a transaction from re-reading its own intents
 	// after it's been aborted.
@@ -124,18 +110,21 @@ var (
 	LocalRangeFrozenStatusSuffix = []byte("fzn-")
 	// LocalRangeLastGCSuffix is the suffix for the last GC.
 	LocalRangeLastGCSuffix = []byte("lgc-")
-	// LocalRaftAppliedIndexSuffix is the suffix for the raft applied index.
-	LocalRaftAppliedIndexSuffix = []byte("rfta")
+	// LocalRangeAppliedStateSuffix is the suffix for the range applied state
+	// key.
+	LocalRangeAppliedStateSuffix = []byte("rask")
+	// LocalRaftAppliedIndexLegacySuffix is the suffix for the raft applied index.
+	LocalRaftAppliedIndexLegacySuffix = []byte("rfta")
 	// LocalRaftTombstoneSuffix is the suffix for the raft tombstone.
 	LocalRaftTombstoneSuffix = []byte("rftb")
 	// LocalRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
 	LocalRaftTruncatedStateSuffix = []byte("rftt")
 	// LocalRangeLeaseSuffix is the suffix for a range lease.
 	LocalRangeLeaseSuffix = []byte("rll-")
-	// LocalLeaseAppliedIndexSuffix is the suffix for the applied lease index.
-	LocalLeaseAppliedIndexSuffix = []byte("rlla")
-	// LocalRangeStatsSuffix is the suffix for range statistics.
-	LocalRangeStatsSuffix = []byte("stat")
+	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease index.
+	LocalLeaseAppliedIndexLegacySuffix = []byte("rlla")
+	// LocalRangeStatsLegacySuffix is the suffix for range statistics.
+	LocalRangeStatsLegacySuffix = []byte("stat")
 	// LocalTxnSpanGCThresholdSuffix is the suffix for the last txn span GC's
 	// threshold.
 	LocalTxnSpanGCThresholdSuffix = []byte("tst-")
@@ -267,7 +256,7 @@ var (
 	SystemConfigTableDataMax = roachpb.Key(MakeTablePrefix(MaxSystemConfigDescID + 1))
 
 	// UserTableDataMin is the start key of user structured data.
-	UserTableDataMin = roachpb.Key(MakeTablePrefix(MaxReservedDescID + 1))
+	UserTableDataMin = roachpb.Key(MakeTablePrefix(MinUserDescID))
 
 	// MaxKey is the infinity marker which is larger than any other key.
 	MaxKey = roachpb.KeyMax
@@ -287,6 +276,15 @@ const (
 	// IDs. Reserved IDs are used by namespaces and tables used internally by
 	// cockroach.
 	MaxReservedDescID = 49
+
+	// MinUserDescID is the first descriptor ID available for user
+	// structured data.
+	MinUserDescID = MaxReservedDescID + 1
+
+	// MinNonPredefinedUserDescID is the first descriptor ID used by
+	// user-level objects that are not created automatically on empty
+	// clusters (default databases).
+	MinNonPredefinedUserDescID = MinUserDescID + 2
 
 	// VirtualDescriptorID is the ID used by all virtual descriptors.
 	VirtualDescriptorID = math.MaxUint32

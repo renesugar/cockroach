@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -39,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -67,6 +69,17 @@ var minWALSyncInterval = settings.RegisterDurationSetting(
 	0*time.Millisecond,
 )
 
+var rocksdbConcurrency = envutil.EnvOrDefaultInt(
+	"COCKROACH_ROCKSDB_CONCURRENCY", func() int {
+		// Use up to min(numCPU, 4) threads for background RocksDB compactions per
+		// store.
+		const max = 4
+		if n := runtime.NumCPU(); n <= max {
+			return n
+		}
+		return max
+	}())
+
 // Set to true to perform expensive iterator debug leak checking. In normal
 // operation, we perform inexpensive iterator leak checking but those checks do
 // not indicate where the leak arose. The expensive checking tracks the stack
@@ -75,9 +88,10 @@ const debugIteratorLeak = false
 
 //export rocksDBLog
 func rocksDBLog(s *C.char, n C.int) {
-	// Note that rocksdb logging is only enabled if log.V(3) is true
-	// when RocksDB.Open() is called.
-	log.Info(context.TODO(), C.GoStringN(s, n))
+	if log.V(3) {
+		ctx := log.WithLogTagStr(context.Background(), "rocksdb", "")
+		log.Info(ctx, C.GoStringN(s, n))
+	}
 }
 
 //export prettyPrintKey
@@ -439,9 +453,9 @@ type RocksDBConfig struct {
 	WarnLargeBatchThreshold time.Duration
 	// Settings instance for cluster-wide knobs.
 	Settings *cluster.Settings
-	// UseSwitchingEnv is true if the switching env is needed (eg: encryption-at-rest).
-	// This may force the store version to versionSwitchingEnv if currently lower.
-	UseSwitchingEnv bool
+	// UseFileRegistry is true if the file registry is needed (eg: encryption-at-rest).
+	// This may force the store version to versionFileRegistry if currently lower.
+	UseFileRegistry bool
 	// RocksDBOptions contains RocksDB specific options using a semicolon
 	// separated key-value syntax ("key1=value1; key2=value2").
 	RocksDBOptions string
@@ -565,15 +579,15 @@ func (r *RocksDB) open() error {
 
 		newVersion = existingVersion
 		if newVersion == versionNoFile {
-			// We currently set the default store version one before the switching env
+			// We currently set the default store version one before the file registry
 			// to allow downgrades to older binaries as long as encryption is not in use.
-			// TODO(mberhault): once enough releases supporting versionSwitchingEnv have passed, we can upgrade
+			// TODO(mberhault): once enough releases supporting versionFileRegistry have passed, we can upgrade
 			// to it without worry.
 			newVersion = versionBeta20160331
 		}
 
-		// Using the switching environment forces the latest version. We can't downgrade!
-		if r.cfg.UseSwitchingEnv {
+		// Using the file registry forces the latest version. We can't downgrade!
+		if r.cfg.UseFileRegistry {
 			newVersion = versionCurrent
 		}
 	} else {
@@ -593,10 +607,9 @@ func (r *RocksDB) open() error {
 	status := C.DBOpen(&r.rdb, goToCSlice([]byte(r.cfg.Dir)),
 		C.DBOptions{
 			cache:             r.cache.cache,
-			logging_enabled:   C.bool(log.V(3)),
-			num_cpu:           C.int(runtime.NumCPU()),
+			num_cpu:           C.int(rocksdbConcurrency),
 			max_open_files:    C.int(maxOpenFiles),
-			use_switching_env: C.bool(newVersion == versionCurrent),
+			use_file_registry: C.bool(newVersion == versionCurrent),
 			must_exist:        C.bool(r.cfg.MustExist),
 			read_only:         C.bool(r.cfg.ReadOnly),
 			rocksdb_options:   goToCSlice([]byte(r.cfg.RocksDBOptions)),
@@ -896,14 +909,14 @@ func (r *RocksDB) Flush() error {
 }
 
 // NewIterator returns an iterator over this rocksdb engine.
-func (r *RocksDB) NewIterator(prefix bool) Iterator {
-	return newRocksDBIterator(r.rdb, prefix, r, r)
+func (r *RocksDB) NewIterator(opts IterOptions) Iterator {
+	return newRocksDBIterator(r.rdb, opts, r, r)
 }
 
 // NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
-func (r *RocksDB) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+func (r *RocksDB) NewTimeBoundIterator(start, end hlc.Timestamp, withStats bool) Iterator {
 	it := &rocksDBIterator{}
-	it.initTimeBound(r.rdb, start, end, r)
+	it.initTimeBound(r.rdb, start, end, withStats, r)
 	return it
 }
 
@@ -979,16 +992,16 @@ func (r *rocksDBReadOnly) Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool
 // that the returned iterator is cached and re-used for the lifetime of the
 // rocksDBReadOnly. A panic will be thrown if multiple prefix or normal (non-prefix)
 // iterators are used simultaneously on the same rocksDBReadOnly.
-func (r *rocksDBReadOnly) NewIterator(prefix bool) Iterator {
+func (r *rocksDBReadOnly) NewIterator(opts IterOptions) Iterator {
 	if r.isClosed {
 		panic("using a closed rocksDBReadOnly")
 	}
 	iter := &r.normalIter
-	if prefix {
+	if opts.Prefix {
 		iter = &r.prefixIter
 	}
 	if iter.rocksDBIterator.iter == nil {
-		iter.rocksDBIterator.init(r.parent.rdb, prefix, r, r.parent)
+		iter.rocksDBIterator.init(r.parent.rdb, opts, r, r.parent)
 	}
 	if iter.inuse {
 		panic("iterator already in use")
@@ -997,12 +1010,12 @@ func (r *rocksDBReadOnly) NewIterator(prefix bool) Iterator {
 	return iter
 }
 
-func (r *rocksDBReadOnly) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+func (r *rocksDBReadOnly) NewTimeBoundIterator(start, end hlc.Timestamp, withStats bool) Iterator {
 	if r.isClosed {
 		panic("using a closed rocksDBReadOnly")
 	}
 	it := &rocksDBIterator{}
-	it.initTimeBound(r.parent.rdb, start, end, r)
+	it.initTimeBound(r.parent.rdb, start, end, withStats, r)
 	return it
 }
 
@@ -1057,10 +1070,9 @@ func (r *RocksDB) GetSSTables() SSTableInfos {
 	// hackery below treats the pointer as an array and then constructs a slice
 	// from it.
 
-	tablesPtr := uintptr(unsafe.Pointer(tables))
 	tableSize := unsafe.Sizeof(C.DBSSTable{})
 	tableVal := func(i int) C.DBSSTable {
-		return *(*C.DBSSTable)(unsafe.Pointer(tablesPtr + uintptr(i)*tableSize))
+		return *(*C.DBSSTable)(unsafe.Pointer(uintptr(unsafe.Pointer(tables)) + uintptr(i)*tableSize))
 	}
 
 	res := make(SSTableInfos, n)
@@ -1126,6 +1138,18 @@ func (r *RocksDB) GetCompactionStats() string {
 	return cStringToGoString(C.DBGetCompactionStats(r.rdb))
 }
 
+// GetEnvStats returns stats for the RocksDB env. This may include encryption stats.
+func (r *RocksDB) GetEnvStats() (*EnvStats, error) {
+	var s C.DBEnvStatsResult
+	if err := statusToError(C.DBGetEnvStats(r.rdb, &s)); err != nil {
+		return nil, err
+	}
+
+	return &EnvStats{
+		EncryptionStatus: cStringToGoBytes(s.encryption_status),
+	}, nil
+}
+
 type rocksDBSnapshot struct {
 	parent *RocksDB
 	handle *C.DBEngine
@@ -1163,12 +1187,12 @@ func (r *rocksDBSnapshot) Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool
 
 // NewIterator returns a new instance of an Iterator over the
 // engine using the snapshot handle.
-func (r *rocksDBSnapshot) NewIterator(prefix bool) Iterator {
-	return newRocksDBIterator(r.handle, prefix, r, r.parent)
+func (r *rocksDBSnapshot) NewIterator(opts IterOptions) Iterator {
+	return newRocksDBIterator(r.handle, opts, r, r.parent)
 }
 
 // NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
-func (r *rocksDBSnapshot) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+func (r *rocksDBSnapshot) NewTimeBoundIterator(start, end hlc.Timestamp, withStats bool) Iterator {
 	panic("not implemented")
 }
 
@@ -1205,18 +1229,18 @@ func (r *distinctBatch) Close() {
 // that the returned iterator is cached and re-used for the lifetime of the
 // batch. A panic will be thrown if multiple prefix or normal (non-prefix)
 // iterators are used simultaneously on the same batch.
-func (r *distinctBatch) NewIterator(prefix bool) Iterator {
+func (r *distinctBatch) NewIterator(opts IterOptions) Iterator {
 	// Used the cached iterator, creating it on first access.
 	iter := &r.normalIter
-	if prefix {
+	if opts.Prefix {
 		iter = &r.prefixIter
 	}
 	if iter.rocksDBIterator.iter == nil {
 		if r.writeOnly {
-			iter.rocksDBIterator.init(r.parent.rdb, prefix, r, r.parent)
+			iter.rocksDBIterator.init(r.parent.rdb, opts, r, r.parent)
 		} else {
 			r.ensureBatch()
-			iter.rocksDBIterator.init(r.batch, prefix, r, r.parent)
+			iter.rocksDBIterator.init(r.batch, opts, r, r.parent)
 		}
 	}
 	if iter.inuse {
@@ -1300,6 +1324,10 @@ func (r *distinctBatch) close() {
 type batchIterator struct {
 	iter  rocksDBIterator
 	batch *rocksDBBatch
+}
+
+func (r *batchIterator) Stats() IteratorStats {
+	return r.iter.Stats()
 }
 
 func (r *batchIterator) Close() {
@@ -1581,7 +1609,7 @@ func (r *rocksDBBatch) ClearIterRange(iter Iterator, start, end MVCCKey) error {
 // that the returned iterator is cached and re-used for the lifetime of the
 // batch. A panic will be thrown if multiple prefix or normal (non-prefix)
 // iterators are used simultaneously on the same batch.
-func (r *rocksDBBatch) NewIterator(prefix bool) Iterator {
+func (r *rocksDBBatch) NewIterator(opts IterOptions) Iterator {
 	if r.writeOnly {
 		panic("write-only batch")
 	}
@@ -1590,12 +1618,12 @@ func (r *rocksDBBatch) NewIterator(prefix bool) Iterator {
 	}
 	// Used the cached iterator, creating it on first access.
 	iter := &r.normalIter
-	if prefix {
+	if opts.Prefix {
 		iter = &r.prefixIter
 	}
 	if iter.iter.iter == nil {
 		r.ensureBatch()
-		iter.iter.init(r.batch, prefix, r, r.parent)
+		iter.iter.init(r.batch, opts, r, r.parent)
 	}
 	if iter.batch != nil {
 		panic("iterator already in use")
@@ -1605,7 +1633,7 @@ func (r *rocksDBBatch) NewIterator(prefix bool) Iterator {
 }
 
 // NewTimeBoundIterator is like NewIterator, but returns a time-bound iterator.
-func (r *rocksDBBatch) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
+func (r *rocksDBBatch) NewTimeBoundIterator(start, end hlc.Timestamp, withStats bool) Iterator {
 	if r.writeOnly {
 		panic("write-only batch")
 	}
@@ -1619,7 +1647,7 @@ func (r *rocksDBBatch) NewTimeBoundIterator(start, end hlc.Timestamp) Iterator {
 	iter := &batchIterator{
 		batch: r,
 	}
-	iter.iter.initTimeBound(r.batch, start, end, r)
+	iter.iter.initTimeBound(r.batch, start, end, withStats, r)
 	return iter
 }
 
@@ -1759,6 +1787,10 @@ func (r *rocksDBBatch) commitInternal(sync bool) error {
 	return nil
 }
 
+func (r *rocksDBBatch) Empty() bool {
+	return r.flushes == 0 && r.builder.Empty()
+}
+
 func (r *rocksDBBatch) Repr() []byte {
 	if r.flushes == 0 {
 		// We've never flushed to C++. Return the mutations only.
@@ -1832,13 +1864,15 @@ var iterPool = sync.Pool{
 // instance. If snapshotHandle is not nil, uses the indicated snapshot.
 // The caller must call rocksDBIterator.Close() when finished with the
 // iterator to free up resources.
-func newRocksDBIterator(rdb *C.DBEngine, prefix bool, engine Reader, parent *RocksDB) Iterator {
+func newRocksDBIterator(
+	rdb *C.DBEngine, opts IterOptions, engine Reader, parent *RocksDB,
+) Iterator {
 	// In order to prevent content displacement, caching is disabled
 	// when performing scans. Any options set within the shared read
 	// options field that should be carried over needs to be set here
 	// as well.
 	r := iterPool.Get().(*rocksDBIterator)
-	r.init(rdb, prefix, engine, parent)
+	r.init(rdb, opts, engine, parent)
 	return r
 }
 
@@ -1846,7 +1880,7 @@ func (r *rocksDBIterator) getIter() *C.DBIterator {
 	return r.iter
 }
 
-func (r *rocksDBIterator) init(rdb *C.DBEngine, prefix bool, engine Reader, parent *RocksDB) {
+func (r *rocksDBIterator) init(rdb *C.DBEngine, opts IterOptions, engine Reader, parent *RocksDB) {
 	r.parent = parent
 	if debugIteratorLeak && r.parent != nil {
 		r.parent.iters.Lock()
@@ -1854,15 +1888,17 @@ func (r *rocksDBIterator) init(rdb *C.DBEngine, prefix bool, engine Reader, pare
 		r.parent.iters.Unlock()
 	}
 
-	r.iter = C.DBNewIter(rdb, C.bool(prefix))
+	r.iter = C.DBNewIter(rdb, C.bool(opts.Prefix), C.bool(opts.WithStats))
 	if r.iter == nil {
 		panic("unable to create iterator")
 	}
 	r.engine = engine
 }
 
-func (r *rocksDBIterator) initTimeBound(rdb *C.DBEngine, start, end hlc.Timestamp, engine Reader) {
-	r.iter = C.DBNewTimeBoundIter(rdb, goToCTimestamp(start), goToCTimestamp(end))
+func (r *rocksDBIterator) initTimeBound(
+	rdb *C.DBEngine, start, end hlc.Timestamp, withStats bool, engine Reader,
+) {
+	r.iter = C.DBNewTimeBoundIter(rdb, goToCTimestamp(start), goToCTimestamp(end), C.bool(withStats))
 	if r.iter == nil {
 		panic("unable to create iterator")
 	}
@@ -1886,6 +1922,15 @@ func (r *rocksDBIterator) destroy() {
 }
 
 // The following methods implement the Iterator interface.
+
+func (r *rocksDBIterator) Stats() IteratorStats {
+	stats := C.DBIterStats(r.iter)
+	return IteratorStats{
+		TimeBoundNumSSTs:           int(C.ulonglong(stats.timebound_num_ssts)),
+		InternalDeleteSkippedCount: int(C.ulonglong(stats.internal_delete_skipped_count)),
+	}
+}
+
 func (r *rocksDBIterator) Close() {
 	r.destroy()
 	iterPool.Put(r)
@@ -2385,7 +2430,7 @@ func dbIterate(
 	if !start.Less(end) {
 		return nil
 	}
-	it := newRocksDBIterator(rdb, false, engine, nil)
+	it := newRocksDBIterator(rdb, IterOptions{}, engine, nil)
 	defer it.Close()
 
 	it.Seek(start)
@@ -2438,9 +2483,15 @@ func (fr *RocksDBSstFileReader) IngestExternalFile(data []byte) error {
 	if err := fr.rocksDB.WriteFile(filename, data); err != nil {
 		return err
 	}
+
+	cPaths := make([]*C.char, 1)
+	cPaths[0] = C.CString(filename)
+	cPathLen := C.size_t(len(cPaths))
+	defer C.free(unsafe.Pointer(cPaths[0]))
+
 	const noMove, modify = false, true
-	return statusToError(C.DBIngestExternalFile(
-		fr.rocksDB.rdb, goToCSlice([]byte(filename)), noMove, modify,
+	return statusToError(C.DBIngestExternalFiles(
+		fr.rocksDB.rdb, &cPaths[0], cPathLen, noMove, modify,
 	))
 }
 
@@ -2456,8 +2507,8 @@ func (fr *RocksDBSstFileReader) Iterate(
 }
 
 // NewIterator returns an iterator over this sst reader.
-func (fr *RocksDBSstFileReader) NewIterator(prefix bool) Iterator {
-	return newRocksDBIterator(fr.rocksDB.rdb, prefix, fr.rocksDB, fr.rocksDB.RocksDB)
+func (fr *RocksDBSstFileReader) NewIterator(opts IterOptions) Iterator {
+	return newRocksDBIterator(fr.rocksDB.rdb, opts, fr.rocksDB, fr.rocksDB.RocksDB)
 }
 
 // Close finishes the reader.
@@ -2549,18 +2600,64 @@ func (r *RocksDB) setAuxiliaryDir(d string) error {
 	return nil
 }
 
-// IngestExternalFile links a file into the RocksDB log-structured merge-tree.
-func (r *RocksDB) IngestExternalFile(
-	ctx context.Context, path string, allowFileModification bool,
+// IngestExternalFiles atomically links a slice of files into the RocksDB
+// log-structured merge-tree.
+func (r *RocksDB) IngestExternalFiles(
+	ctx context.Context, paths []string, allowFileModifications bool,
 ) error {
-	return statusToError(C.DBIngestExternalFile(
-		r.rdb, goToCSlice([]byte(path)), C._Bool(true), C._Bool(allowFileModification),
+	cPaths := make([]*C.char, len(paths))
+	for i := range paths {
+		cPaths[i] = C.CString(paths[i])
+	}
+	defer func() {
+		for i := range cPaths {
+			C.free(unsafe.Pointer(cPaths[i]))
+		}
+	}()
+
+	return statusToError(C.DBIngestExternalFiles(
+		r.rdb,
+		&cPaths[0],
+		C.size_t(len(cPaths)),
+		C._Bool(true), // move_files
+		C._Bool(allowFileModifications),
 	))
 }
 
 // WriteFile writes data to a file in this RocksDB's env.
 func (r *RocksDB) WriteFile(filename string, data []byte) error {
 	return statusToError(C.DBEnvWriteFile(r.rdb, goToCSlice([]byte(filename)), goToCSlice(data)))
+}
+
+// OpenFile opens a DBFile, which is essentially a rocksdb WritableFile
+// with the given filename, in this RocksDB's env.
+func (r *RocksDB) OpenFile(filename string) (DBFile, error) {
+	var file C.DBWritableFile
+	if err := statusToError(C.DBEnvOpenFile(r.rdb, goToCSlice([]byte(filename)), &file)); err != nil {
+		return nil, notFoundErrOrDefault(err)
+	}
+	return &rocksdbFile{file: file, rdb: r.rdb}, nil
+}
+
+// ReadFile reads the content from a file with the given filename. The file
+// must have been opened through Engine.OpenFile. Otherwise an error will be
+// returned.
+func (r *RocksDB) ReadFile(filename string) ([]byte, error) {
+	var data C.DBSlice
+	if err := statusToError(C.DBEnvReadFile(r.rdb, goToCSlice([]byte(filename)), &data)); err != nil {
+		return nil, notFoundErrOrDefault(err)
+	}
+	defer C.free(unsafe.Pointer(data.data))
+	return cSliceToGoBytes(data), nil
+}
+
+// DeleteFile deletes the file with the given filename from this RocksDB's env.
+// If the file with given filename doesn't exist, return os.ErrNotExist.
+func (r *RocksDB) DeleteFile(filename string) error {
+	if err := statusToError(C.DBEnvDeleteFile(r.rdb, goToCSlice([]byte(filename)))); err != nil {
+		return notFoundErrOrDefault(err)
+	}
+	return nil
 }
 
 // IsValidSplitKey returns whether the key is a valid split key. Certain key
@@ -2607,4 +2704,43 @@ func mvccScanDecodeKeyValue(repr []byte) (key MVCCKey, value []byte, orepr []byt
 	repr = repr[keySize+valSize:]
 	key, err = DecodeKey(rawKey)
 	return key, value, repr, err
+}
+
+func notFoundErrOrDefault(err error) error {
+	if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "File not found") {
+		return os.ErrNotExist
+	}
+	return err
+}
+
+// DBFile is an interface for interacting with DBWritableFile in RocksDB.
+type DBFile interface {
+	// Append appends data to this DBFile.
+	Append(data []byte) error
+	// Close closes this DBFile.
+	Close() error
+	// Sync synchronously flushes this DBFile's data to disk.
+	Sync() error
+}
+
+// rocksdbFile implements DBFile interface. It is used to interact with the
+// DBWritableFile in the corresponding RocksDB env.
+type rocksdbFile struct {
+	file C.DBWritableFile
+	rdb  *C.DBEngine
+}
+
+// Append implements the DBFile interface.
+func (f *rocksdbFile) Append(data []byte) error {
+	return statusToError(C.DBEnvAppendFile(f.rdb, f.file, goToCSlice(data)))
+}
+
+// Close implements the DBFile interface.
+func (f *rocksdbFile) Close() error {
+	return statusToError(C.DBEnvCloseFile(f.rdb, f.file))
+}
+
+// Sync implements the DBFile interface.
+func (f *rocksdbFile) Sync() error {
+	return statusToError(C.DBEnvSyncFile(f.rdb, f.file))
 }

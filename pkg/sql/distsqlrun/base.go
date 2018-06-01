@@ -22,12 +22,14 @@ import (
 
 	opentracing "github.com/opentracing/opentracing-go"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 const rowChannelBufSize = 16
@@ -82,11 +84,29 @@ type RowReceiver interface {
 	ProducerDone()
 }
 
-// RowSource is any component of a flow that produces rows that cam be consumed
+// RowSource is any component of a flow that produces rows that can be consumed
 // by another component.
+//
+// Communication components generally (e.g. RowBuffer, RowChannel) implement
+// this interface. Some processors also implement it (in addition to
+// implementing the Processor interface) - in which case those
+// processors can be "fused" with their consumer (i.e. run in the consumer's
+// goroutine).
 type RowSource interface {
 	// OutputTypes returns the schema for the rows in this source.
 	OutputTypes() []sqlbase.ColumnType
+
+	// Start prepares the RowSource for future Next() calls and takes in the
+	// context in which these future calls should operate. Start needs to be
+	// called before Next/ConsumerDone/ConsumerClosed.
+	//
+	// RowSources that consume other RowSources are expected to Start() their
+	// inputs.
+	//
+	// Implementations are expected to hold on to the provided context. They may
+	// chose to derive and annotate it (Processors generally do). For convenience,
+	// the possibly updated context is returned.
+	Start(context.Context) context.Context
 
 	// Next returns the next record from the source. At most one of the return
 	// values will be non-empty. Both of them can be empty when the RowSource has
@@ -103,7 +123,9 @@ type RowSource interface {
 	// producers). Therefore, consumers need to be aware that some rows might have
 	// been skipped in case they continue to consume rows. Usually a consumer
 	// should react to an error by calling ConsumerDone(), thus asking the
-	// RowSource to drain, and separately discard any future data rows.
+	// RowSource to drain, and separately discard any future data rows. A consumer
+	// receiving an error should also call ConsumerDone() on any other input it
+	// has.
 	Next() (sqlbase.EncDatumRow, *ProducerMetadata)
 
 	// ConsumerDone lets the source know that we will not need any more data
@@ -130,6 +152,8 @@ type RowSource interface {
 
 // Run reads records from the source and outputs them to the receiver, properly
 // draining the source of metadata and closing both the source and receiver.
+//
+// src needs to have been Start()ed before calling this.
 func Run(ctx context.Context, src RowSource, dst RowReceiver) {
 	for {
 		row, meta := src.Next()
@@ -200,9 +224,34 @@ func getTraceData(ctx context.Context) []tracing.RecordedSpan {
 	return nil
 }
 
+// sendTraceData collects the tracing information from the ctx and pushes it to
+// dst. The ConsumerStatus returned by dst is ignored.
+//
+// Note that the tracing data is distinct between different processors, since
+// each one gets its own trace "recording group".
 func sendTraceData(ctx context.Context, dst RowReceiver) {
 	if rec := getTraceData(ctx); rec != nil {
 		dst.Push(nil /* row */, &ProducerMetadata{TraceData: rec})
+	}
+}
+
+// sendTxnCoordMetaMaybe reads the txn metadata from a leaf transactions and
+// sends it to dst, so that it eventually makes it to the root txn. The
+// ConsumerStatus returned by dst is ignored.
+//
+// If the txn is a root txn, this is a no-op.
+//
+// NOTE(andrei): As of 04/2018, the txn is shared by all processors scheduled on
+// a node, and so it's possible for multiple processors to send the same
+// TxnCoordMeta. The root TxnCoordSender doesn't care if it receives the same
+// thing multiple times.
+func sendTxnCoordMetaMaybe(txn *client.Txn, dst RowReceiver) {
+	if txn.Type() == client.RootTxn {
+		return
+	}
+	txnMeta := txn.GetTxnCoordMeta()
+	if txnMeta.Txn.ID != (uuid.UUID{}) {
+		dst.Push(nil /* row */, &ProducerMetadata{TxnMeta: &txnMeta})
 	}
 }
 
@@ -215,10 +264,20 @@ func sendTraceData(ctx context.Context, dst RowReceiver) {
 // metadata. This is intended to have been the error, if any, that caused the
 // draining.
 //
+// pushTrailingMeta is called after draining the sources and before calling
+// dst.ProducerDone(). It gives the caller the opportunity to push some trailing
+// metadata (e.g. tracing information and txn updates, if applicable).
+//
 // srcs can be nil.
 //
 // All errors are forwarded to the producer.
-func DrainAndClose(ctx context.Context, dst RowReceiver, cause error, srcs ...RowSource) {
+func DrainAndClose(
+	ctx context.Context,
+	dst RowReceiver,
+	cause error,
+	pushTrailingMeta func(context.Context),
+	srcs ...RowSource,
+) {
 	if cause != nil {
 		// We ignore the returned ConsumerStatus and rely on the
 		// DrainAndForwardMetadata() calls below to close srcs in all cases.
@@ -236,7 +295,7 @@ func DrainAndClose(ctx context.Context, dst RowReceiver, cause error, srcs ...Ro
 		DrainAndForwardMetadata(ctx, srcs[0], dst)
 		wg.Wait()
 	}
-	sendTraceData(ctx, dst)
+	pushTrailingMeta(ctx)
 	dst.ProducerDone()
 }
 
@@ -301,6 +360,10 @@ type ProducerMetadata struct {
 	// to be sent from leaf transactions to augment the root transaction,
 	// held by the flow's ultimate receiver.
 	TxnMeta *roachpb.TxnCoordMeta
+	// RowNum corresponds to a row produced by a "source" processor that takes no
+	// inputs. It is used in tests to verify that all metadata is forwarded
+	// exactly once to the receiver on the gateway node.
+	RowNum *RemoteProducerMetadata_RowNum
 }
 
 // RowChannel is a thin layer over a RowChannelMsg channel, which can be used to
@@ -359,6 +422,9 @@ func (rc *RowChannel) ProducerDone() {
 func (rc *RowChannel) OutputTypes() []sqlbase.ColumnType {
 	return rc.types
 }
+
+// Start is part of the RowSource interface.
+func (rc *RowChannel) Start(ctx context.Context) context.Context { return ctx }
 
 // Next is part of the RowSource interface.
 func (rc *RowChannel) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
@@ -427,6 +493,12 @@ func (mrc *MultiplexedRowChannel) ProducerDone() {
 // OutputTypes is part of the RowSource interface.
 func (mrc *MultiplexedRowChannel) OutputTypes() []sqlbase.ColumnType {
 	return mrc.rowChan.types
+}
+
+// Start is part of the RowSource interface.
+func (mrc *MultiplexedRowChannel) Start(ctx context.Context) context.Context {
+	mrc.rowChan.Start(ctx)
+	return ctx
 }
 
 // Next is part of the RowSource interface.
@@ -559,7 +631,7 @@ func (rb *RowBuffer) Push(row sqlbase.EncDatumRow, meta *ProducerMetadata) Consu
 	return status
 }
 
-// ProducerDone is part of the interface.
+// ProducerDone is part of the RowSource interface.
 func (rb *RowBuffer) ProducerDone() {
 	if rb.ProducerClosed {
 		panic("RowBuffer already closed")
@@ -574,6 +646,9 @@ func (rb *RowBuffer) OutputTypes() []sqlbase.ColumnType {
 	}
 	return rb.types
 }
+
+// Start is part of the RowSource interface.
+func (rb *RowBuffer) Start(ctx context.Context) context.Context { return ctx }
 
 // Next is part of the RowSource interface.
 //

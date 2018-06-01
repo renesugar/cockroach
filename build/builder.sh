@@ -3,7 +3,7 @@
 set -euo pipefail
 
 image=cockroachdb/builder
-version=20180220-200046
+version=20180504-124046
 
 function init() {
   docker build --tag="${image}" "$(dirname "${0}")/builder"
@@ -155,7 +155,11 @@ if [ "${BUILDER_HIDE_GOPATH_SRC:-}" != "1" ]; then
 fi
 vols="${vols} --volume=${cockroach_toplevel}:/go/src/github.com/cockroachdb/cockroach${cached_volume_mode}"
 
-mkdir -p "${cockroach_toplevel}"/bin.docker_amd64
+# If ${cockroach_toplevel}/bin doesn't exist on the host, Docker creates it as
+# root unless it already exists. Create it first as the invoking user.
+# (This is a bug in the Docker daemon that only occurs when bind-mounted volumes
+# are nested, as they are here.)
+mkdir -p "${cockroach_toplevel}"/bin{.docker_amd64,}
 vols="${vols} --volume=${cockroach_toplevel}/bin.docker_amd64:/go/src/github.com/cockroachdb/cockroach/bin${delegated_volume_mode}"
 
 mkdir -p "${gocache}"/docker/bin

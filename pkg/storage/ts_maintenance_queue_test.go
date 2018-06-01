@@ -237,24 +237,21 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	// periods; this simplifies verification.
 	seriesName := "test.metric"
 	sourceName := "source1"
-	// "now" is five minutes in the past to avoid any sort of shenanigans with the
-	// various adjustments we make in the very-recent-past to create consistent
-	// graphs.
-	now := tsrv.Clock().PhysicalNow() - int64(5*time.Minute)
+	now := tsrv.Clock().PhysicalNow()
 	nearPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 2)
 	farPast := now - (tsdb.PruneThreshold(ts.Resolution10s) * 4)
 	sampleDuration := ts.Resolution10s.SampleDuration()
 	datapoints := []tspb.TimeSeriesDatapoint{
 		{
-			TimestampNanos: farPast - farPast%sampleDuration + sampleDuration/2,
+			TimestampNanos: farPast - farPast%sampleDuration,
 			Value:          100.0,
 		},
 		{
-			TimestampNanos: nearPast - (nearPast)%sampleDuration + sampleDuration/2,
+			TimestampNanos: nearPast - (nearPast)%sampleDuration,
 			Value:          200.0,
 		},
 		{
-			TimestampNanos: now - now%sampleDuration + sampleDuration/2,
+			TimestampNanos: now - now%sampleDuration,
 			Value:          300.0,
 		},
 	}
@@ -290,8 +287,16 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 	)
 	memMon.Start(context.TODO(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer memMon.Stop(context.TODO())
-	acc := memMon.MakeBoundAccount()
-	defer acc.Close(context.TODO())
+	memContext := ts.MakeQueryMemoryContext(
+		&memMon,
+		&memMon,
+		ts.QueryMemoryOptions{
+			BudgetBytes:             math.MaxInt64 / 8,
+			EstimatedSources:        1,
+			InterpolationLimitNanos: 0,
+		},
+	)
+	defer memContext.Close(context.TODO())
 
 	// getDatapoints queries all datapoints in the series from the beginning
 	// of time to a point in the near future.
@@ -300,12 +305,13 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 			context.TODO(),
 			tspb.Query{Name: seriesName},
 			ts.Resolution10s,
-			ts.Resolution10s.SampleDuration(),
-			0,
-			now+ts.Resolution10s.SlabDuration(),
-			0,
-			&acc,
-			&memMon,
+			ts.QueryTimespan{
+				SampleDurationNanos: ts.Resolution10s.SampleDuration(),
+				StartNanos:          0,
+				EndNanos:            now + ts.Resolution10s.SlabDuration(),
+				NowNanos:            now + (10 * time.Hour).Nanoseconds(),
+			},
+			memContext,
 		)
 		return dps, err
 	}

@@ -48,7 +48,7 @@ func ResolveIntentRange(
 	}
 
 	intent := roachpb.Intent{
-		Span:   args.Span,
+		Span:   args.Span(),
 		Txn:    args.IntentTxn,
 		Status: args.Status,
 	}
@@ -56,7 +56,7 @@ func ResolveIntentRange(
 	// Use a time-bounded iterator as an optimization if indicated.
 	var iterAndBuf engine.IterAndBuf
 	if args.MinTimestamp != (hlc.Timestamp{}) {
-		iter := batch.NewTimeBoundIterator(args.MinTimestamp, args.IntentTxn.Timestamp)
+		iter := batch.NewTimeBoundIterator(args.MinTimestamp, args.IntentTxn.Timestamp, false)
 		iterAndBuf = engine.GetBufUsingIter(iter)
 	} else {
 		iterAndBuf = engine.GetIterAndBuf(batch)

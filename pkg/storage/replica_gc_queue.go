@@ -135,7 +135,8 @@ func (rgcq *replicaGCQueue) shouldQueue(
 
 	var isCandidate bool
 	if raftStatus := repl.RaftStatus(); raftStatus != nil {
-		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate)
+		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate ||
+			raftStatus.SoftState.RaftState == raft.StatePreCandidate)
 	} else {
 		// If a replica doesn't have an active raft group, we should check whether
 		// we're decommissioning. If so, we should process the replica because it
@@ -253,6 +254,6 @@ func (*replicaGCQueue) timer(_ time.Duration) time.Duration {
 }
 
 // purgatoryChan returns nil.
-func (*replicaGCQueue) purgatoryChan() <-chan struct{} {
+func (*replicaGCQueue) purgatoryChan() <-chan time.Time {
 	return nil
 }

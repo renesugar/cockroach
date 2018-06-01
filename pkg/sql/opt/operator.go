@@ -18,10 +18,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
-
-//go:generate optgen -out operator.og.go ops ops/scalar.opt ops/relational.opt ops/enforcer.opt
 
 // Operator describes the type of operation that a memo expression performs.
 // Some operators are relational (join, select, project) and others are scalar
@@ -43,85 +40,42 @@ func (i Operator) String() string {
 	return opNames[opIndexes[i]:opIndexes[i+1]]
 }
 
-// FuncOpDef defines the value of the Def private field of the Function
-// operator. It provides the name and return type of the function, as well as a
-// pointer to an already resolved builtin overload definition.
-type FuncOpDef struct {
-	Name     string
-	Type     types.T
-	Overload *tree.Builtin
-}
-
-func (f FuncOpDef) String() string {
-	return f.Name
-}
-
-// ScanOpDef defines the value of the Def private field of the Scan operator.
-type ScanOpDef struct {
-	// Table identifies the table to scan. It is an index that can be passed to
-	// the Metadata.Table method in order to fetch optbase.Table metadata.
-	Table TableIndex
-
-	// Cols specifies the set of columns that the scan operator projects. This
-	// may be a subset of the columns that the table contains.
-	Cols ColSet
-}
-
-// SetOpColMap defines the value of the ColMap private field of the set
-// operators: Union, Intersect, Except, UnionAll, IntersectAll and ExceptAll.
-// It matches columns from the left and right inputs of the operator
-// with the output columns, since OutputCols are not ordered and may
-// not correspond to each other.
-//
-// For example, consider the following query:
-//   SELECT y, x FROM xy UNION SELECT b, a FROM ab
-//
-// Given:
-//   col  index
-//   x    1
-//   y    2
-//   a    3
-//   b    4
-//
-// SetOpColMap will contain the following values:
-//   Left:  [2, 1]
-//   Right: [4, 3]
-//   Out:   [5, 6]  <-- synthesized output columns
-type SetOpColMap struct {
-	Left  ColList
-	Right ColList
-	Out   ColList
-}
+// ComparisonOpMap maps from a semantic tree comparison operator type to an
+// optimizer operator type.
+var ComparisonOpMap [tree.NumComparisonOperators]Operator
 
 // ComparisonOpReverseMap maps from an optimizer operator type to a semantic
 // tree comparison operator type.
-var ComparisonOpReverseMap = [...]tree.ComparisonOperator{
-	EqOp:           tree.EQ,
-	LtOp:           tree.LT,
-	GtOp:           tree.GT,
-	LeOp:           tree.LE,
-	GeOp:           tree.GE,
-	NeOp:           tree.NE,
-	InOp:           tree.In,
-	NotInOp:        tree.NotIn,
-	LikeOp:         tree.Like,
-	NotLikeOp:      tree.NotLike,
-	ILikeOp:        tree.ILike,
-	NotILikeOp:     tree.NotILike,
-	SimilarToOp:    tree.SimilarTo,
-	NotSimilarToOp: tree.NotSimilarTo,
-	RegMatchOp:     tree.RegMatch,
-	NotRegMatchOp:  tree.NotRegMatch,
-	RegIMatchOp:    tree.RegIMatch,
-	NotRegIMatchOp: tree.NotRegIMatch,
-	IsOp:           tree.IsNotDistinctFrom,
-	IsNotOp:        tree.IsDistinctFrom,
-	ContainsOp:     tree.Contains,
+var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperator{
+	EqOp:             tree.EQ,
+	LtOp:             tree.LT,
+	GtOp:             tree.GT,
+	LeOp:             tree.LE,
+	GeOp:             tree.GE,
+	NeOp:             tree.NE,
+	InOp:             tree.In,
+	NotInOp:          tree.NotIn,
+	LikeOp:           tree.Like,
+	NotLikeOp:        tree.NotLike,
+	ILikeOp:          tree.ILike,
+	NotILikeOp:       tree.NotILike,
+	SimilarToOp:      tree.SimilarTo,
+	NotSimilarToOp:   tree.NotSimilarTo,
+	RegMatchOp:       tree.RegMatch,
+	NotRegMatchOp:    tree.NotRegMatch,
+	RegIMatchOp:      tree.RegIMatch,
+	NotRegIMatchOp:   tree.NotRegIMatch,
+	IsOp:             tree.IsNotDistinctFrom,
+	IsNotOp:          tree.IsDistinctFrom,
+	ContainsOp:       tree.Contains,
+	JsonExistsOp:     tree.JSONExists,
+	JsonSomeExistsOp: tree.JSONSomeExists,
+	JsonAllExistsOp:  tree.JSONAllExists,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
 // binary operator type.
-var BinaryOpReverseMap = [...]tree.BinaryOperator{
+var BinaryOpReverseMap = map[Operator]tree.BinaryOperator{
 	BitandOp:        tree.Bitand,
 	BitorOp:         tree.Bitor,
 	BitxorOp:        tree.Bitxor,
@@ -143,7 +97,75 @@ var BinaryOpReverseMap = [...]tree.BinaryOperator{
 
 // UnaryOpReverseMap maps from an optimizer operator type to a semantic tree
 // unary operator type.
-var UnaryOpReverseMap = [...]tree.UnaryOperator{
+var UnaryOpReverseMap = map[Operator]tree.UnaryOperator{
 	UnaryMinusOp:      tree.UnaryMinus,
 	UnaryComplementOp: tree.UnaryComplement,
+}
+
+// AggregateOpReverseMap maps from an optimizer operator type to the name of an
+// aggregation function.
+var AggregateOpReverseMap = map[Operator]string{
+	AnyNotNullOp: "any_not_null",
+	ArrayAggOp:   "array_agg",
+	AvgOp:        "avg",
+	BoolAndOp:    "bool_and",
+	BoolOrOp:     "bool_or",
+	ConcatAggOp:  "concat_agg",
+	CountOp:      "count",
+	CountRowsOp:  "count_rows",
+	MaxOp:        "max",
+	MinOp:        "min",
+	SumIntOp:     "sum_int",
+	SumOp:        "sum",
+	SqrDiffOp:    "sqrdiff",
+	VarianceOp:   "variance",
+	StdDevOp:     "stddev",
+	XorAggOp:     "xor_agg",
+	JsonAggOp:    "json_agg",
+	JsonbAggOp:   "jsonb_agg",
+}
+
+// NegateOpMap maps from a comparison operator type to its negated operator
+// type, as if the Not operator was applied to it. Some comparison operators,
+// like Contains and JsonExists, do not have negated versions.
+var NegateOpMap = map[Operator]Operator{
+	EqOp:           NeOp,
+	LtOp:           GeOp,
+	GtOp:           LeOp,
+	LeOp:           GtOp,
+	GeOp:           LtOp,
+	NeOp:           EqOp,
+	InOp:           NotInOp,
+	NotInOp:        InOp,
+	LikeOp:         NotLikeOp,
+	NotLikeOp:      LikeOp,
+	ILikeOp:        NotILikeOp,
+	NotILikeOp:     ILikeOp,
+	SimilarToOp:    NotSimilarToOp,
+	NotSimilarToOp: SimilarToOp,
+	RegMatchOp:     NotRegMatchOp,
+	NotRegMatchOp:  RegMatchOp,
+	RegIMatchOp:    NotRegIMatchOp,
+	NotRegIMatchOp: RegIMatchOp,
+	IsOp:           IsNotOp,
+	IsNotOp:        IsOp,
+}
+
+// BoolOperatorRequiresNotNullArgs returns true if the operator can never
+// evaluate to true if one of its children is NULL.
+func BoolOperatorRequiresNotNullArgs(op Operator) bool {
+	switch op {
+	case
+		EqOp, LtOp, LeOp, GtOp, GeOp, NeOp,
+		LikeOp, NotLikeOp, ILikeOp, NotILikeOp, SimilarToOp, NotSimilarToOp,
+		RegMatchOp, NotRegMatchOp, RegIMatchOp, NotRegIMatchOp:
+		return true
+	}
+	return false
+}
+
+func init() {
+	for optOp, treeOp := range ComparisonOpReverseMap {
+		ComparisonOpMap[treeOp] = optOp
+	}
 }

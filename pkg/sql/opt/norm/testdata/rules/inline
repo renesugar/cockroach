@@ -1,0 +1,213 @@
+exec-ddl
+CREATE TABLE a (k INT PRIMARY KEY, i INT, f FLOAT, s STRING, j JSON)
+----
+TABLE a
+ ├── k int not null
+ ├── i int
+ ├── f float
+ ├── s string
+ ├── j jsonb
+ └── INDEX primary
+      └── k int not null
+
+exec-ddl
+CREATE TABLE xy (x INT PRIMARY KEY, y INT)
+----
+TABLE xy
+ ├── x int not null
+ ├── y int
+ └── INDEX primary
+      └── x int not null
+
+# --------------------------------------------------
+# PushSelectIntoInlinableProject
+# --------------------------------------------------
+
+# Inline comparison.
+opt
+SELECT * FROM (SELECT k=1 AS expr FROM a) a WHERE expr IS NULL
+----
+project
+ ├── columns: expr:6(bool)
+ ├── select
+ │    ├── columns: k:1(int!null)
+ │    ├── keys: (1)
+ │    ├── scan a
+ │    │    ├── columns: k:1(int!null)
+ │    │    └── keys: (1)
+ │    └── filters [type=bool, outer=(1)]
+ │         └── (a.k = 1) IS NULL [type=bool, outer=(1)]
+ └── projections [outer=(1)]
+      └── a.k = 1 [type=bool, outer=(1)]
+
+# Inline arithmetic.
+opt
+SELECT * FROM (SELECT k*2+1 AS expr FROM a) a WHERE expr > 10
+----
+project
+ ├── columns: expr:6(int)
+ ├── select
+ │    ├── columns: k:1(int!null)
+ │    ├── keys: (1)
+ │    ├── scan a
+ │    │    ├── columns: k:1(int!null)
+ │    │    └── keys: (1)
+ │    └── filters [type=bool, outer=(1)]
+ │         └── ((a.k * 2) + 1) > 10 [type=bool, outer=(1)]
+ └── projections [outer=(1)]
+      └── (a.k * 2) + 1 [type=int, outer=(1)]
+
+# Inline boolean logic.
+opt
+SELECT * FROM (SELECT NOT(k>1 AND k<=5) AS expr FROM a) a WHERE expr
+----
+project
+ ├── columns: expr:6(bool)
+ ├── scan a
+ │    ├── columns: k:1(int!null)
+ │    ├── constraint: /1: [ - /1] [/6 - ]
+ │    └── keys: (1)
+ └── projections [outer=(1)]
+      └── (a.k <= 1) OR (a.k > 5) [type=bool, outer=(1)]
+
+# Inline constants.
+opt
+SELECT * FROM (SELECT (f IS NULL OR f != 10.5) AS expr FROM a) a WHERE expr
+----
+project
+ ├── columns: expr:6(bool)
+ ├── select
+ │    ├── columns: f:3(float)
+ │    ├── scan a
+ │    │    └── columns: f:3(float)
+ │    └── filters [type=bool, outer=(3)]
+ │         └── (a.f IS NULL) OR (a.f != 10.5) [type=bool, outer=(3)]
+ └── projections [outer=(3)]
+      └── (a.f IS NULL) OR (a.f != 10.5) [type=bool, outer=(3)]
+
+# Reference the expression to inline multiple times.
+opt
+SELECT * FROM (SELECT f+1 AS expr FROM a) a WHERE expr=expr
+----
+project
+ ├── columns: expr:6(float)
+ ├── select
+ │    ├── columns: f:3(float)
+ │    ├── scan a
+ │    │    └── columns: f:3(float)
+ │    └── filters [type=bool, outer=(3)]
+ │         └── (a.f + 1.0) = (a.f + 1.0) [type=bool, outer=(3)]
+ └── projections [outer=(3)]
+      └── a.f + 1.0 [type=float, outer=(3)]
+
+# Use outer references in both inlined expression and in referencing expression.
+opt
+SELECT * FROM a WHERE EXISTS(SELECT * FROM (SELECT (x-i) AS expr FROM xy) WHERE expr > i*i)
+----
+semi-join
+ ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ ├── keys: (1)
+ ├── scan a
+ │    ├── columns: k:1(int!null) i:2(int) f:3(float) s:4(string) j:5(jsonb)
+ │    └── keys: (1)
+ ├── scan xy
+ │    ├── columns: x:6(int!null)
+ │    └── keys: (6)
+ └── filters [type=bool, outer=(2,6)]
+      └── (xy.x - a.i) > (a.i * a.i) [type=bool, outer=(2,6)]
+
+# --------------------------------------------------
+# InlineProjectInProject
+# --------------------------------------------------
+opt
+SELECT expr, i+1 FROM (SELECT k=1 AS expr, i FROM a)
+----
+project
+ ├── columns: expr:6(bool) "i + 1":7(int)
+ ├── scan a
+ │    ├── columns: k:1(int!null) i:2(int)
+ │    └── keys: (1)
+ └── projections [outer=(1,2)]
+      ├── a.i + 1 [type=int, outer=(2)]
+      └── a.k = 1 [type=bool, outer=(1)]
+
+# Inline multiple expressions.
+opt
+SELECT expr+1, i, expr2 || 'bar' FROM (SELECT k+1 AS expr, s || 'foo' AS expr2, i FROM a)
+----
+project
+ ├── columns: "expr + 1":8(int) i:2(int) "expr2 || 'bar'":9(string)
+ ├── scan a
+ │    ├── columns: k:1(int!null) i:2(int) s:4(string)
+ │    └── keys: (1)
+ └── projections [outer=(1,2,4)]
+      ├── (a.k + 1) + 1 [type=int, outer=(1)]
+      └── (a.s || 'foo') || 'bar' [type=string, outer=(4)]
+
+# Don't inline when there are multiple references.
+opt
+SELECT expr, expr*2 FROM (SELECT k+1 AS expr FROM a)
+----
+project
+ ├── columns: expr:6(int) "expr * 2":7(int)
+ ├── project
+ │    ├── columns: expr:6(int)
+ │    ├── scan a
+ │    │    ├── columns: k:1(int!null)
+ │    │    └── keys: (1)
+ │    └── projections [outer=(1)]
+ │         └── a.k + 1 [type=int, outer=(1)]
+ └── projections [outer=(6)]
+      └── expr * 2 [type=int, outer=(6)]
+
+# Uncorrelated subquery should not block inlining.
+opt
+SELECT EXISTS(SELECT * FROM xy WHERE x=1 OR x=2), expr*2 FROM (SELECT k+1 AS expr FROM a)
+----
+project
+ ├── columns: "EXISTS (SELECT * FROM xy WHERE (x = 1) OR (x = 2))":9(bool) "expr * 2":10(int)
+ ├── scan a
+ │    ├── columns: k:1(int!null)
+ │    └── keys: (1)
+ └── projections [outer=(1)]
+      ├── exists [type=bool]
+      │    └── scan xy
+      │         ├── columns: x:7(int!null) y:8(int)
+      │         ├── constraint: /7: [/1 - /2]
+      │         └── keys: (7)
+      └── (a.k + 1) * 2 [type=int, outer=(1)]
+
+# Correlated subquery should be hoisted as usual.
+opt
+SELECT EXISTS(SELECT * FROM xy WHERE expr<0) FROM (SELECT k+1 AS expr FROM a)
+----
+project
+ ├── columns: "EXISTS (SELECT * FROM xy WHERE expr < 0)":9(bool)
+ ├── group-by
+ │    ├── columns: exists_agg:11(bool) rownum:12(int!null)
+ │    ├── grouping columns: rownum:12(int!null)
+ │    ├── keys: (12)
+ │    ├── left-join
+ │    │    ├── columns: expr:6(int) true:10(bool) rownum:12(int!null)
+ │    │    ├── row-number
+ │    │    │    ├── columns: expr:6(int) rownum:12(int!null)
+ │    │    │    ├── keys: (12)
+ │    │    │    └── project
+ │    │    │         ├── columns: expr:6(int)
+ │    │    │         ├── scan a
+ │    │    │         │    ├── columns: k:1(int!null)
+ │    │    │         │    └── keys: (1)
+ │    │    │         └── projections [outer=(1)]
+ │    │    │              └── a.k + 1 [type=int, outer=(1)]
+ │    │    ├── project
+ │    │    │    ├── columns: true:10(bool!null)
+ │    │    │    ├── scan xy
+ │    │    │    └── projections
+ │    │    │         └── true [type=bool]
+ │    │    └── filters [type=bool, outer=(6), constraints=(/6: (/NULL - /-1]; tight)]
+ │    │         └── expr < 0 [type=bool, outer=(6), constraints=(/6: (/NULL - /-1]; tight)]
+ │    └── aggregations [outer=(10)]
+ │         └── exists-agg [type=bool, outer=(10)]
+ │              └── variable: true [type=bool, outer=(10)]
+ └── projections [outer=(11)]
+      └── variable: exists_agg [type=bool, outer=(11)]

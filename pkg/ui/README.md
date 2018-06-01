@@ -17,6 +17,8 @@ Our UI is compiled using a collection of tools that depends on
 [Node.js](https://nodejs.org/) and are managed with
 [Yarn](https://yarnpkg.com), a package manager that offers more deterministic
 package installation than NPM. NodeJS 6.x and Yarn 0.22.0 are known to work.
+[Chrome](https://www.google.com/chrome/), Google's internet browser. Unit tests
+are run using Chrome's "Headless" mode.
 
 With Node and Yarn installed, bootstrap local development by running `make` in
 this directory. This will run `yarn install` to install our Node dependencies,
@@ -46,6 +48,14 @@ $ make watch TARGET=<target-cluster-http-uri>
 ```
 
 then navigate to `http://localhost:3000` to access the UI.
+
+To proxy to a cluster started up in secure mode, use:
+
+```shell
+$ make watch-secure TARGET=<target-cluster-https-uri>
+```
+
+then navigate to `https://localhost:3000` to access the UI.
 
 While the proxy is running, any changes you make in the `src` directory will
 trigger an automatic recompilation of the UI. This recompilation should be much

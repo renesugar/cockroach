@@ -15,29 +15,32 @@
 package debug
 
 import (
+	"context"
 	"expvar"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
 
 	// Register the net/trace endpoint with http.DefaultServeMux.
 
+	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
 	"golang.org/x/net/trace"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/pkg/errors"
+	"github.com/rcrowley/go-metrics"
+	"github.com/rcrowley/go-metrics/exp"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
-	"github.com/rcrowley/go-metrics"
-	"github.com/rcrowley/go-metrics/exp"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
-var origTraceAuthRequest = trace.AuthRequest
-
 func init() {
-	// Disable the net/trace auth handler. We saved it (in origTraceAuthRequest)
-	// and will consult it as appropriate.
+	// Disable the net/trace auth handler.
 	trace.AuthRequest = func(r *http.Request) (allowed, sensitive bool) {
 		return true, true
 	}
@@ -58,11 +61,13 @@ const (
 // Endpoint is the entry point under which the debug tools are housed.
 const Endpoint = "/debug/"
 
-var debugRemote = settings.RegisterValidatedStringSetting(
+// DebugRemote controls which clients are allowed to access certain
+// confidential debug pages, such as those served under the /debug/ prefix.
+var DebugRemote = settings.RegisterValidatedStringSetting(
 	"server.remote_debugging.mode",
 	"set to enable remote debugging, localhost-only or disable (any, local, off)",
 	"local",
-	func(s string) error {
+	func(sv *settings.Values, s string) error {
 		switch RemoteMode(strings.ToLower(s)) {
 		case RemoteOff, RemoteLocal, RemoteAny:
 			return nil
@@ -107,6 +112,9 @@ func NewServer(st *cluster.Settings) *Server {
 	// Also register /debug/vars (even though /debug/metrics is better).
 	mux.Handle("/debug/vars", expvar.Handler())
 
+	// Register the stopper endpoint, which lists all active tasks.
+	mux.HandleFunc("/debug/stopper", stop.HandleDebug)
+
 	// Set up the log spy, a tool that allows inspecting filtered logs at high
 	// verbosity.
 	spy := logSpy{
@@ -114,11 +122,15 @@ func NewServer(st *cluster.Settings) *Server {
 	}
 	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
+	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0))
+	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
+
 	return &Server{
 		st:  st,
 		mux: mux,
 		spy: spy,
 	}
+
 }
 
 // ServeHTTP serves various tools under the /debug endpoint. It restricts access
@@ -136,18 +148,55 @@ func (ds *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // authRequest restricts access to /debug/*.
 func (ds *Server) authRequest(r *http.Request) bool {
-	allow, _ := origTraceAuthRequest(r)
+	return authRequest(r.RemoteAddr, ds.st)
+}
 
-	switch RemoteMode(strings.ToLower(debugRemote.Get(&ds.st.SV))) {
+// authRequest restricts access according to the DebugRemote setting.
+func authRequest(remoteAddr string, st *cluster.Settings) bool {
+	switch RemoteMode(strings.ToLower(DebugRemote.Get(&st.SV))) {
 	case RemoteAny:
-		allow = true
+		return true
 	case RemoteLocal:
-		// Default behavior of trace.AuthRequest.
-		break
+		return isLocalhost(remoteAddr)
 	default:
-		allow = false
+		return false
 	}
-	return allow
+}
+
+// isLocalhost returns true if the remoteAddr represents a client talking to
+// us via localhost.
+func isLocalhost(remoteAddr string) bool {
+	// RemoteAddr is commonly in the form "IP" or "IP:port".
+	// If it is in the form "IP:port", split off the port.
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+// GatewayRemoteAllowed returns whether a request that has been passed through
+// the grpc gateway should be allowed accessed to privileged debugging
+// information. Because this function assumes the presence of a context field
+// populated by the grpc gateway, it's not applicable for other uses.
+func GatewayRemoteAllowed(ctx context.Context, st *cluster.Settings) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		// This should only happen for direct grpc connections, which are allowed.
+		return true
+	}
+	peerAddr, ok := md["x-forwarded-for"]
+	if !ok || len(peerAddr) == 0 {
+		// This should only happen for direct grpc connections, which are allowed.
+		return true
+	}
+
+	return authRequest(peerAddr[0], st)
 }
 
 func handleLanding(w http.ResponseWriter, r *http.Request) {

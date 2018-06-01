@@ -23,13 +23,14 @@ import (
 	"strings"
 	"sync"
 
+	opentracing "github.com/opentracing/opentracing-go"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
 )
 
 const asyncTaskNamePrefix = "[async] "
@@ -64,7 +65,8 @@ var trackedStoppers struct {
 	stoppers []*Stopper
 }
 
-func handleDebug(w http.ResponseWriter, r *http.Request) {
+// HandleDebug responds with the list of stopper tasks actively running.
+func HandleDebug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	trackedStoppers.Lock()
 	defer trackedStoppers.Unlock()
@@ -73,10 +75,6 @@ func handleDebug(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%p: %d tasks\n%s", s, s.mu.numTasks, s.runningTasksLocked())
 		s.mu.Unlock()
 	}
-}
-
-func init() {
-	http.Handle("/debug/stopper", http.HandlerFunc(handleDebug))
 }
 
 // Closer is an interface for objects to attach to the stopper to
@@ -291,7 +289,7 @@ func (s *Stopper) RunLimitedAsyncTask(
 		if !wait {
 			return ErrThrottled
 		}
-		log.Infof(ctx, "stopper throttling task from %s due to semaphore", taskName)
+		log.Eventf(ctx, "stopper throttling task from %s due to semaphore", taskName)
 		// Retry the select without the default.
 		select {
 		case sem <- struct{}{}:

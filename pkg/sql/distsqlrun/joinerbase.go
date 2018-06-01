@@ -42,8 +42,13 @@ type joinerBase struct {
 	numMergedEqualityColumns int
 }
 
+// init initializes the joinerBase.
+//
+// opts is passed along to the underlying processorBase. The zero value is used
+// if the processor using the joinerBase is not implementing RowSource.
 func (jb *joinerBase) init(
 	flowCtx *FlowCtx,
+	processorID int32,
 	leftTypes []sqlbase.ColumnType,
 	rightTypes []sqlbase.ColumnType,
 	jType sqlbase.JoinType,
@@ -53,22 +58,13 @@ func (jb *joinerBase) init(
 	numMergedColumns uint32,
 	post *PostProcessSpec,
 	output RowReceiver,
+	opts procStateOpts,
 ) error {
 	jb.joinType = jType
 
-	numLeftCols, numRightCols := len(leftTypes), len(rightTypes)
-	if post != nil {
-		if post.Projection {
-			numLeftCols, numRightCols = len(post.OutputColumns), len(post.OutputColumns)
-		} else if post.RenderExprs != nil {
-			numLeftCols, numRightCols = len(post.RenderExprs), len(post.RenderExprs)
-		}
-	}
 	if isSetOpJoin(jb.joinType) {
-		if err := isValidSetOpJoin(
-			onExpr, numLeftCols, numRightCols, len(leftEqColumns),
-		); err != nil {
-			return err
+		if onExpr.Expr != "" {
+			return errors.Errorf("expected empty onExpr, got %v", onExpr.Expr)
 		}
 	}
 
@@ -109,11 +105,12 @@ func (jb *joinerBase) init(
 	}
 	outputTypes := condTypes[:outputSize]
 
-	evalCtx := flowCtx.NewEvalCtx()
-	if err := jb.onCond.init(onExpr, condTypes, evalCtx); err != nil {
+	if err := jb.processorBase.init(
+		post, outputTypes, flowCtx, processorID, output, opts,
+	); err != nil {
 		return err
 	}
-	return jb.processorBase.init(post, outputTypes, flowCtx, evalCtx, output)
+	return jb.onCond.init(onExpr, condTypes, jb.evalCtx)
 }
 
 type joinSide uint8
@@ -161,18 +158,6 @@ func shouldIncludeRightColsInOutput(joinType sqlbase.JoinType) bool {
 
 func isSetOpJoin(joinType sqlbase.JoinType) bool {
 	return joinType == sqlbase.IntersectAllJoin || joinType == sqlbase.ExceptAllJoin
-}
-
-func isValidSetOpJoin(onExpr Expression, numLeftCols int, numRightCols int, numEqCols int) error {
-	if onExpr.Expr != "" {
-		return errors.Errorf("expected empty onExpr, got %v", onExpr.Expr)
-	}
-	if numLeftCols != numEqCols || numRightCols != numEqCols {
-		return errors.Errorf(
-			"expected %v left and right columns, got %v left and %v right columns",
-			numEqCols, numLeftCols, numRightCols)
-	}
-	return nil
 }
 
 // shouldEmitUnmatchedRow determines if we should emit am ummatched row (with

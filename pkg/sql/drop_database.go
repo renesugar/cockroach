@@ -47,6 +47,10 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, errEmptyDatabaseName
 	}
 
+	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("DROP DATABASE on current database")
+	}
+
 	// Check that the database exists.
 	var dbDesc *DatabaseDescriptor
 	var err error
@@ -168,10 +172,10 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 		int32(n.dbDesc.ID),
 		int32(params.extendedEvalCtx.NodeID),
 		struct {
-			DatabaseName          string
-			Statement             string
-			User                  string
-			DroppedTablesAndViews []string
+			DatabaseName         string
+			Statement            string
+			User                 string
+			DroppedSchemaObjects []string
 		}{n.n.Name.String(), n.n.String(), p.SessionData().User, tbNameStrings},
 	)
 }

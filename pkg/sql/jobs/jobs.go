@@ -60,6 +60,7 @@ type Details interface{}
 var _ Details = BackupDetails{}
 var _ Details = RestoreDetails{}
 var _ Details = SchemaChangeDetails{}
+var _ Details = ChangefeedDetails{}
 
 // Record stores the job fields that are not automatically managed by Job.
 type Record struct {
@@ -106,6 +107,16 @@ type InvalidStatusError struct {
 
 func (e *InvalidStatusError) Error() string {
 	return fmt.Sprintf("cannot %s %s job (id %d)", e.op, e.status, e.id)
+}
+
+// SimplifyInvalidStatusError unwraps an *InvalidStatusError into an error
+// message suitable for users. Other errors are returned as passed.
+func SimplifyInvalidStatusError(err error) error {
+	ierr, ok := err.(*InvalidStatusError)
+	if !ok {
+		return err
+	}
+	return errors.Errorf("job %s", ierr.status)
 }
 
 // ID returns the ID of the job that this Job is currently tracking. This will
@@ -339,7 +350,7 @@ func (j *Job) load(ctx context.Context) error {
 	var payload *Payload
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		const stmt = "SELECT payload FROM system.jobs WHERE id = $1"
-		row, err := j.registry.ex.QueryRowInTransaction(ctx, "log-job", txn, stmt, *j.id)
+		row, err := j.registry.ex.QueryRow(ctx, "log-job", txn, stmt, *j.id)
 		if err != nil {
 			return err
 		}
@@ -374,7 +385,7 @@ func (j *Job) insert(ctx context.Context, id int64, payload *Payload) error {
 		}
 
 		const stmt = "INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)"
-		_, err = j.registry.ex.ExecuteStatementInTransaction(ctx, "job-insert", txn, stmt, id, StatusPending, payloadBytes)
+		_, err = j.registry.ex.Exec(ctx, "job-insert", txn, stmt, id, StatusPending, payloadBytes)
 		return err
 	}); err != nil {
 		return err
@@ -394,7 +405,7 @@ func (j *Job) update(
 	var payload *Payload
 	if err := j.runInTxn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		const selectStmt = "SELECT status, payload FROM system.jobs WHERE id = $1"
-		row, err := j.registry.ex.QueryRowInTransaction(ctx, "log-job", txn, selectStmt, *j.id)
+		row, err := j.registry.ex.QueryRow(ctx, "log-job", txn, selectStmt, *j.id)
 		if err != nil {
 			return err
 		}
@@ -424,8 +435,7 @@ func (j *Job) update(
 
 		const updateStmt = "UPDATE system.jobs SET status = $1, payload = $2 WHERE id = $3"
 		updateArgs := []interface{}{status, payloadBytes, *j.id}
-		n, err := j.registry.ex.ExecuteStatementInTransaction(
-			ctx, "job-update", txn, updateStmt, updateArgs...)
+		n, err := j.registry.ex.Exec(ctx, "job-update", txn, updateStmt, updateArgs...)
 		if err != nil {
 			return err
 		}
@@ -476,6 +486,8 @@ func detailsType(d isPayload_Details) Type {
 		return TypeSchemaChange
 	case *Payload_Import:
 		return TypeImport
+	case *Payload_Changefeed:
+		return TypeChangefeed
 	default:
 		panic(fmt.Sprintf("Payload.Type called on a payload with an unknown details type: %T", d))
 	}
@@ -498,6 +510,8 @@ func WrapPayloadDetails(details Details) interface {
 		return &Payload_SchemaChange{SchemaChange: &d}
 	case ImportDetails:
 		return &Payload_Import{Import: &d}
+	case ChangefeedDetails:
+		return &Payload_Changefeed{Changefeed: &d}
 	default:
 		panic(fmt.Sprintf("jobs.WrapPayloadDetails: unknown details type %T", d))
 	}
@@ -519,6 +533,8 @@ func (p *Payload) UnwrapDetails() (Details, error) {
 		return *d.SchemaChange, nil
 	case *Payload_Import:
 		return *d.Import, nil
+	case *Payload_Changefeed:
+		return *d.Changefeed, nil
 	default:
 		return nil, errors.Errorf("jobs.Payload: unsupported details type %T", d)
 	}

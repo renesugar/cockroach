@@ -919,7 +919,9 @@ func (*DString) AmbiguousFormat() bool { return true }
 // Format implements the NodeFormatter interface.
 func (d *DString) Format(ctx *FmtCtx) {
 	buf, f := ctx.Buffer, ctx.flags
-	if f.HasFlags(fmtWithinArray) {
+	if f.HasFlags(fmtUnicodeStrings) {
+		buf.WriteString(string(*d))
+	} else if f.HasFlags(fmtWithinArray) {
 		lex.EncodeSQLStringInsideArray(buf, string(*d))
 	} else {
 		lex.EncodeSQLStringWithFlags(buf, string(*d), f.EncodeFlags())
@@ -1063,6 +1065,25 @@ type DBytes string
 // argument.
 func NewDBytes(d DBytes) *DBytes {
 	return &d
+}
+
+// MustBeDBytes attempts to convert an Expr into a DBytes, panicking if unsuccessful.
+func MustBeDBytes(e Expr) DBytes {
+	i, ok := AsDBytes(e)
+	if !ok {
+		panic(pgerror.NewErrorf(pgerror.CodeInternalError, "expected *DBytes, found %T", e))
+	}
+	return i
+}
+
+// AsDBytes attempts to convert an Expr into a DBytes, returning a flag indicating
+// whether it was successful.
+func AsDBytes(e Expr) (DBytes, bool) {
+	switch t := e.(type) {
+	case *DBytes:
+		return *t, true
+	}
+	return "", false
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1387,7 +1408,7 @@ func (*DIPAddr) Max(_ *EvalContext) (Datum, bool) {
 
 // AmbiguousFormat implements the Datum interface.
 func (*DIPAddr) AmbiguousFormat() bool {
-	return false
+	return true
 }
 
 // Format implements the NodeFormatter interface.
@@ -1550,17 +1571,7 @@ func (d *DTime) Compare(ctx *EvalContext, other Datum) int {
 		// NULL is less than any non-NULL value.
 		return 1
 	}
-	v, ok := other.(*DTime)
-	if !ok {
-		panic(makeUnsupportedComparisonMessage(d, other))
-	}
-	if *d < *v {
-		return -1
-	}
-	if *v < *d {
-		return 1
-	}
-	return 0
+	return compareTimestamps(ctx, d, other)
 }
 
 // Prev implements the Datum interface.
@@ -1616,6 +1627,118 @@ func (d *DTime) Format(ctx *FmtCtx) {
 
 // Size implements the Datum interface.
 func (d *DTime) Size() uintptr {
+	return unsafe.Sizeof(*d)
+}
+
+// DTimeTZ is the time with time zone Datum.
+type DTimeTZ struct {
+	timeofday.TimeOfDay
+	*time.Location
+}
+
+// ToTime converts a DTimeTZ to a time.Time, using the Unix epoch as the date.
+func (d *DTimeTZ) ToTime() time.Time {
+	t := d.TimeOfDay.ToTime().In(d.Location)
+	tSeconds := t.Unix() * int64(time.Second)
+	_, tOffset := t.Zone()
+	tNanos := int64(t.Nanosecond())
+	nanos := tSeconds - int64(tOffset)*int64(time.Second) + tNanos
+	return timeutil.Unix(0, nanos).In(d.Location)
+}
+
+// MakeDTimeTZ creates a DTimeTZ from a TimeOfDay and time.Location.
+func MakeDTimeTZ(t timeofday.TimeOfDay, loc *time.Location) *DTimeTZ {
+	d := DTimeTZ{t, loc}
+	return &d
+}
+
+// ParseDTimeTZ parses and returns the *DTime Datum value represented by the
+// provided string, or an error if parsing is unsuccessful.
+func ParseDTimeTZ(s string, loc *time.Location) (*DTimeTZ, error) {
+	t, err := parseTimestampInLocation("1970-01-01 "+s, loc, types.TimeTZ)
+	if err != nil {
+		// Build our own error message to avoid exposing the dummy date.
+		return nil, makeParseError(s, types.TimeTZ, nil)
+	}
+	return MakeDTimeTZ(timeofday.FromTime(t), t.Location()), nil
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (*DTimeTZ) ResolvedType() types.T {
+	return types.TimeTZ
+}
+
+// Compare implements the Datum interface.
+func (d *DTimeTZ) Compare(ctx *EvalContext, other Datum) int {
+	if other == DNull {
+		// NULL is less than any non-NULL value.
+		return 1
+	}
+	return compareTimestamps(ctx, d, other)
+}
+
+// Prev implements the Datum interface.
+func (d *DTimeTZ) Prev(_ *EvalContext) (Datum, bool) {
+	prev := DTimeTZ{d.TimeOfDay - 1, d.Location}
+	return &prev, true
+}
+
+// Next implements the Datum interface.
+func (d *DTimeTZ) Next(_ *EvalContext) (Datum, bool) {
+	next := DTimeTZ{d.TimeOfDay + 1, d.Location}
+	return &next, true
+}
+
+// IsMax implements the Datum interface.
+func (d *DTimeTZ) IsMax(_ *EvalContext) bool {
+	t := d.ToTime()
+	tNext := t.Add(time.Microsecond)
+	return t.After(tNext)
+}
+
+// IsMin implements the Datum interface.
+func (d *DTimeTZ) IsMin(_ *EvalContext) bool {
+	t := d.ToTime()
+	tPrev := t.Add(-time.Microsecond)
+	return t.Before(tPrev)
+}
+
+// Max implements the Datum interface.
+func (d *DTimeTZ) Max(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// Min implements the Datum interface.
+func (d *DTimeTZ) Min(_ *EvalContext) (Datum, bool) {
+	return nil, false
+}
+
+// AmbiguousFormat implements the Datum interface.
+func (*DTimeTZ) AmbiguousFormat() bool { return false }
+
+// Format implements the NodeFormatter interface.
+func (d *DTimeTZ) Format(ctx *FmtCtx) {
+	f := ctx.flags
+	bareStrings := f.HasFlags(FmtFlags(lex.EncBareStrings))
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+
+	ds := d.ToTime().String()
+	// Get the time zone information, eg. -05:00
+	tz := strings.Split(ds, " ")[2]
+	tz = tz[0:3] + ":" + tz[3:]
+	tod := d.TimeOfDay.String()
+	ds = tod + tz
+
+	ctx.WriteString(ds)
+	if !bareStrings {
+		ctx.WriteByte('\'')
+	}
+}
+
+// Size implements the Datum interface.
+func (d *DTimeTZ) Size() uintptr {
 	return unsafe.Sizeof(*d)
 }
 
@@ -1768,6 +1891,10 @@ func timeFromDatum(ctx *EvalContext, d Datum) (time.Time, bool) {
 		return t.Time, true
 	case *DTimestamp:
 		return t.Time, true
+	case *DTimeTZ:
+		return t.ToTime(), true
+	case *DTime:
+		return timeofday.TimeOfDay(*t).ToTime(), true
 	default:
 		return time.Time{}, false
 	}
@@ -2282,6 +2409,10 @@ func (d *DJSON) Format(ctx *FmtCtx) {
 	// TODO(justin): ideally the JSON string encoder should know it needs to
 	// escape things to be inside SQL strings in order to avoid this allocation.
 	s := d.JSON.String()
+	if ctx.flags.HasFlags(fmtUnicodeStrings) {
+		ctx.Buffer.WriteString(s)
+		return
+	}
 	lex.EncodeSQLStringWithFlags(ctx.Buffer, s, ctx.flags.EncodeFlags())
 }
 
@@ -2331,9 +2462,9 @@ func AsDTuple(e Expr) (*DTuple, bool) {
 
 // ResolvedType implements the TypedExpr interface.
 func (d *DTuple) ResolvedType() types.T {
-	typ := make(types.TTuple, len(d.D))
+	typ := types.TTuple{Types: make([]types.T, len(d.D))}
 	for i, v := range d.D {
-		typ[i] = v.ResolvedType()
+		typ.Types[i] = v.ResolvedType()
 	}
 	return typ
 }
@@ -2476,6 +2607,7 @@ func (d *DTuple) IsMin(ctx *EvalContext) bool {
 func (*DTuple) AmbiguousFormat() bool { return false }
 
 // Format implements the NodeFormatter interface.
+// TODO(bram): We don't format tuples in the same way as postgres. See #25522.
 func (d *DTuple) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&d.D)
 }
@@ -2746,7 +2878,11 @@ func (d *DArray) IsMin(_ *EvalContext) bool {
 }
 
 // AmbiguousFormat implements the Datum interface.
-func (*DArray) AmbiguousFormat() bool { return false }
+func (d *DArray) AmbiguousFormat() bool {
+	// The type of the array is ambiguous if it is empty; when serializing we need
+	// to annotate it with the type.
+	return len(d.Array) == 0
+}
 
 // Format implements the NodeFormatter interface.
 func (d *DArray) Format(ctx *FmtCtx) {
@@ -3224,7 +3360,7 @@ func DatumTypeSize(t types.T) (uintptr, bool) {
 	case types.TTuple:
 		sz := uintptr(0)
 		variable := false
-		for _, typ := range ty {
+		for _, typ := range ty.Types {
 			typsz, typvariable := DatumTypeSize(typ)
 			sz += typsz
 			variable = variable || typvariable
@@ -3266,6 +3402,7 @@ var baseDatumTypeSizes = map[types.T]struct {
 	types.Bytes:       {unsafe.Sizeof(DBytes("")), variableSize},
 	types.Date:        {unsafe.Sizeof(DDate(0)), fixedSize},
 	types.Time:        {unsafe.Sizeof(DTime(0)), fixedSize},
+	types.TimeTZ:      {unsafe.Sizeof(DTimeTZ{}), fixedSize},
 	types.Timestamp:   {unsafe.Sizeof(DTimestamp{}), fixedSize},
 	types.TimestampTZ: {unsafe.Sizeof(DTimestampTZ{}), fixedSize},
 	types.Interval:    {unsafe.Sizeof(DInterval{}), fixedSize},

@@ -186,6 +186,36 @@ type ColumnResolutionResult interface {
 	ColumnResolutionResult()
 }
 
+// Resolve performs name resolution for a qualified star using a resolver.
+func (a *AllColumnsSelector) Resolve(
+	ctx context.Context, r ColumnItemResolver,
+) (srcName *TableName, srcMeta ColumnSourceMeta, err error) {
+	prefix := makeTableNameFromUnresolvedName(&a.TableName)
+
+	// Is there a data source with this prefix?
+	var res NumResolutionResults
+	res, srcName, srcMeta, err = r.FindSourceMatchingName(ctx, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if res == NoResults && a.TableName.NumParts == 2 {
+		// No, but name of form db.tbl.*?
+		// Special rule for compatibility with CockroachDB v1.x:
+		// search name db.public.tbl.* instead.
+		prefix.ExplicitCatalog = true
+		prefix.CatalogName = prefix.SchemaName
+		prefix.SchemaName = PublicSchemaName
+		res, srcName, srcMeta, err = r.FindSourceMatchingName(ctx, prefix)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if res == NoResults {
+		return nil, nil, newSourceNotFoundError("no data source matches pattern: %s", a)
+	}
+	return srcName, srcMeta, nil
+}
+
 // Resolve performs name resolution for a column item using a resolver.
 func (c *ColumnItem) Resolve(
 	ctx context.Context, r ColumnItemResolver,
@@ -257,7 +287,6 @@ func (t *TableName) ResolveExisting(
 ) (bool, NameResolutionResult, error) {
 	if t.ExplicitSchema {
 		if t.ExplicitCatalog {
-			// log.VEventf(ctx, 2, "full name already resolved: %q", t)
 			// Already 3 parts: nothing to search. Delegate to the resolver.
 			return r.LookupObject(ctx, t.Catalog(), t.Schema(), t.Table())
 		}
@@ -273,7 +302,6 @@ func (t *TableName) ResolveExisting(
 			if err == nil {
 				t.CatalogName = Name(curDb)
 			}
-			// log.VEventf(ctx, 2, "two part lookup: %+v // %v", t, err)
 			return found, objMeta, err
 		}
 		// No luck so far. Compatibility with CockroachDB v1.1: try D.public.T instead.
@@ -283,7 +311,6 @@ func (t *TableName) ResolveExisting(
 				t.SchemaName = PublicSchemaName
 				t.ExplicitCatalog = true
 			}
-			// log.VEventf(ctx, 2, "two part lookup compat: %+v // %v", t, err)
 			return found, objMeta, err
 		}
 		// Welp, really haven't found anything.
@@ -298,7 +325,6 @@ func (t *TableName) ResolveExisting(
 				t.CatalogName = Name(curDb)
 				t.SchemaName = Name(next)
 			}
-			// log.VEventf(ctx, 2, "one part lookup: %+v // %v", t, err)
 			return found, objMeta, err
 		}
 	}
@@ -312,7 +338,6 @@ func (t *TableName) ResolveTarget(
 ) (found bool, scMeta SchemaMeta, err error) {
 	if t.ExplicitSchema {
 		if t.ExplicitCatalog {
-			// log.VEventf(ctx, 2, "full target already resolved: %q", t)
 			// Already 3 parts: nothing to do.
 			return r.LookupSchema(ctx, t.Catalog(), t.Schema())
 		}
@@ -322,7 +347,6 @@ func (t *TableName) ResolveTarget(
 			if err == nil {
 				t.CatalogName = Name(curDb)
 			}
-			// log.VEventf(ctx, 2, "two part target lookup: %+v // %v", t, err)
 			return found, scMeta, err
 		}
 		// No luck so far. Compatibility with CockroachDB v1.1: use D.public.T instead.
@@ -332,22 +356,22 @@ func (t *TableName) ResolveTarget(
 				t.SchemaName = PublicSchemaName
 				t.ExplicitCatalog = true
 			}
-			// log.VEventf(ctx, 2, "two part target lookup compat: %+v // %v", t, err)
 			return found, scMeta, err
 		}
 		// Welp, really haven't found anything.
 		return false, nil, nil
 	}
 
-	// This is a naked table name. Use the current schema = the first item in the search path.
-	hasFirst, firstSchema := searchPath.FirstSpecified()
-	if hasFirst {
-		if found, scMeta, err = r.LookupSchema(ctx, curDb, firstSchema); found || err != nil {
+	// This is a naked table name. Use the current schema = the first
+	// valid item in the search path.
+	iter := searchPath.IterWithoutImplicitPGCatalog()
+	for scName, ok := iter(); ok; scName, ok = iter() {
+		if found, scMeta, err = r.LookupSchema(ctx, curDb, scName); found || err != nil {
 			if err == nil {
 				t.CatalogName = Name(curDb)
-				t.SchemaName = Name(firstSchema)
+				t.SchemaName = Name(scName)
 			}
-			// log.VEventf(ctx, 2, "one part target lookup: %+v // %v", t, err)
+			break
 		}
 	}
 	return found, scMeta, err
@@ -384,14 +408,16 @@ func (tp *TableNamePrefix) Resolve(
 		// No luck.
 		return false, nil, nil
 	}
-	// This is a naked table name. Use the current schema = the first item in the search path.
-	hasFirst, firstSchema := searchPath.FirstSpecified()
-	if hasFirst {
-		if found, scMeta, err = r.LookupSchema(ctx, curDb, firstSchema); found || err != nil {
+	// This is a naked table name. Use the current schema = the first
+	// valid item in the search path.
+	iter := searchPath.IterWithoutImplicitPGCatalog()
+	for scName, ok := iter(); ok; scName, ok = iter() {
+		if found, scMeta, err = r.LookupSchema(ctx, curDb, scName); found || err != nil {
 			if err == nil {
 				tp.CatalogName = Name(curDb)
-				tp.SchemaName = Name(firstSchema)
+				tp.SchemaName = Name(scName)
 			}
+			break
 		}
 	}
 	return found, scMeta, err

@@ -57,6 +57,8 @@ type samplerProcessor struct {
 
 var _ Processor = &samplerProcessor{}
 
+const samplerProcName = "sampler"
+
 var supportedSketchTypes = map[SketchType]struct{}{
 	// The code currently hardcodes the use of this single type of sketch
 	// (which avoids the extra complexity until we actually have multiple types).
@@ -64,7 +66,12 @@ var supportedSketchTypes = map[SketchType]struct{}{
 }
 
 func newSamplerProcessor(
-	flowCtx *FlowCtx, spec *SamplerSpec, input RowSource, post *PostProcessSpec, output RowReceiver,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *SamplerSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	output RowReceiver,
 ) (*samplerProcessor, error) {
 	for _, s := range spec.Sketches {
 		if _, ok := supportedSketchTypes[s.SketchType]; !ok {
@@ -119,25 +126,35 @@ func newSamplerProcessor(
 	outTypes = append(outTypes, sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES})
 	s.outTypes = outTypes
 
-	if err := s.init(post, outTypes, flowCtx, nil /* evalCtx */, output); err != nil {
+	if err := s.init(
+		post, outTypes, flowCtx, processorID, output,
+		// this proc doesn't implement RowSource and doesn't use processorBase to drain
+		procStateOpts{},
+	); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
+func (s *samplerProcessor) pushTrailingMeta(ctx context.Context) {
+	sendTraceData(ctx, s.out.output)
+}
+
 // Run is part of the Processor interface.
-func (s *samplerProcessor) Run(wg *sync.WaitGroup) {
+func (s *samplerProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
-	ctx, span := processorSpan(s.flowCtx.Ctx, "sampler")
-	defer tracing.FinishSpan(span)
 
-	earlyExit, err := s.mainLoop(ctx)
+	s.input.Start(ctx)
+	s.startInternal(ctx, samplerProcName)
+	defer tracing.FinishSpan(s.span)
+
+	earlyExit, err := s.mainLoop(s.ctx)
 	if err != nil {
-		DrainAndClose(ctx, s.out.output, err, s.input)
+		DrainAndClose(s.ctx, s.out.output, err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		sendTraceData(ctx, s.out.output)
+		s.pushTrailingMeta(s.ctx)
 		s.input.ConsumerClosed()
 		s.out.Close()
 	}
@@ -150,7 +167,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, _ erro
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if !emitHelper(ctx, &s.out, nil /* row */, meta, s.input) {
+			if !emitHelper(ctx, &s.out, nil /* row */, meta, s.pushTrailingMeta, s.input) {
 				// No cleanup required; emitHelper() took care of it.
 				return true, nil
 			}
@@ -193,7 +210,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, _ erro
 	for _, sample := range s.sr.Get() {
 		copy(outRow, sample.Row)
 		outRow[s.rankCol] = sqlbase.EncDatum{Datum: tree.NewDInt(tree.DInt(sample.Rank))}
-		if !emitHelper(ctx, &s.out, outRow, nil /* meta */, s.input) {
+		if !emitHelper(ctx, &s.out, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
 			return true, nil
 		}
 	}
@@ -214,7 +231,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, _ erro
 			return false, err
 		}
 		outRow[s.sketchCol] = sqlbase.EncDatum{Datum: tree.NewDBytes(tree.DBytes(data))}
-		if !emitHelper(ctx, &s.out, outRow, nil /* meta */, s.input) {
+		if !emitHelper(ctx, &s.out, outRow, nil /* meta */, s.pushTrailingMeta, s.input) {
 			return true, nil
 		}
 	}

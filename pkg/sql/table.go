@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -59,7 +58,10 @@ type namespaceKey struct {
 // system.namespace.
 func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey, error) {
 	namespace := map[sqlbase.ID]namespaceKey{}
-	rows, _ /* cols */, err := p.queryRows(ctx, `SELECT id, "parentID", name FROM system.namespace`)
+	rows, _ /* cols */, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "get-all-names", p.txn,
+		`SELECT id, "parentID", name FROM system.namespace`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -135,10 +137,6 @@ type uncommittedDatabase struct {
 // end of each transaction on the session, or on hitting conditions such
 // as errors, or retries that result in transaction timestamp changes.
 type TableCollection struct {
-	// The timestamp used to pick tables. The timestamp falls within the
-	// validity window of every table in leasedTables.
-	timestamp hlc.Timestamp
-
 	// leaseMgr manages acquiring and releasing per-table leases.
 	leaseMgr *LeaseManager
 	// A collection of table descriptor valid for the timestamp.
@@ -155,6 +153,9 @@ type TableCollection struct {
 	// TableCollection and invisible to other transactions. A dropped
 	// table is marked dropped.
 	uncommittedTables []*sqlbase.TableDescriptor
+
+	// Map of tables created in the transaction.
+	createdTables map[sqlbase.ID]struct{}
 
 	// databaseCache is used as a cache for database names.
 	// TODO(andrei): get rid of it and replace it with a leasing system for
@@ -186,17 +187,6 @@ type dbCacheSubscriber interface {
 	waitForCacheState(cond func(*databaseCache) (bool, error)) error
 }
 
-// Check if the timestamp used so far to pick tables has changed because
-// of a transaction retry.
-func (tc *TableCollection) resetForTxnRetry(ctx context.Context, txn *client.Txn) {
-	if tc.timestamp != (hlc.Timestamp{}) &&
-		tc.timestamp != txn.OrigTimestamp() {
-		if err := tc.releaseTables(ctx, dontBlockForDBCacheUpdate); err != nil {
-			log.Warningf(ctx, "error releasing tables")
-		}
-	}
-}
-
 // getTableVersion returns a table descriptor with a version suitable for
 // the transaction: table.ModificationTime <= txn.Timestamp < expirationTime.
 // The table must be released by calling tc.releaseTables().
@@ -218,11 +208,6 @@ func (tc *TableCollection) getTableVersion(
 ) (*sqlbase.TableDescriptor, *sqlbase.DatabaseDescriptor, error) {
 	if log.V(2) {
 		log.Infof(ctx, "planner acquiring lease on table '%s'", tn)
-	}
-
-	if flags.allowAdding {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInternalError,
-			"programming error: unsupported flags passed to getTableVersion: %+v", flags)
 	}
 
 	if tn.SchemaName != tree.PublicSchemaName {
@@ -258,10 +243,6 @@ func (tc *TableCollection) getTableVersion(
 			return nil, nil, err
 		}
 	}
-
-	// If the txn has been pushed the table collection is released and
-	// txn deadline is reset.
-	tc.resetForTxnRetry(ctx, flags.txn)
 
 	if refuseFurtherLookup, table, err := tc.getUncommittedTable(
 		dbID, tn, flags.required); refuseFurtherLookup || err != nil {
@@ -299,7 +280,11 @@ func (tc *TableCollection) getTableVersion(
 		// know how to deal with, so propagate the error.
 		return nil, nil, err
 	}
-	tc.timestamp = origTimestamp
+
+	if !origTimestamp.Less(expiration) {
+		log.Fatalf(ctx, "bad table for T=%s, expiration=%s", origTimestamp, expiration)
+	}
+
 	tc.leasedTables = append(tc.leasedTables, table)
 	log.VEventf(ctx, 2, "added table '%s' to table collection", tn)
 
@@ -327,10 +312,6 @@ func (tc *TableCollection) getTableVersionByID(
 		}
 		return table, nil
 	}
-
-	// If the txn has been pushed the table collection is released and
-	// txn deadline is reset.
-	tc.resetForTxnRetry(ctx, txn)
 
 	for _, table := range tc.uncommittedTables {
 		if table.ID == tableID {
@@ -364,7 +345,11 @@ func (tc *TableCollection) getTableVersionByID(
 		}
 		return nil, err
 	}
-	tc.timestamp = origTimestamp
+
+	if !origTimestamp.Less(expiration) {
+		log.Fatalf(ctx, "bad table for T=%s, expiration=%s", origTimestamp, expiration)
+	}
+
 	tc.leasedTables = append(tc.leasedTables, table)
 	log.VEventf(ctx, 2, "added table '%s' to table collection", table.Name)
 
@@ -403,7 +388,6 @@ func (tc *TableCollection) releaseLeases(ctx context.Context) {
 
 // releaseTables releases all tables currently held by the TableCollection.
 func (tc *TableCollection) releaseTables(ctx context.Context, opt releaseOpt) error {
-	tc.timestamp = hlc.Timestamp{}
 	if len(tc.leasedTables) > 0 {
 		log.VEventf(ctx, 2, "releasing %d tables", len(tc.leasedTables))
 		for _, table := range tc.leasedTables {
@@ -414,25 +398,31 @@ func (tc *TableCollection) releaseTables(ctx context.Context, opt releaseOpt) er
 		tc.leasedTables = tc.leasedTables[:0]
 	}
 	tc.uncommittedTables = nil
+	tc.createdTables = nil
 
 	if opt == blockForDBCacheUpdate {
 		for _, uc := range tc.uncommittedDatabases {
 			if !uc.dropped {
 				continue
 			}
+			// Wait until the database cache has been updated to properly
+			// reflect a dropped database, so that future commands on the
+			// same gateway node observe the dropped database.
 			err := tc.dbCacheSubscriber.waitForCacheState(
 				func(dc *databaseCache) (bool, error) {
-					desc, err := dc.getCachedDatabaseDesc(uc.name, false /*required*/)
-					if err != nil {
-						return false, err
+					// Resolve the database name from the database cache.
+					dbID, err := dc.getDatabaseID(ctx,
+						tc.leaseMgr.execCfg.DB.Txn, uc.name, false /*required*/)
+					if err != nil || dbID == 0 {
+						// dbID can still be 0 if required is false and
+						// the database is not found.
+						return true, err
 					}
-					if desc == nil {
-						return true, nil
-					}
+
 					// If the database name still exists but it now references another
-					// db, we're good - it means that the database name has been reused
-					// within the same transaction.
-					return desc.ID != uc.id, nil
+					// db with a more recent id, we're good - it means that the database
+					// name has been reused.
+					return dbID > uc.id, nil
 				})
 			if err != nil {
 				return err
@@ -456,6 +446,19 @@ func (tc *TableCollection) addUncommittedTable(desc sqlbase.TableDescriptor) {
 	tc.releaseAllDescriptors()
 }
 
+func (tc *TableCollection) addCreatedTable(id sqlbase.ID) {
+	if tc.createdTables == nil {
+		tc.createdTables = make(map[sqlbase.ID]struct{})
+	}
+	tc.createdTables[id] = struct{}{}
+	tc.releaseAllDescriptors()
+}
+
+func (tc *TableCollection) isCreatedTable(id sqlbase.ID) bool {
+	_, ok := tc.createdTables[id]
+	return ok
+}
+
 type dbAction bool
 
 const (
@@ -475,7 +478,9 @@ func (tc *TableCollection) addUncommittedDatabase(name string, id sqlbase.ID, ac
 func (tc *TableCollection) getUncommittedDatabaseID(
 	requestedDbName string, required bool,
 ) (c bool, res sqlbase.ID, err error) {
-	// Walk latest to earliest.
+	// Walk latest to earliest so that a DROP DATABASE followed by a
+	// CREATE DATABASE with the same name will result in the CREATE DATABASE
+	// being seen.
 	for i := len(tc.uncommittedDatabases) - 1; i >= 0; i-- {
 		db := tc.uncommittedDatabases[i]
 		if requestedDbName == db.name {
@@ -502,7 +507,10 @@ func (tc *TableCollection) getUncommittedDatabaseID(
 func (tc *TableCollection) getUncommittedTable(
 	dbID sqlbase.ID, tn *tree.TableName, required bool,
 ) (refuseFurtherLookup bool, table *sqlbase.TableDescriptor, err error) {
-	for _, table := range tc.uncommittedTables {
+	// Walk latest to earliest so that a DROP TABLE followed by a CREATE TABLE
+	// with the same name will result in the CREATE TABLE being seen.
+	for i := len(tc.uncommittedTables) - 1; i >= 0; i-- {
+		table := tc.uncommittedTables[i]
 		// If a table has gotten renamed we'd like to disallow using the old names.
 		// The renames could have happened in another transaction but it's still okay
 		// to disallow the use of the old name in this transaction because the other
@@ -544,22 +552,29 @@ func (tc *TableCollection) getUncommittedTable(
 	return false, nil, nil
 }
 
+func (tc *TableCollection) getUncommittedTableByID(id sqlbase.ID) *sqlbase.TableDescriptor {
+	// Walk latest to earliest so that a DROP TABLE followed by a CREATE TABLE
+	// with the same name will result in the CREATE TABLE being seen.
+	for i := len(tc.uncommittedTables) - 1; i >= 0; i-- {
+		table := tc.uncommittedTables[i]
+		if table.ID == id {
+			return table
+		}
+	}
+	return nil
+}
+
 // getAllDescriptors returns all descriptors visible by the transaction,
 // first checking the TableCollection's cached descriptors for validity
 // before defaulting to a key-value scan, if necessary.
 func (tc *TableCollection) getAllDescriptors(
 	ctx context.Context, txn *client.Txn,
 ) ([]sqlbase.DescriptorProto, error) {
-	// If the txn has been pushed the table collection is released and txn
-	// deadline is reset.
-	tc.resetForTxnRetry(ctx, txn)
-
 	if tc.allDescriptors == nil {
 		descs, err := GetAllDescriptors(ctx, txn)
 		if err != nil {
 			return nil, err
 		}
-		tc.timestamp = txn.OrigTimestamp()
 		tc.allDescriptors = descs
 	}
 	return tc.allDescriptors, nil
@@ -616,6 +631,11 @@ func (p *planner) createSchemaChangeJob(
 func (p *planner) notifySchemaChange(
 	tableDesc *sqlbase.TableDescriptor, mutationID sqlbase.MutationID,
 ) {
+	if !tableDesc.UpVersion {
+		// If a version change has not been requested there is no pending
+		// schema change to be executed.
+		return
+	}
 	sc := SchemaChanger{
 		tableID:              tableDesc.GetID(),
 		mutationID:           mutationID,
@@ -638,6 +658,18 @@ func (p *planner) writeTableDesc(ctx context.Context, tableDesc *sqlbase.TableDe
 		return pgerror.NewErrorf(pgerror.CodeInternalError,
 			"programming error: virtual descriptors cannot be stored, found: %v", tableDesc)
 	}
+
+	if p.Tables().isCreatedTable(tableDesc.ID) {
+		if err := runSchemaChangesInTxn(ctx, p.txn, p.Tables(), p.execCfg, p.EvalContext(), tableDesc); err != nil {
+			return err
+		}
+	}
+
+	if err := tableDesc.ValidateTable(p.extendedEvalCtx.Settings); err != nil {
+		return pgerror.NewErrorf(pgerror.CodeInternalError,
+			"programming error: table descriptor is not valid: %s\n%v", err, tableDesc)
+	}
+
 	p.Tables().addUncommittedTable(*tableDesc)
 
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())

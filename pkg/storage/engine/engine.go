@@ -57,6 +57,12 @@ type SimpleIterator interface {
 	UnsafeValue() []byte
 }
 
+// IteratorStats is returned from (Iterator).Stats.
+type IteratorStats struct {
+	InternalDeleteSkippedCount int
+	TimeBoundNumSSTs           int
+}
+
 // Iterator is an interface for iterating over key/value pairs in an
 // engine. Iterator implementations are thread safe unless otherwise
 // noted.
@@ -116,6 +122,20 @@ type Iterator interface {
 	MVCCScan(start, end roachpb.Key, max int64, timestamp hlc.Timestamp,
 		txn *roachpb.Transaction, consistent, reverse, tombstone bool,
 	) (kvs []byte, numKvs int64, intents []byte, err error)
+
+	Stats() IteratorStats
+}
+
+// IterOptions contains options used to create an Iterator.
+type IterOptions struct {
+	// If Prefix is true, Seek will use the user-key prefix of
+	// the supplied MVCC key to restrict which sstables are searched,
+	// but iteration (using Next) over keys without the same user-key
+	// prefix will not work correctly (keys may be skipped)
+	Prefix bool
+	// If WithStats is true, the iterator accumulates RocksDB performance
+	// counters over its lifetime which can be queried via `Stats()`.
+	WithStats bool
 }
 
 // Reader is the read interface to an engine's data.
@@ -143,13 +163,10 @@ type Reader interface {
 	// an error, the iteration will stop and return the error.
 	// If the first result of f is true, the iteration stops.
 	Iterate(start, end MVCCKey, f func(MVCCKeyValue) (bool, error)) error
-	// NewIterator returns a new instance of an Iterator over this engine. When
-	// prefix is true, Seek will use the user-key prefix of the supplied MVCC key
-	// to restrict which sstables are searched, but iteration (using Next) over
-	// keys without the same user-key prefix will not work correctly (keys may be
-	// skipped). The caller must invoke Iterator.Close() when finished with the
-	// iterator to free resources.
-	NewIterator(prefix bool) Iterator
+	// NewIterator returns a new instance of an Iterator over this
+	// engine. The caller must invoke Iterator.Close() when finished
+	// with the iterator to free resources.
+	NewIterator(opts IterOptions) Iterator
 	// NewTimeBoundIterator is like NewIterator, but the underlying iterator will
 	// efficiently skip over SSTs that contain no MVCC keys in the time range
 	// [start, end].
@@ -158,7 +175,7 @@ type Reader interface {
 	// will frequently return keys outside of the [start, end] time range. If you
 	// must guarantee that you never see a key outside of the time bounds, perform
 	// your own filtering.
-	NewTimeBoundIterator(start, end hlc.Timestamp) Iterator
+	NewTimeBoundIterator(start, end hlc.Timestamp, withStats bool) Iterator
 }
 
 // Writer is the write interface to an engine's data.
@@ -253,12 +270,12 @@ type Engine interface {
 	// by invoking Close(). Note that snapshots must not be used after the
 	// original engine has been stopped.
 	NewSnapshot() Reader
-	// IngestExternalFile links a file into the RocksDB log-structured
-	// merge-tree. May modify the file (including the underlying file in
-	// the case of hard-links) if allowFileModification is passed as
-	// well. See additional comments in db.cc's IngestExternalFile
-	// explaining modification behavior.
-	IngestExternalFile(ctx context.Context, path string, allowFileModification bool) error
+	// IngestExternalFiles atomically links a slice of files into the RocksDB
+	// log-structured merge-tree. May modify the files (including the underlying
+	// file in the case of hard-links) if allowFileModifications is passed as
+	// well. See additional comments in db.cc's IngestExternalFile explaining
+	// modification behavior.
+	IngestExternalFiles(ctx context.Context, paths []string, allowFileModifications bool) error
 	// ApproximateDiskBytes returns an approximation of the on-disk size for the given key span.
 	ApproximateDiskBytes(from, to roachpb.Key) (uint64, error)
 	// CompactRange ensures that the specified range of key value pairs is
@@ -266,6 +283,13 @@ type Engine interface {
 	// that the key range is compacted all the way to the bottommost level of
 	// SSTables, which is necessary to pick up changes to bloom filters.
 	CompactRange(start, end roachpb.Key, forceBottommost bool) error
+	// OpenFile opens a DBFile with the given filename.
+	OpenFile(filename string) (DBFile, error)
+	// ReadFile reads the content from the file with the given filename int this RocksDB's env.
+	ReadFile(filename string) ([]byte, error)
+	// DeleteFile deletes the file with the given filename from this RocksDB's env.
+	// If the file with given filename doesn't exist, return os.ErrNotExist.
+	DeleteFile(filename string) error
 }
 
 // WithSSTables extends the Engine interface with a method to get info
@@ -292,6 +316,8 @@ type Batch interface {
 	// situations where we know all of the batched operations are for distinct
 	// keys.
 	Distinct() ReadWriter
+	// Empty returns whether the batch is empty or not.
+	Empty() bool
 	// Repr returns the underlying representation of the batch and can be used to
 	// reconstitute the batch on a remote node using Writer.ApplyBatchRepr().
 	Repr() []byte
@@ -319,6 +345,12 @@ type Stats struct {
 	Compactions                    int64
 	TableReadersMemEstimate        int64
 	PendingCompactionBytesEstimate int64
+}
+
+// EnvStats is a set of RocksDB env stats, including encryption status.
+type EnvStats struct {
+	// EncryptionStatus is a serialized enginepbccl/stats.proto::EncryptionStatus protobuf.
+	EncryptionStatus []byte
 }
 
 // PutProto sets the given key to the protobuf-serialized byte string

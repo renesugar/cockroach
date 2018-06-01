@@ -53,6 +53,10 @@ const (
 	// string address of the node. E.g. node:1 => 127.0.0.1:24001
 	KeyNodeIDPrefix = "node"
 
+	// KeyHealthAlertPrefix is the key prefix for gossiping health alerts. The
+	// value is a proto of type HealthCheckResult.
+	KeyNodeHealthAlertPrefix = "health-alert"
+
 	// KeyNodeLivenessPrefix is the key prefix for gossiping node liveness info.
 	KeyNodeLivenessPrefix = "liveness"
 
@@ -80,6 +84,11 @@ const (
 	// KeyDistSQLDrainingPrefix is the key prefix for each node's DistSQL
 	// draining state.
 	KeyDistSQLDrainingPrefix = "distsql-draining"
+
+	// KeyTableStatAddedPrefix is the prefix for keys that indicate a new table
+	// statistic was computed. The statistics themselves are not stored in gossip;
+	// the keys are used to notify nodes to invalidate table statistic caches.
+	KeyTableStatAddedPrefix = "table-stat-added"
 )
 
 // MakeKey creates a canonical key under which to gossip a piece of
@@ -107,19 +116,25 @@ func IsNodeIDKey(key string) bool {
 	return strings.HasPrefix(key, KeyNodeIDPrefix+separator)
 }
 
-// NodeIDFromKey attempts to extract a NodeID from the provided key.
-// The key should have been constructed by MakeNodeIDKey.
-// Returns an error if the key is not of the correct type or is not parsable.
-func NodeIDFromKey(key string) (roachpb.NodeID, error) {
-	trimmedKey := strings.TrimPrefix(key, KeyNodeIDPrefix+separator)
-	if trimmedKey == key {
-		return 0, errors.Errorf("%q is not a NodeID Key", key)
+// NodeIDFromKey attempts to extract a NodeID from the provided key after
+// stripping the provided prefix. Returns an error if the key is not of the
+// correct type or is not parsable.
+func NodeIDFromKey(key string, prefix string) (roachpb.NodeID, error) {
+	trimmedKey, err := removePrefixFromKey(key, prefix)
+	if err != nil {
+		return 0, err
 	}
-	nodeID, err := strconv.ParseInt(trimmedKey, 10, 64)
+	nodeID, err := strconv.ParseInt(trimmedKey, 10 /* base */, 64 /* bitSize */)
 	if err != nil {
 		return 0, errors.Wrapf(err, "failed parsing NodeID from key %q", key)
 	}
 	return roachpb.NodeID(nodeID), nil
+}
+
+// MakeNodeHealthAlertKey returns the gossip key under which the given node can
+// gossip health alerts.
+func MakeNodeHealthAlertKey(nodeID roachpb.NodeID) string {
+	return MakeKey(KeyNodeHealthAlertPrefix, strconv.Itoa(int(nodeID)))
 }
 
 // MakeNodeLivenessKey returns the gossip key for node liveness info.
@@ -146,4 +161,36 @@ func MakeDistSQLNodeVersionKey(nodeID roachpb.NodeID) string {
 // draining state.
 func MakeDistSQLDrainingKey(nodeID roachpb.NodeID) string {
 	return MakeKey(KeyDistSQLDrainingPrefix, nodeID.String())
+}
+
+// MakeTableStatAddedKey returns the gossip key used to notify that a new
+// statistic is available for the given table.
+func MakeTableStatAddedKey(tableID uint32) string {
+	return MakeKey(KeyTableStatAddedPrefix, strconv.FormatUint(uint64(tableID), 10 /* base */))
+}
+
+// TableIDFromTableStatAddedKey attempts to extract the table ID from the
+// provided key.
+// The key should have been constructed by MakeTableStatAddedKey.
+// Returns an error if the key is not of the correct type or is not parsable.
+func TableIDFromTableStatAddedKey(key string) (uint32, error) {
+	trimmedKey, err := removePrefixFromKey(key, KeyTableStatAddedPrefix)
+	if err != nil {
+		return 0, err
+	}
+	tableID, err := strconv.ParseUint(trimmedKey, 10 /* base */, 32 /* bitSize */)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed parsing table ID from key %q", key)
+	}
+	return uint32(tableID), nil
+}
+
+// removePrefixFromKey removes the key prefix and separator and returns what's
+// left. Returns an error if the key doesn't have this prefix.
+func removePrefixFromKey(key, prefix string) (string, error) {
+	trimmedKey := strings.TrimPrefix(key, prefix+separator)
+	if trimmedKey == key {
+		return "", errors.Errorf("%q does not have expected prefix %q%s", key, prefix, separator)
+	}
+	return trimmedKey, nil
 }

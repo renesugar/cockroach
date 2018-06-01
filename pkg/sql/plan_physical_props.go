@@ -33,15 +33,23 @@ func planPhysicalProps(plan planNode) physicalProps {
 		return planPhysicalProps(n.run.results)
 	case *limitNode:
 		return planPhysicalProps(n.plan)
+	case *spoolNode:
+		return planPhysicalProps(n.source)
 	case *indexJoinNode:
 		return planPhysicalProps(n.index)
+	case *serializeNode:
+		return planPhysicalProps(n.source)
+	case *deleteNode:
+		if n.run.rowsNeeded {
+			return planPhysicalProps(n.source)
+		}
 
 	case *filterNode:
 		return n.props
 
 	case *groupNode:
-		// TODO(dt,knz,radu): aggregate buckets can be ordered if the source is
-		// ordered on the aggregating column already.
+		return n.props
+
 	case *windowNode:
 		// TODO: window partitions can be ordered if the source is ordered
 		// appropriately.
@@ -50,8 +58,6 @@ func planPhysicalProps(plan planNode) physicalProps {
 	case *unionNode:
 		// TODO(knz): this can be ordered if the source is ordered already.
 	case *insertNode:
-		// TODO(knz): RETURNING is ordered by the PK.
-	case *deleteNode:
 		// TODO(knz): RETURNING is ordered by the PK.
 	case *updateNode, *upsertNode:
 		// After an update, the original order may have been destroyed.

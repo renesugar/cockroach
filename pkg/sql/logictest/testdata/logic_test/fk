@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
 
 statement ok
 CREATE TABLE customers (id INT PRIMARY KEY, email STRING UNIQUE)
@@ -808,11 +808,34 @@ refers  CREATE TABLE refers (
     INDEX another_idx (b ASC),
     CONSTRAINT fk_a_ref_referee FOREIGN KEY (a) REFERENCES referee (id),
     INDEX refers_auto_index_fk_a_ref_referee (a ASC),
+    INDEX foo (a ASC),
     FAMILY "primary" (a, b, rowid)
 )
 
 statement ok
 DROP INDEX refers@another_idx
+
+# refers is not visible because it is in the ADD state.
+query T
+SHOW TABLES FROM test
+----
+bar
+child
+customers
+delivery
+domain_modules
+domains
+foo
+grandchild
+modules
+pairs
+referee
+refpairs
+refpairs_c_between
+refpairs_wrong_order
+tx
+tx_leg
+unindexed
 
 statement ok
 COMMIT
@@ -1312,3 +1335,17 @@ CREATE TABLE no_default_table (
 # Clean up after the test.
 statement ok
 DROP TABLE a;
+
+subtest 24664
+
+statement ok
+CREATE TABLE t (a INT, b INT, UNIQUE INDEX (a), UNIQUE INDEX (a, b))
+
+statement ok
+ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES t (a)
+
+statement error column "a" cannot be used by multiple foreign key constraints
+ALTER TABLE t ADD FOREIGN KEY (a, b) REFERENCES t (a, b)
+
+statement ok
+DROP TABLE t

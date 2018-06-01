@@ -37,6 +37,7 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 		{key: StoreGossipKey(), expSuffix: localStoreGossipSuffix, expDetail: nil},
 		{key: StoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
 		{key: StoreLastUpKey(), expSuffix: localStoreLastUpSuffix, expDetail: nil},
+		{key: StoreHLCUpperBoundKey(), expSuffix: localHLCUpperBoundSuffix, expDetail: nil},
 		{
 			key:       StoreSuggestedCompactionKey(roachpb.Key("a"), roachpb.Key("z")),
 			expSuffix: localStoreSuggestedCompactionSuffix,
@@ -144,10 +145,10 @@ func TestKeyAddressError(t *testing.T) {
 		"local range ID key .* is not addressable": {
 			AbortSpanKey(0, uuid.MakeV4()),
 			RaftTombstoneKey(0),
-			RaftAppliedIndexKey(0),
+			RaftAppliedIndexLegacyKey(0),
 			RaftTruncatedStateKey(0),
 			RangeLeaseKey(0),
-			RangeStatsKey(0),
+			RangeStatsLegacyKey(0),
 			RaftHardStateKey(0),
 			RaftLastIndexKey(0),
 			RaftLogPrefix(0),
@@ -473,7 +474,9 @@ func TestBatchRange(t *testing.T) {
 	for i, c := range testCases {
 		var ba roachpb.BatchRequest
 		for _, pair := range c.req {
-			ba.Add(&roachpb.ScanRequest{Span: roachpb.Span{Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1])}})
+			ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+				Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1]),
+			}})
 		}
 		if rs, err := Range(ba); err != nil {
 			t.Errorf("%d: %v", i, err)
@@ -501,7 +504,9 @@ func TestBatchError(t *testing.T) {
 
 	for i, c := range testCases {
 		var ba roachpb.BatchRequest
-		ba.Add(&roachpb.ScanRequest{Span: roachpb.Span{Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1])}})
+		ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+			Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1]),
+		}})
 		if _, err := Range(ba); !testutils.IsError(err, c.errMsg) {
 			t.Errorf("%d: unexpected error %v", i, err)
 		}
@@ -509,7 +514,9 @@ func TestBatchError(t *testing.T) {
 
 	// Test a case where a non-range request has an end key.
 	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.GetRequest{Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}})
+	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{
+		Key: roachpb.Key("a"), EndKey: roachpb.Key("b"),
+	}})
 	if _, err := Range(ba); !testutils.IsError(err, "end key specified for non-range operation") {
 		t.Errorf("unexpected error %v", err)
 	}

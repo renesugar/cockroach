@@ -15,6 +15,7 @@
 package distsqlrun
 
 import (
+	"context"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -24,10 +25,13 @@ import (
 // rows.
 type valuesProcessor struct {
 	processorBase
-	rowSourceBase
 
 	columns []DatumInfo
 	data    [][]byte
+	// numRows is only guaranteed to be set if there are zero columns (because of
+	// backward compatibility). If it set and there are columns, it matches the
+	// number of rows that are encoded in data.
+	numRows uint64
 
 	sd     StreamDecoder
 	rowBuf sqlbase.EncDatumRow
@@ -36,126 +40,114 @@ type valuesProcessor struct {
 var _ Processor = &valuesProcessor{}
 var _ RowSource = &valuesProcessor{}
 
+const valuesProcName = "values"
+
 func newValuesProcessor(
-	flowCtx *FlowCtx, spec *ValuesCoreSpec, post *PostProcessSpec, output RowReceiver,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *ValuesCoreSpec,
+	post *PostProcessSpec,
+	output RowReceiver,
 ) (*valuesProcessor, error) {
 	v := &valuesProcessor{
 		columns: spec.Columns,
+		numRows: spec.NumRows,
 		data:    spec.RawBytes,
 	}
 	types := make([]sqlbase.ColumnType, len(v.columns))
 	for i := range v.columns {
 		types[i] = v.columns[i].Type
 	}
-	if err := v.init(post, types, flowCtx, nil /* evalCtx */, output); err != nil {
+	if err := v.init(post, types, flowCtx, processorID, output, procStateOpts{}); err != nil {
 		return nil, err
 	}
 	return v, nil
 }
 
 // Run is part of the processor interface.
-func (v *valuesProcessor) Run(wg *sync.WaitGroup) {
+func (v *valuesProcessor) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if v.out.output == nil {
 		panic("valuesProcessor output not initialized for emitting rows")
 	}
-	Run(v.flowCtx.Ctx, v, v.out.output)
+	ctx = v.Start(ctx)
+	Run(ctx, v, v.out.output)
 	if wg != nil {
 		wg.Done()
 	}
 }
 
-func (v *valuesProcessor) close() {
-	v.internalClose()
-}
+// Start is part of the RowSource interface.
+func (v *valuesProcessor) Start(ctx context.Context) context.Context {
+	ctx = v.startInternal(ctx, valuesProcName)
 
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (v *valuesProcessor) producerMeta(err error) *ProducerMetadata {
-	var meta *ProducerMetadata
-	if !v.closed {
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-		} else if trace := getTraceData(v.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		// We need to close as soon as we send producer metadata as we're done
-		// sending rows. The consumer is allowed to not call ConsumerDone().
-		v.close()
+	// Add a bogus header to apease the StreamDecoder, which wants to receive a
+	// header before any data.
+	m := &ProducerMessage{
+		Typing: v.columns,
+		Header: &ProducerHeader{},
 	}
-	return meta
+	if err := v.sd.AddMessage(m); err != nil {
+		v.moveToDraining(err)
+		return ctx
+	}
+
+	v.rowBuf = make(sqlbase.EncDatumRow, len(v.columns))
+	return ctx
 }
 
 // Next is part of the RowSource interface.
 func (v *valuesProcessor) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if v.maybeStart("values", "" /* logTag */) {
-		// Add a bogus header to apease the StreamDecoder, which wants to receive a
-		// header before any data.
-		m := &ProducerMessage{
-			Typing: v.columns,
-			Header: &ProducerHeader{}}
-		if err := v.sd.AddMessage(m); err != nil {
-			return nil, v.producerMeta(err)
-		}
-
-		v.rowBuf = make(sqlbase.EncDatumRow, len(v.columns))
-	}
-	if v.closed {
-		return nil, v.producerMeta(nil /* err */)
-	}
-
-	for {
+	for v.state == stateRunning {
 		row, meta, err := v.sd.GetRow(v.rowBuf)
 		if err != nil {
-			return nil, v.producerMeta(err)
+			v.moveToDraining(err)
+			break
 		}
 
-		if row == nil && meta == nil {
-			if len(v.data) == 0 {
-				return nil, v.producerMeta(nil /* err */)
-			}
+		if meta != nil {
+			return nil, meta
+		}
+
+		if row == nil {
 			// Push a chunk of data to the stream decoder.
 			m := &ProducerMessage{}
-			m.Data.RawBytes = v.data[0]
-			if err := v.sd.AddMessage(m); err != nil {
-				return nil, v.producerMeta(err)
+			if len(v.columns) == 0 {
+				if v.numRows == 0 {
+					v.moveToDraining(nil /* err */)
+					break
+				}
+				m.Data.NumEmptyRows = int32(v.numRows)
+				v.numRows = 0
+			} else {
+				if len(v.data) == 0 {
+					v.moveToDraining(nil /* err */)
+					break
+				}
+				m.Data.RawBytes = v.data[0]
+				v.data = v.data[1:]
 			}
-			v.data = v.data[1:]
+			if err := v.sd.AddMessage(m); err != nil {
+				v.moveToDraining(err)
+				break
+			}
 			continue
 		}
 
-		if row != nil {
-			if v.consumerStatus != NeedMoreRows {
-				continue
-			}
-			outRow, status, err := v.out.ProcessRow(v.ctx, row)
-			if err != nil {
-				return nil, v.producerMeta(err)
-			}
-			switch status {
-			case NeedMoreRows:
-				if outRow == nil && err == nil {
-					continue
-				}
-			case DrainRequested:
-				continue
-			}
+		if outRow := v.processRowHelper(row); outRow != nil {
 			return outRow, nil
 		}
-
-		return nil, meta
 	}
+	return nil, v.drainHelper()
+
 }
 
 // ConsumerDone is part of the RowSource interface.
 func (v *valuesProcessor) ConsumerDone() {
-	v.consumerDone()
+	v.moveToDraining(nil /* err */)
 }
 
 // ConsumerClosed is part of the RowSource interface.
 func (v *valuesProcessor) ConsumerClosed() {
-	v.consumerClosed("values")
 	// The consumer is done, Next() will not be called again.
-	v.close()
+	v.internalClose()
 }

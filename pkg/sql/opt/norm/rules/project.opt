@@ -1,0 +1,28 @@
+# =============================================================================
+# project.opt contains normalization rules for the Project operator.
+# =============================================================================
+
+
+# EliminateProject discards a Project operator which is not adding or removing
+# columns.
+[EliminateProject, Normalize]
+(Project
+    $input:*
+    $projections:(Projections []) & (HasSameCols $input $projections)
+)
+=>
+$input
+
+# EliminateProjectProject discards a nested Project operator that is only
+# removing columns from its input (and not synthesizing new ones). That's
+# something the outer Project operator can do on its own.
+[EliminateProjectProject, Normalize]
+(Project
+    $input:(Project $innerInput:* (Projections []))
+    $projections:*
+)
+=>
+(Project
+    $innerInput
+    $projections
+)

@@ -20,6 +20,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"hash"
@@ -580,11 +581,14 @@ var Builtins = map[string][]tree.Builtin{
 					return tree.NewDString(buf.String()), nil
 				case "escape":
 					return tree.NewDString(encodeEscape([]byte(data))), nil
+				case "base64":
+					enc := base64.StdEncoding.EncodeToString([]byte(data))
+					return tree.NewDString(enc), nil
 				default:
-					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' and 'escape' formats are supported for ENCODE")
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex', 'escape', and 'base64' formats are supported for ENCODE")
 				}
 			},
-			Info: "Encodes `data` in the text format specified by `format` (only \"hex\" and \"escape\" are supported).",
+			Info: "Encodes `data` in the text format specified by `format` (only \"hex\", \"escape\", and \"base64\" are supported).",
 		},
 	},
 
@@ -607,11 +611,17 @@ var Builtins = map[string][]tree.Builtin{
 						return nil, err
 					}
 					return tree.NewDBytes(tree.DBytes(decoded)), nil
+				case "base64":
+					decoded, err := base64.StdEncoding.DecodeString(data)
+					if err != nil {
+						return nil, err
+					}
+					return tree.NewDBytes(tree.DBytes(decoded)), nil
 				default:
-					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex' and 'escape' formats are supported for DECODE")
+					return nil, pgerror.NewError(pgerror.CodeInvalidParameterValueError, "only 'hex', 'escape', and 'base64' formats are supported for DECODE")
 				}
 			},
-			Info: "Decodes `data` as the format specified by `format` (only \"hex\" and \"escape\" are supported).",
+			Info: "Decodes `data` as the format specified by `format` (only \"hex\", \"escape\", and \"base64\" are supported).",
 		},
 	},
 
@@ -1153,7 +1163,7 @@ CockroachDB supports the following flags:
 	"greatest": {
 		tree.Builtin{
 			Types:        tree.HomogeneousType{},
-			ReturnType:   tree.IdentityReturnType(0),
+			ReturnType:   tree.FirstNonNullReturnType(),
 			NullableArgs: true,
 			Category:     categoryComparison,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
@@ -1165,7 +1175,7 @@ CockroachDB supports the following flags:
 	"least": {
 		tree.Builtin{
 			Types:        tree.HomogeneousType{},
-			ReturnType:   tree.IdentityReturnType(0),
+			ReturnType:   tree.FirstNonNullReturnType(),
 			NullableArgs: true,
 			Category:     categoryComparison,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
@@ -1254,7 +1264,7 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return tree.TimestampDifference(ctx, ctx.GetTxnTimestamp(time.Microsecond), args[0])
 			},
-			Info: "Calculates the interval between `val` and the current time.",
+			Info: "Calculates the interval between the current time and `val`.",
 		},
 		tree.Builtin{
 			Types:      tree.ArgTypes{{"begin", types.TimestampTZ}, {"end", types.TimestampTZ}},
@@ -1274,7 +1284,19 @@ CockroachDB supports the following flags:
 				t := ctx.GetTxnTimestamp(time.Microsecond).Time
 				return tree.NewDDateFromTime(t, ctx.GetLocation()), nil
 			},
-			Info: "Returns the current date.",
+			Info: "Returns the date of the current transaction." + txnTSContextDoc,
+		},
+	},
+
+	"current_time": {
+		tree.Builtin{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.TimeTZ),
+			Impure:     true,
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				return ctx.GetTxnTime(), nil
+			},
+			Info: "Returns the time of the current transaction, with time zone." + txnTSContextDoc,
 		},
 	},
 
@@ -1291,7 +1313,7 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return tree.MakeDTimestampTZ(ctx.GetStmtTimestamp(), time.Microsecond), nil
 			},
-			Info: "Returns the current statement's timestamp.",
+			Info: "Returns the start time of the current statement.",
 		},
 		tree.Builtin{
 			Types:      tree.ArgTypes{},
@@ -1300,7 +1322,7 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return tree.MakeDTimestamp(ctx.GetStmtTimestamp(), time.Microsecond), nil
 			},
-			Info: "Returns the current statement's timestamp.",
+			Info: "Returns the start time of the current statement.",
 		},
 	},
 
@@ -1313,7 +1335,13 @@ CockroachDB supports the following flags:
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return ctx.GetClusterTimestamp(), nil
 			},
-			Info: "This function is used only by CockroachDB's developers for testing purposes.",
+			Info: `Returns the logical time of the current transaction.
+
+This function is reserved for testing purposes by CockroachDB
+developers and its definition may change without prior notice.
+
+Note that uses of this function disable server-side optimizations and
+may increase either contention or retry errors, or both.`,
 		},
 	},
 
@@ -1326,7 +1354,7 @@ CockroachDB supports the following flags:
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return tree.MakeDTimestampTZ(timeutil.Now(), time.Microsecond), nil
 			},
-			Info: "Returns the current wallclock time.",
+			Info: "Returns the current system time on one of the cluster nodes.",
 		},
 		tree.Builtin{
 			Types:      tree.ArgTypes{},
@@ -1335,7 +1363,7 @@ CockroachDB supports the following flags:
 			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				return tree.MakeDTimestamp(timeutil.Now(), time.Microsecond), nil
 			},
-			Info: "Returns the current wallclock time.",
+			Info: "Returns the current system time on one of the cluster nodes.",
 		},
 	},
 
@@ -1387,6 +1415,19 @@ CockroachDB supports the following flags:
 			Category:   categoryDateAndTime,
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				fromTime := args[1].(*tree.DTime)
+				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
+				return extractStringFromTime(fromTime, timeSpan)
+			},
+			Info: "Extracts `element` from `input`.\n\n" +
+				"Compatible elements: hour, minute, second, millisecond, microsecond, epoch",
+		},
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"element", types.String}, {"input", types.TimeTZ}},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Category:   categoryDateAndTime,
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				fromTimeTZ := args[1].(*tree.DTimeTZ)
+				fromTime := tree.MakeDTime(fromTimeTZ.TimeOfDay)
 				timeSpan := strings.ToLower(string(tree.MustBeDString(args[0])))
 				return extractStringFromTime(fromTime, timeSpan)
 			},
@@ -1863,7 +1904,7 @@ CockroachDB supports the following flags:
 				return roundDecimal(&args[0].(*tree.DDecimal).Decimal, scale)
 			},
 			Info: "Keeps `decimal_accuracy` number of figures to the right of the zero position " +
-				" in `input using half away from zero rounding. If `decimal_accuracy` " +
+				"in `input` using half away from zero rounding. If `decimal_accuracy` " +
 				"is not in the range -2^31...(2^31-1), the results are undefined.",
 		},
 	},
@@ -2007,6 +2048,36 @@ CockroachDB supports the following flags:
 				return stringToArray(str, delimOrNil, nullStr)
 			},
 			Info: "Split a string into components on a delimiter with a specified string to consider NULL.",
+		},
+	},
+
+	"array_to_string": {
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"input", types.AnyArray}, {"delim", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Category:   categoryArray,
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				delimOrNil := stringOrNil(args[1])
+				return arrayToString(arr, delimOrNil, nil)
+			},
+			Info: "Join an array into a string with a delimiter.",
+		},
+		tree.Builtin{
+			Types:        tree.ArgTypes{{"input", types.AnyArray}, {"delimiter", types.String}, {"null", types.String}},
+			ReturnType:   tree.FixedReturnType(types.String),
+			Category:     categoryArray,
+			NullableArgs: true,
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, nil
+				}
+				arr := tree.MustBeDArray(args[0])
+				delimOrNil := stringOrNil(args[1])
+				nullStr := stringOrNil(args[2])
+				return arrayToString(arr, delimOrNil, nullStr)
+			},
+			Info: "Join an array into a string with a delimiter, replacing NULLs with a null string.",
 		},
 	},
 
@@ -2196,6 +2267,7 @@ CockroachDB supports the following flags:
 
 	// Metadata functions.
 
+	// https://www.postgresql.org/docs/10/static/functions-info.html
 	"version": {
 		tree.Builtin{
 			Types:      tree.ArgTypes{},
@@ -2208,6 +2280,7 @@ CockroachDB supports the following flags:
 		},
 	},
 
+	// https://www.postgresql.org/docs/10/static/functions-info.html
 	"current_database": {
 		tree.Builtin{
 			Types:      tree.ArgTypes{},
@@ -2223,52 +2296,79 @@ CockroachDB supports the following flags:
 		},
 	},
 
+	// https://www.postgresql.org/docs/10/static/functions-info.html
+	//
+	// Note that in addition to what the pg doc says ("current_schema =
+	// first item in search path"), the pg server actually skips over
+	// non-existent schemas in the search path to determine
+	// current_schema. This is not documented but can be verified by a
+	// SQL client against a pg server.
 	"current_schema": {
 		tree.Builtin{
-			Types:      tree.ArgTypes{},
-			ReturnType: tree.FixedReturnType(types.String),
-			Category:   categorySystemInfo,
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				hasFirst, first := ctx.SessionData.SearchPath.FirstSpecified()
-				if !hasFirst {
-					return tree.DNull, nil
+			Types:            tree.ArgTypes{},
+			ReturnType:       tree.FixedReturnType(types.String),
+			Category:         categorySystemInfo,
+			DistsqlBlacklist: true,
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ctx := evalCtx.Ctx()
+				curDb := evalCtx.SessionData.Database
+				iter := evalCtx.SessionData.SearchPath.IterWithoutImplicitPGCatalog()
+				for scName, ok := iter(); ok; scName, ok = iter() {
+					if found, _, err := evalCtx.Planner.LookupSchema(ctx, curDb, scName); found || err != nil {
+						if err != nil {
+							return nil, err
+						}
+						return tree.NewDString(scName), nil
+					}
 				}
-				return tree.NewDString(first), nil
+				return tree.DNull, nil
 			},
-			Info: "Returns the current schema. This function is provided for " +
-				"compatibility with PostgreSQL. For a new CockroachDB application, " +
-				"consider using current_database() instead.",
+			Info: "Returns the current schema.",
 		},
 	},
 
-	// For now, schemas are the same as databases. So, current_schemas
-	// returns the current database (if one has been set by the user)
-	// and the session's database search path.
+	// https://www.postgresql.org/docs/10/static/functions-info.html
+	//
+	// Note that in addition to what the pg doc says ("current_schemas =
+	// items in search path with or without pg_catalog depending on
+	// argument"), the pg server actually skips over non-existent
+	// schemas in the search path to compute current_schemas. This is
+	// not documented but can be verified by a SQL client against a pg
+	// server.
 	"current_schemas": {
 		tree.Builtin{
-			Types:      tree.ArgTypes{{"include_pg_catalog", types.Bool}},
-			ReturnType: tree.FixedReturnType(types.TArray{Typ: types.String}),
-			Category:   categorySystemInfo,
-			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+			Types:            tree.ArgTypes{{"include_pg_catalog", types.Bool}},
+			ReturnType:       tree.FixedReturnType(types.TArray{Typ: types.String}),
+			Category:         categorySystemInfo,
+			DistsqlBlacklist: true,
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				ctx := evalCtx.Ctx()
+				curDb := evalCtx.SessionData.Database
 				includePgCatalog := *(args[0].(*tree.DBool))
 				schemas := tree.NewDArray(types.String)
 				var iter func() (string, bool)
 				if includePgCatalog {
-					iter = ctx.SessionData.SearchPath.Iter()
+					iter = evalCtx.SessionData.SearchPath.Iter()
 				} else {
-					iter = ctx.SessionData.SearchPath.IterWithoutImplicitPGCatalog()
+					iter = evalCtx.SessionData.SearchPath.IterWithoutImplicitPGCatalog()
 				}
-				for p, ok := iter(); ok; p, ok = iter() {
-					if err := schemas.Append(tree.NewDString(p)); err != nil {
-						return nil, err
+				for scName, ok := iter(); ok; scName, ok = iter() {
+					if found, _, err := evalCtx.Planner.LookupSchema(ctx, curDb, scName); found || err != nil {
+						if err != nil {
+							return nil, err
+						}
+						if err := schemas.Append(tree.NewDString(scName)); err != nil {
+							return nil, err
+						}
 					}
 				}
 				return schemas, nil
 			},
-			Info: "Returns the current search path for unqualified names.",
+			Info: "Returns the valid schemas in the search path.",
 		},
 	},
 
+	// https://www.postgresql.org/docs/10/static/functions-info.html
 	"current_user": {
 		tree.Builtin{
 			Types:      tree.ArgTypes{},
@@ -2419,6 +2519,80 @@ CockroachDB supports the following flags:
 				"Incorrect use can severely impact performance.",
 		},
 	},
+
+	"lpad": {
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"string", types.String}, {"length", types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				length := int(tree.MustBeDInt(args[1]))
+				if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(length)); err != nil {
+					return nil, err
+				}
+				ret, err := lpad(evalCtx, s, length, " ")
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(ret), nil
+			},
+			Category: categoryString,
+			Info: "Pads `string` to `length` by adding ' ' to the left of `string`." +
+				"If `string` is longer than `length` it is truncated.",
+		},
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"string", types.String}, {"length", types.Int}, {"fill", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				length := int(tree.MustBeDInt(args[1]))
+				fill := string(tree.MustBeDString(args[2]))
+				ret, err := lpad(evalCtx, s, length, fill)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(ret), nil
+			},
+			Category: categoryString,
+			Info: "Pads `string` by adding `fill` to the left of `string` to make it `length`. " +
+				"If `string` is longer than `length` it is truncated.",
+		},
+	},
+	"rpad": {
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"string", types.String}, {"length", types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				length := int(tree.MustBeDInt(args[1]))
+				ret, err := rpad(evalCtx, s, length, " ")
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(ret), nil
+			},
+			Category: categoryString,
+			Info: "Pads `string` to `length` by adding ' ' to the right of string. " +
+				"If `string` is longer than `length` it is truncated.",
+		},
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"string", types.String}, {"length", types.Int}, {"fill", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				length := int(tree.MustBeDInt(args[1]))
+				fill := string(tree.MustBeDString(args[2]))
+				ret, err := rpad(evalCtx, s, length, fill)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDString(ret), nil
+			},
+			Category: categoryString,
+			Info: "Pads `string` to `length` by adding `fill` to the right of `string`. " +
+				"If `string` is longer than `length` it is truncated.",
+		},
+	},
 }
 
 var substringImpls = []tree.Builtin{
@@ -2534,6 +2708,14 @@ var ceilImpl = []tree.Builtin{
 	}, "Calculates the smallest integer greater than `val`."),
 }
 
+var txnTSContextDoc = `
+
+The value is based on a timestamp picked when the transaction starts
+and which stays constant throughout the transaction. This timestamp
+has no relationship with the commit order of concurrent transactions.`
+
+var txnTSDoc = `Returns the time of the current transaction.` + txnTSContextDoc
+
 var txnTSImpl = []tree.Builtin{
 	{
 		Types:             tree.ArgTypes{},
@@ -2543,7 +2725,7 @@ var txnTSImpl = []tree.Builtin{
 		Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			return ctx.GetTxnTimestamp(time.Microsecond), nil
 		},
-		Info: "Returns the current transaction's timestamp.",
+		Info: txnTSDoc,
 	},
 	{
 		Types:      tree.ArgTypes{},
@@ -2552,7 +2734,7 @@ var txnTSImpl = []tree.Builtin{
 		Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 			return ctx.GetTxnTimestampNoZone(time.Microsecond), nil
 		},
-		Info: "Returns the current transaction's timestamp.",
+		Info: txnTSDoc,
 	},
 }
 
@@ -2713,7 +2895,7 @@ var jsonBuildObjectImpl = tree.Builtin{
 				return nil, err
 			}
 
-			val, err := asJSON(args[i+1])
+			val, err := AsJSON(args[i+1])
 			if err != nil {
 				return nil, err
 			}
@@ -2730,7 +2912,7 @@ var toJSONImpl = tree.Builtin{
 	Types:      tree.ArgTypes{{"val", types.Any}},
 	ReturnType: tree.FixedReturnType(types.JSON),
 	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-		j, err := asJSON(args[0])
+		j, err := AsJSON(args[0])
 		if err != nil {
 			return nil, err
 		}
@@ -2746,7 +2928,7 @@ var jsonBuildArrayImpl = tree.Builtin{
 	Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 		builder := json.NewArrayBuilder(len(args))
 		for _, arg := range args {
-			j, err := asJSON(arg)
+			j, err := AsJSON(arg)
 			if err != nil {
 				return nil, err
 			}
@@ -2775,7 +2957,7 @@ var jsonObjectImpls = []tree.Builtin{
 				if err != nil {
 					return nil, err
 				}
-				val, err := asJSON(arr.Array[i+1])
+				val, err := AsJSON(arr.Array[i+1])
 				if err != nil {
 					return nil, err
 				}
@@ -2806,7 +2988,7 @@ var jsonObjectImpls = []tree.Builtin{
 				if err != nil {
 					return nil, err
 				}
-				val, err := asJSON(values.Array[i])
+				val, err := AsJSON(values.Array[i])
 				if err != nil {
 					return nil, err
 				}
@@ -3521,6 +3703,32 @@ func stringToArray(str string, delimPtr *string, nullStr *string) (tree.Datum, e
 	return result, nil
 }
 
+// arrayToString implements the array_to_string builtin - arr is joined using
+// delim. If nullStr is non-nil, NULL values in the array will be replaced by
+// it.
+func arrayToString(arr *tree.DArray, delimPtr *string, nullStr *string) (tree.Datum, error) {
+	if delimPtr == nil {
+		return tree.DNull, nil
+	}
+
+	f := tree.NewFmtCtxWithBuf(tree.FmtParseDatums)
+
+	for i := range arr.Array {
+		if arr.Array[i] == tree.DNull {
+			if nullStr == nil {
+				continue
+			}
+			f.WriteString(*nullStr)
+		} else {
+			f.FormatNode(arr.Array[i])
+		}
+		if i < len(arr.Array)-1 {
+			f.WriteString(*delimPtr)
+		}
+	}
+	return tree.NewDString(f.CloseAndGetString()), nil
+}
+
 // encodeEscape implements the encode(..., 'escape') Postgres builtin. It's
 // described "escape converts zero bytes and high-bit-set bytes to octal
 // sequences (\nnn) and doubles backslashes."
@@ -3643,7 +3851,8 @@ func truncateTimestamp(
 	return tree.MakeDTimestampTZ(toTime, time.Microsecond), nil
 }
 
-func asJSON(d tree.Datum) (json.JSON, error) {
+// AsJSON converts a datum into our standard json representation.
+func AsJSON(d tree.Datum) (json.JSON, error) {
 	switch t := d.(type) {
 	case *tree.DBool:
 		return json.FromBool(bool(*t)), nil
@@ -3662,7 +3871,7 @@ func asJSON(d tree.Datum) (json.JSON, error) {
 	case *tree.DArray:
 		builder := json.NewArrayBuilder(t.Len())
 		for _, e := range t.Array {
-			j, err := asJSON(e)
+			j, err := AsJSON(e)
 			if err != nil {
 				return nil, err
 			}
@@ -3672,21 +3881,21 @@ func asJSON(d tree.Datum) (json.JSON, error) {
 	case *tree.DTuple:
 		builder := json.NewObjectBuilder(len(t.D))
 		for i, e := range t.D {
-			j, err := asJSON(e)
+			j, err := AsJSON(e)
 			if err != nil {
 				return nil, err
 			}
 			builder.Add(fmt.Sprintf("f%d", i+1), j)
 		}
 		return builder.Build(), nil
-	case *tree.DTimestamp, *tree.DTimestampTZ, *tree.DDate, *tree.DUuid, *tree.DOid, *tree.DInterval, *tree.DBytes, *tree.DIPAddr, *tree.DTime:
+	case *tree.DTimestamp, *tree.DTimestampTZ, *tree.DDate, *tree.DUuid, *tree.DOid, *tree.DInterval, *tree.DBytes, *tree.DIPAddr, *tree.DTime, *tree.DTimeTZ:
 		return json.FromString(tree.AsStringWithFlags(t, tree.FmtBareStrings)), nil
 	default:
 		if d == tree.DNull {
 			return json.NullJSONValue, nil
 		}
 
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unexpected type %T for asJSON", d)
+		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "unexpected type %T for AsJSON", d)
 	}
 }
 
@@ -3714,4 +3923,69 @@ func asJSONObjectKey(d tree.Datum) (string, error) {
 	default:
 		return "", pgerror.NewErrorf(pgerror.CodeInternalError, "unexpected type %T for asJSONObjectKey", d)
 	}
+}
+
+// padMaybeTruncate truncates the input string to length if the string is
+// longer or equal in size to length. If truncated, the first return value
+// will be true, and the last return value will be the truncated string.
+// The second return value is set to the length of the input string in runes.
+func padMaybeTruncate(s string, length int, fill string) (ok bool, slen int, ret string) {
+	if length < 0 {
+		// lpad and rpad both return an empty string if the input length is
+		// negative.
+		length = 0
+	}
+	slen = utf8.RuneCountInString(s)
+	if length == slen {
+		return true, slen, s
+	}
+
+	// If string is longer then length truncate it to the requested number
+	// of characters.
+	if length < slen {
+		return true, slen, string([]rune(s)[:length])
+	}
+
+	// If the input fill is the empty string, return the original string.
+	if len(fill) == 0 {
+		return true, slen, s
+	}
+
+	return false, slen, s
+}
+
+func lpad(evalCtx *tree.EvalContext, s string, length int, fill string) (string, error) {
+	ok, slen, ret := padMaybeTruncate(s, length, fill)
+	if ok {
+		return ret, nil
+	}
+	if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(length)); err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	fillRunes := []rune(fill)
+	for i := 0; i < length-slen; i++ {
+		buf.WriteRune(fillRunes[i%len(fillRunes)])
+	}
+	buf.WriteString(s)
+
+	return buf.String(), nil
+}
+
+func rpad(evalCtx *tree.EvalContext, s string, length int, fill string) (string, error) {
+	ok, slen, ret := padMaybeTruncate(s, length, fill)
+	if ok {
+		return ret, nil
+	}
+	if err := evalCtx.ActiveMemAcc.Grow(evalCtx.Ctx(), int64(length)); err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	buf.WriteString(s)
+	fillRunes := []rune(fill)
+	for i := 0; i < length-slen; i++ {
+		buf.WriteRune(fillRunes[i%len(fillRunes)])
+	}
+
+	return buf.String(), nil
 }

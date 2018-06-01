@@ -8,17 +8,20 @@
     "iam",
     "internal",
     "internal/optional",
+    "internal/trace",
     "internal/version",
     "storage",
   ]
-  revision = "eaddaf6dd7ee35fd3c2420c8d27478db176b0485"
-  version = "v0.15.0"
+  revision = "094187a3a68a589c8217a46b90af0efae38542b9"
 
 [[projects]]
   name = "github.com/Azure/azure-sdk-for-go"
-  packages = ["storage"]
-  revision = "509eea43b93cec2f3f17acbe2578ef58703923f8"
-  version = "v11.1.1-beta"
+  packages = [
+    "storage",
+    "version",
+  ]
+  revision = "e67cd39e942c417ae5e9ae1165f778d9fe8996e0"
+  version = "v14.5.0"
 
 [[projects]]
   branch = "master"
@@ -37,8 +40,8 @@
     "autorest/azure",
     "autorest/date",
   ]
-  revision = "e90eb98af76c8cf5684aa79ecc8abce90afe484a"
-  version = "v9.2.0"
+  revision = "0ae36a9e544696de46fdadb7b0d5fb38af48c063"
+  version = "v10.2.0"
 
 [[projects]]
   branch = "parse-constraints-with-dash-in-pre"
@@ -520,6 +523,7 @@
     "proto",
     "protoc-gen-go/descriptor",
     "protoc-gen-go/generator",
+    "protoc-gen-go/generator/internal/remap",
     "protoc-gen-go/plugin",
     "ptypes",
     "ptypes/any",
@@ -527,7 +531,7 @@
     "ptypes/struct",
     "ptypes/timestamp",
   ]
-  revision = "bbd03ef6da3a115852eaf24c8a1c46aeb39aa175"
+  revision = "b4deda0973fb4c70b50d226b1af49f3da59f5265"
 
 [[projects]]
   branch = "master"
@@ -569,9 +573,12 @@
     "internal/symbolizer",
     "internal/symbolz",
     "profile",
-    "third_party/svg",
+    "third_party/d3",
+    "third_party/d3flamegraph",
+    "third_party/d3tip",
+    "third_party/svgpan",
   ]
-  revision = "2fb0552a69e2f33975f90698a2a1155e8c1a46f8"
+  revision = "60840899638bfaf3fd6f2b17b9785f1dac67a4a4"
 
 [[projects]]
   name = "github.com/googleapis/gax-go"
@@ -691,8 +698,8 @@
     "unix",
     "unix/sigtramp",
   ]
-  revision = "92ff7be0fe45ff74fdea05fcbcaef25467f19779"
-  version = "v1.6.4"
+  revision = "69b759d6ff84df6bbd39846dae3670625cc0361b"
+  version = "v1.7"
 
 [[projects]]
   branch = "master"
@@ -738,6 +745,12 @@
   ]
   revision = "ba38bae1f0ec1ece9092d35bbecbb497ee344cbc"
   version = "v0.15.0"
+
+[[projects]]
+  name = "github.com/marstr/guid"
+  packages = ["."]
+  revision = "8bd9a64bf37eb297b492a4101fb28e80ac0b290f"
+  version = "v1.1.0"
 
 [[projects]]
   name = "github.com/marusama/semaphore"
@@ -954,12 +967,6 @@
   version = "v1.2.0"
 
 [[projects]]
-  name = "github.com/satori/uuid"
-  packages = ["."]
-  revision = "879c5887cd475cd7864858769793b2ceb0d44feb"
-  version = "v1.1.0"
-
-[[projects]]
   branch = "master"
   name = "github.com/sdboyer/constext"
   packages = ["."]
@@ -1003,15 +1010,41 @@
 
 [[projects]]
   branch = "master"
-  name = "github.com/tylertreat/hdrhistogram-writer"
-  packages = ["."]
-  revision = "d105e3c15daaac745539bdd3e4a1f743b8feda09"
-
-[[projects]]
-  branch = "master"
   name = "github.com/wadey/gocovmerge"
   packages = ["."]
   revision = "b5bfa59ec0adc420475f97f89b58045c721d761c"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/xwb1989/sqlparser"
+  packages = [
+    ".",
+    "dependency/bytes2",
+    "dependency/hack",
+    "dependency/querypb",
+    "dependency/sqltypes",
+  ]
+  revision = "6aff8615a33faf1f260a3a8f800456511505d5fd"
+  source = "https://github.com/dt/sqlparser"
+
+[[projects]]
+  name = "go.opencensus.io"
+  packages = [
+    "exporter/stackdriver/propagation",
+    "internal",
+    "internal/tagencoding",
+    "plugin/ochttp",
+    "plugin/ochttp/propagation/b3",
+    "stats",
+    "stats/internal",
+    "stats/view",
+    "tag",
+    "trace",
+    "trace/internal",
+    "trace/propagation",
+  ]
+  revision = "0095aec66ae14801c6711210f6f0716411cefdd3"
+  version = "v0.8.0"
 
 [[projects]]
   branch = "master"
@@ -1051,7 +1084,7 @@
     "jws",
     "jwt",
   ]
-  revision = "bb50c06baba3d0c76f9d125c0719093e315b5b44"
+  revision = "6881fee410a5daf86371371f9ad451b95e168b71"
 
 [[projects]]
   branch = "master"
@@ -1142,7 +1175,7 @@
     "storage/v1",
     "transport/http",
   ]
-  revision = "9ae0bf1fac9d6b6b388ab8811c3c85537b8adc10"
+  revision = "9c79deebf7496e355d7e95d82d4af1fe4e769b2f"
 
 [[projects]]
   name = "google.golang.org/appengine"
@@ -1167,21 +1200,25 @@
   packages = [
     "googleapis/api/annotations",
     "googleapis/iam/v1",
+    "googleapis/rpc/code",
     "googleapis/rpc/status",
   ]
   revision = "f676e0f3ac6395ff1a529ae59a6670878a8371a6"
 
 [[projects]]
+  branch = "master"
   name = "google.golang.org/grpc"
   packages = [
     ".",
     "balancer",
     "balancer/base",
     "balancer/roundrobin",
+    "channelz",
     "codes",
     "connectivity",
     "credentials",
     "encoding",
+    "encoding/proto",
     "grpclb/grpc_lb_v1/messages",
     "grpclog",
     "health/grpc_health_v1",
@@ -1198,8 +1235,7 @@
     "tap",
     "transport",
   ]
-  revision = "6b51017f791ae1cfbec89c52efdf444b13b550ef"
-  version = "v1.9.2"
+  revision = "8f06f82ca394b1ac837d4b0c0cfa07188b0e9dee"
 
 [[projects]]
   branch = "v2"
@@ -1229,6 +1265,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "8bda46b35139d318b4fda9ba890f573323a93a9343efc84052094710c1ba59ec"
+  inputs-digest = "7cd01a43675d4f71b67733ff9c8883b6af343ccbf3b38bb4d6ec9388e6a22f24"
   solver-name = "gps-cdcl"
   solver-version = 1

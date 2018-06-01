@@ -1,6 +1,6 @@
 import _ from "lodash";
 import { hashHistory } from "react-router";
-import { syncHistoryWithStore, routerReducer, RouterState } from "react-router-redux";
+import { syncHistoryWithStore, routerMiddleware, routerReducer, RouterState } from "react-router-redux";
 import { createStore, combineReducers, applyMiddleware, compose, GenericStoreEnhancer, Store } from "redux";
 import createSagaMiddleware from "redux-saga";
 import thunk from "redux-thunk";
@@ -12,6 +12,7 @@ import { metricsReducer, MetricsState, queryMetricsSaga } from "./metrics";
 import { queryManagerReducer, QueryManagerState } from "./queryManager/reducer";
 import { timeWindowReducer, TimeWindowState } from "./timewindow";
 import { uiDataReducer, UIDataState } from "./uiData";
+import { loginReducer, LoginAPIState } from "./login";
 
 export interface AdminUIState {
     cachedData: APIReducersState;
@@ -22,6 +23,7 @@ export interface AdminUIState {
     routing: RouterState;
     timewindow: TimeWindowState;
     uiData: UIDataState;
+    login: LoginAPIState;
 }
 
 // createAdminUIStore is a function that returns a new store for the admin UI.
@@ -29,7 +31,7 @@ export interface AdminUIState {
 export function createAdminUIStore() {
   const sagaMiddleware = createSagaMiddleware();
 
-  const store: Store<AdminUIState> = createStore(
+  const s: Store<AdminUIState> = createStore(
     combineReducers<AdminUIState>({
       cachedData: apiReducersReducer,
       hover: hoverReducer,
@@ -39,9 +41,10 @@ export function createAdminUIStore() {
       routing: routerReducer,
       timewindow: timeWindowReducer,
       uiData: uiDataReducer,
+      login: loginReducer,
     }),
     compose(
-      applyMiddleware(thunk, sagaMiddleware),
+      applyMiddleware(thunk, sagaMiddleware, routerMiddleware(hashHistory)),
       // Support for redux dev tools
       // https://chrome.google.com/webstore/detail/redux-devtools/lmhkpmbekcpmknklioeibfkpmmfibljd
       (window as any).devToolsExtension ? (window as any).devToolsExtension({
@@ -58,7 +61,7 @@ export function createAdminUIStore() {
   );
 
   sagaMiddleware.run(queryMetricsSaga);
-  return store;
+  return s;
 }
 
 export const store = createAdminUIStore();

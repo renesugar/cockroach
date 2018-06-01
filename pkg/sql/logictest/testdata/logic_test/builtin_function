@@ -1,4 +1,10 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default opt parallel-stmts distsql distsql-metadata distsql-opt
+
+statement ok
+CREATE TABLE foo (a int)
+
+statement ok
+INSERT INTO foo (a) VALUES (1)
 
 query error unknown function: foo.bar
 SELECT foo.bar()
@@ -1055,6 +1061,27 @@ SELECT GREATEST(1, 1.2)
 ----
 1.2
 
+# Test homogenous functions that can't be constant folded.
+query I
+SELECT GREATEST(NULL, a, 5, NULL) FROM foo
+----
+5
+
+query I
+SELECT GREATEST(NULL, NULL, NULL, a, -1) FROM foo
+----
+1
+
+query I
+SELECT LEAST(NULL, a, 5, NULL) FROM foo
+----
+1
+
+query I
+SELECT LEAST(NULL, NULL, NULL, a, -1) FROM foo
+----
+-1
+
 # Test float and int comparison.
 
 query BBBB
@@ -1176,18 +1203,26 @@ SELECT CURRENT_SCHEMAS(false)
 ----
 {"public"}
 
+# Force the function to be evaluated at execution time and verify it doesn't
+# break when distsql is on.
+query T
+SELECT CURRENT_SCHEMAS(x) FROM (VALUES (true), (false)) AS t(x);
+----
+{"pg_catalog","public"}
+{"public"}
+
 statement ok
 SET SEARCH_PATH=test,pg_catalog
 
 query T
 SELECT CURRENT_SCHEMAS(true)
 ----
-{"test","pg_catalog"}
+{"pg_catalog"}
 
 query T
 SELECT CURRENT_SCHEMAS(false)
 ----
-{"test","pg_catalog"}
+{"pg_catalog"}
 
 statement ok
 RESET SEARCH_PATH
@@ -1218,9 +1253,6 @@ false
 # SELECT current_schema()
 # ----
 # NULL
-
-statement ok
-CREATE TABLE foo (a int)
 
 query B
 SELECT pg_catalog.pg_table_is_visible('foo'::regclass)
@@ -1360,6 +1392,30 @@ query T
 SELECT DECODE('123\000456', 'escape')::STRING
 ----
 \x31323300343536
+
+query TT
+SELECT ENCODE('abc', 'base64'), DECODE('YWJj', 'base64')
+----
+YWJj abc
+
+query T
+SELECT DECODE('padded==', 'base64')::STRING
+----
+\xa5a75d79
+
+query T
+SELECT DECODE('padded1=', 'base64')::STRING
+----
+\xa5a75d79dd
+
+query error illegal base64 data at input byte 4
+SELECT DECODE('invalid', 'base64')
+
+query error only 'hex', 'escape', and 'base64' formats are supported for ENCODE
+SELECT ENCODE('abc', 'fake')
+
+query error only 'hex', 'escape', and 'base64' formats are supported for DECODE
+SELECT DECODE('abc', 'fake')
 
 query T
 SELECT FROM_IP(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x01\x02\x03\x04')
@@ -1677,3 +1733,40 @@ query TITI
 SELECT pg_catalog.inet_client_addr(), pg_catalog.inet_client_port(), pg_catalog.inet_server_addr(), pg_catalog.inet_server_port()
 ----
 ::/0  0  ::/0  0
+
+query TTTT
+SELECT quote_ident('foo'), quote_ident('select'), quote_ident('int8'), quote_ident('numeric')
+----
+foo  "select"  int8  "numeric"
+
+
+query TT
+SELECT lpad('abc', 5, 'xy'), rpad('abc', 5, 'xy')
+----
+xyabc  abcxy
+
+query TT
+SELECT lpad('abc', 5, ''), rpad('abc', 5, '')
+----
+abc  abc
+
+query error memory budget exceeded
+SELECT lpad('abc', 100000000000000)
+
+query error memory budget exceeded
+SELECT rpad('abc', 100000000000000)
+
+query TT
+SELECT array_to_string(ARRAY['a', 'b,', NULL, 'c'], ','), array_to_string(ARRAY['a', 'b,', NULL, 'c'], ',', NULL)
+----
+a,b,,c  a,b,,c
+
+query TT
+SELECT array_to_string(ARRAY['a', 'b,', 'c'], NULL), array_to_string(ARRAY['a', 'b,', NULL, 'c'], 'foo', 'zerp')
+----
+NULL  afoob,foozerpfooc
+
+query TT
+SELECT array_to_string(NULL, ','), array_to_string(NULL, 'foo', 'zerp')
+----
+NULL  NULL

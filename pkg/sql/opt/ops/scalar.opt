@@ -7,17 +7,60 @@
 # Scalar - All operators in this file are marked with the Scalar tag, so they
 #          can be easily distinguished from Relational and Enforcer operators.
 
+# Subquery is a subquery in a single-row context. Here are some examples:
+#
+#   SELECT 1 = (SELECT 1)
+#   SELECT (1, 'a') = (SELECT 1, 'a')`
+#
+# In a single-row context, the outer query is only valid if the subquery returns
+# at most one row. Subqueries in a multi-row context can be transformed to a
+# single row context using the Any operator. See the comment above the Any
+# operator for more details.
+#
+# The Input field contains the subquery itself, which should be wrapped in a
+# Max1Row operator to enforce that the subquery can return at most one row
+# (Max1Row may be removed by the optimizer later if it can determine statically
+# that the subquery will always return at most one row). In addition, the
+# subquery must project exactly one output column. If the subquery returns one
+# row, then that column is bound to the single column value in that row. If the
+# subquery returns zero rows, then that column is bound to NULL.
 [Scalar]
 define Subquery {
-    Input      Expr
-    Projection Expr
+    Input Expr
+}
+
+# Any is a SQL operator that applies a comparison to every row of an input
+# subquery and returns true if any of the comparisons are true, else returns
+# null if any of the comparisons are null, else returns false. The following
+# transformations map from various SQL operators into the Any operator:
+#
+#   <scalar> IN (<subquery>)
+#   ==> (Any <subquery> <scalar> EqOp)
+#
+#   <scalar> NOT IN (<subquery>)
+#   ==> (Not (Any <subquery> <scalar> EqOp))
+#
+#   <scalar> <comp> {SOME|ANY}(<subquery>)
+#   ==> (Any <subquery> <scalar> <comp>)
+#
+#   <scalar> <comp> ALL(<subquery>)
+#   ==> (Not (Any <subquery> <scalar> <negated-comp>))
+#
+# Any expects the input subquery to return a single column of any data type. The
+# scalar value is compared with that column using the specified comparison
+# operator.
+[Scalar]
+define Any {
+    Input  Expr
+    Scalar Expr
+    Cmp    Operator
 }
 
 # Variable is the typed scalar value of a column in the query. The private
-# field is a Metadata.ColumnIndex that references the column by index.
+# field is a Metadata.ColumnID that references the column by index.
 [Scalar]
 define Variable {
-    Col ColumnIndex
+    Col ColumnID
 }
 
 # Const is a typed scalar constant value. The private field is a tree.Datum
@@ -64,7 +107,7 @@ define False {
 
 [Scalar]
 define Placeholder {
-    Value Interface
+    Value TypedExpr
 }
 
 [Scalar]
@@ -73,25 +116,36 @@ define Tuple {
 }
 
 # Projections is a set of typed scalar expressions that will become output
-# columns for a containing Project operator. The private Cols field contains
-# the list of column indexes returned by the expression, as a *opt.ColList. It
-# is not legal for Cols to be empty.
+# columns for a containing Project operator. 
+#
+# The private Defs field contains the list of column indexes returned by each
+# expression, and a list of pass-through columns.
+#
+# Elems cannot contain a simple VariableOp with the same ColumnID as the
+# synthesized column (in Def.SynthesizedCols); that is a pass-through column.
+# Elems can contain a VariableOp when a new ColumnID is being assigned, such as
+# in the case of an outer column reference.
 [Scalar]
 define Projections {
     Elems ExprList
-    Cols  ColList
+    Def   ProjectionsOpDef
 }
 
-# Aggregations is a set of aggregate expressions that will become output
-# columns for a containing GroupBy operator. The private Cols field contains
-# the list of column indexes returned by the expression, as a *ColList. It
-# is legal for Cols to be empty.
+# Aggregations is a set of aggregate expressions that will become output columns
+# for a containing GroupBy operator. The expressions can only consist of
+# aggregate functions and variable references. More complex expressions must be
+# formulated using a Project operator as input to the GroupBy operator.
+#
+# The private Cols field contains the list of column indexes returned by the
+# expression, as an opt.ColList. It is legal for Cols to be empty.
 [Scalar]
 define Aggregations {
     Aggs ExprList
     Cols ColList
 }
 
+# Exists takes a relational query as its input, and evaluates to true if the
+# query returns at least one row.
 [Scalar]
 define Exists {
     Input Expr
@@ -262,6 +316,24 @@ define Contains {
    Right Expr
 }
 
+[Scalar, Comparison]
+define JsonExists {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define JsonAllExists {
+   Left  Expr
+   Right Expr
+}
+
+[Scalar, Comparison]
+define JsonSomeExists {
+   Left  Expr
+   Right Expr
+}
+
 [Scalar, Binary]
 define Bitand {
    Left  Expr
@@ -374,10 +446,20 @@ define UnaryComplement {
     Input Expr
 }
 
+# Cast converts the input expression into an expression of the target type.
+# While the input's type is restricted to the datum types in the types package,
+# the target type can be any of the column types in the coltypes package. For
+# example, this is a legal cast:
+#
+#   'hello'::VARCHAR(2)
+#
+# That expression has the effect of truncating the string to just 'he', since
+# the target data type allows a maximum of two characters. This is one example
+# of a "lossy" cast.
 [Scalar]
 define Cast {
-    Input Expr
-    Typ   Type
+    Input     Expr
+    TargetTyp ColType
 }
 
 # Case is a CASE statement of the form:
@@ -389,7 +471,7 @@ define Cast {
 #
 # The Case operator evaluates <Input> (if not provided, Input is set to True),
 # then picks the WHEN branch where <condval> is equal to
-# <cond>, then evaluates and returns the corresponding THEN expression. If no
+# <Input>, then evaluates and returns the corresponding THEN expression. If no
 # WHEN branch matches, the ELSE expression is evaluated and returned, if any.
 # Otherwise, NULL is returned.
 #
@@ -411,8 +493,15 @@ define When {
     Value     Expr
 }
 
+# Array is an ARRAY literal of the form ARRAY[<expr1>, <expr2>, ..., <exprN>].
+[Scalar]
+define Array {
+    Elems ExprList
+    Typ   Type
+}
+
 # Function invokes a builtin SQL function like CONCAT or NOW, passing the given
-# arguments. The private field is an opt.FuncOpDef struct that provides the
+# arguments. The private field is a *opt.FuncOpDef struct that provides the
 # name of the function as well as a pointer to the builtin overload definition.
 [Scalar]
 define Function {
@@ -430,4 +519,116 @@ define Coalesce {
 [Scalar]
 define UnsupportedExpr {
   Value TypedExpr
+}
+
+[Scalar, Aggregate]
+define ArrayAgg {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define Avg {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define BoolAnd {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define BoolOr {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define ConcatAgg {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define Count {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define CountRows {
+}
+
+[Scalar, Aggregate]
+define Max {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define Min {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define SumInt {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define Sum {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define SqrDiff {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define Variance {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define StdDev {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define XorAgg {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define JsonAgg {
+    Input Expr
+}
+
+[Scalar, Aggregate]
+define JsonbAgg {
+    Input Expr
+}
+
+# ExistsAgg evaluates to True if there is at least one non-null value in the
+# grouping set. Otherwise, it returns False. Its behavior is exactly equivalent
+# to:
+#
+#   COUNT(c) > 0
+#
+# Just like COUNT(c) and the other SQL aggregates, EXISTS_AGG(c) will ignore
+# null values. A set containing only null values is equivalent to an empty set
+# (both yield False).
+#
+# ExistsAgg is not part of SQL, but it's used internally to rewrite correlated
+# Exists subqueries into an efficient and convenient form.
+[Scalar, Aggregate]
+define ExistsAgg {
+    Input Expr
+}
+
+# AnyNotNull returns any non-null value in the grouping set, or null if there
+# are no non-null values. This is particularly useful for "passing through" the
+# value of a column that is known to be constant within a grouping set.
+#
+# AnyNotNull is not part of SQL, but it's used internally to rewrite correlated
+# subqueries into an efficient and convenient form.
+[Scalar, Aggregate]
+define AnyNotNull {
+    Input Expr
 }

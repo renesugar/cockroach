@@ -47,10 +47,6 @@ func declareKeysClearRange(
 	// We look up the range descriptor key to check whether the span
 	// is equal to the entire range for fast stats updating.
 	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
-	// We may look up the current range stats in order to efficiently
-	// negate them in the case of being able to clear the entire user-
-	// space span of keys in the range.
-	spans.Add(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeStatsKey(header.RangeID)})
 }
 
 // ClearRange wipes all MVCC versions of keys covered by the specified
@@ -144,7 +140,7 @@ func computeStatsDelta(
 	// If we can't use the fast stats path, or race test is enabled,
 	// compute stats across the key span to be cleared.
 	if !fast || util.RaceEnabled {
-		iter := batch.NewIterator(false)
+		iter := batch.NewIterator(engine.IterOptions{})
 		computed, err := iter.ComputeStats(from, to, delta.LastUpdateNanos)
 		iter.Close()
 		if err != nil {

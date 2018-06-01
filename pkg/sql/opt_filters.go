@@ -254,6 +254,11 @@ func (p *planner) propagateFilters(
 			return plan, extraFilter, err
 		}
 
+	case *spoolNode:
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
+			return plan, extraFilter, err
+		}
+
 	case *createTableNode:
 		if n.n.As() {
 			if n.sourcePlan, err = p.triggerFilterPropagation(ctx, n.sourcePlan); err != nil {
@@ -262,22 +267,41 @@ func (p *planner) propagateFilters(
 		}
 
 	case *deleteNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
+	case *rowCountNode:
+		newSource, err := p.triggerFilterPropagation(ctx, n.source)
+		if err != nil {
+			return plan, extraFilter, err
+		}
+		n.source = newSource.(batchedPlanNode)
+
+	case *serializeNode:
+		newSource, err := p.triggerFilterPropagation(ctx, n.source)
+		if err != nil {
+			return plan, extraFilter, err
+		}
+		n.source = newSource.(batchedPlanNode)
+
 	case *insertNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
 	case *upsertNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
 			return plan, extraFilter, err
 		}
 
 	case *updateNode:
-		if n.run.rows, err = p.triggerFilterPropagation(ctx, n.run.rows); err != nil {
+		if n.source, err = p.triggerFilterPropagation(ctx, n.source); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *distSQLWrapper:
+		if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
 			return plan, extraFilter, err
 		}
 
@@ -294,8 +318,10 @@ func (p *planner) propagateFilters(
 		}
 
 	case *showTraceNode:
-		if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
-			return plan, extraFilter, err
+		if n.plan != nil {
+			if n.plan, err = p.triggerFilterPropagation(ctx, n.plan); err != nil {
+				return plan, extraFilter, err
+			}
 		}
 
 	case *showTraceReplicaNode:
@@ -320,13 +346,26 @@ func (p *planner) propagateFilters(
 			return plan, extraFilter, err
 		}
 
+	case *cancelQueriesNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *cancelSessionsNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
+	case *controlJobsNode:
+		if n.rows, err = p.triggerFilterPropagation(ctx, n.rows); err != nil {
+			return plan, extraFilter, err
+		}
+
 	case *alterIndexNode:
 	case *alterTableNode:
 	case *alterSequenceNode:
 	case *alterUserSetPasswordNode:
-	case *cancelQueryNode:
 	case *scrubNode:
-	case *controlJobNode:
 	case *createDatabaseNode:
 	case *createIndexNode:
 	case *CreateUserNode:
@@ -418,9 +457,8 @@ func (p *planner) addGroupFilter(
 		// aggregations"), and renumber the indexed vars accordingly.
 		convFunc := func(v tree.VariableExpr) (bool, tree.Expr) {
 			if iv, ok := v.(*tree.IndexedVar); ok {
-				f := g.funcs[iv.Idx]
-				if f.isIdentAggregate() {
-					return true, &tree.IndexedVar{Idx: f.argRenderIdx}
+				if groupingCol, ok := g.aggIsGroupingColumn(iv.Idx); ok {
+					return true, &tree.IndexedVar{Idx: groupingCol}
 				}
 			}
 			return false, v
@@ -431,8 +469,7 @@ func (p *planner) addGroupFilter(
 	}
 
 	// Propagate the inner filter.
-	newPlan, err := p.propagateOrWrapFilters(
-		ctx, g.plan, info, innerFilter)
+	newPlan, err := p.propagateOrWrapFilters(ctx, g.plan, nil /* info */, innerFilter)
 	if err != nil {
 		return g, extraFilter, err
 	}

@@ -42,13 +42,18 @@ func TestSetup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	tests := []struct {
-		rows      int
-		batchSize int
+		rows        int
+		batchSize   int
+		concurrency int
 	}{
-		{10, 1},
-		{10, 9},
-		{10, 10},
-		{10, 100},
+		{10, 1, 1},
+		{10, 9, 1},
+		{10, 10, 1},
+		{10, 100, 1},
+		{10, 1, 4},
+		{10, 9, 4},
+		{10, 10, 4},
+		{10, 100, 4},
 	}
 
 	ctx := context.Background()
@@ -62,15 +67,16 @@ func TestSetup(t *testing.T) {
 			sqlDB.Exec(t, `DROP TABLE IF EXISTS bank`)
 
 			gen := bank.FromRows(test.rows)
-			if _, err := workload.Setup(sqlDB.DB, gen, test.batchSize); err != nil {
+			if _, err := workload.Setup(ctx, sqlDB.DB, gen, test.batchSize, test.concurrency); err != nil {
 				t.Fatalf("%+v", err)
 			}
 
 			for _, table := range gen.Tables() {
 				var c int
 				sqlDB.QueryRow(t, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table.Name)).Scan(&c)
-				if c != table.InitialRowCount {
-					t.Errorf(`%s: got %d rows expected %d`, table.Name, c, table.InitialRowCount)
+				if c != table.InitialRows.NumTotal {
+					t.Errorf(`%s: got %d rows expected %d`,
+						table.Name, c, table.InitialRows.NumTotal)
 				}
 			}
 		})

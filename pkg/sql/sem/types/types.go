@@ -65,6 +65,8 @@ var (
 	Date T = tDate{}
 	// Time is the type of a DTime. Can be compared with ==.
 	Time T = tTime{}
+	//TimeTZ is the type of a DTimeTZ, Can be compared with ==.
+	TimeTZ T = tTimeTZ{}
 	// Timestamp is the type of a DTimestamp. Can be compared with ==.
 	Timestamp T = tTimestamp{}
 	// TimestampTZ is the type of a DTimestampTZ. Can be compared with ==.
@@ -93,6 +95,7 @@ var (
 		Bytes,
 		Date,
 		Time,
+		TimeTZ,
 		Timestamp,
 		TimestampTZ,
 		Interval,
@@ -106,7 +109,7 @@ var (
 	// compared with ==.
 	FamCollatedString T = TCollatedString{}
 	// FamTuple is the type family of a DTuple. CANNOT be compared with ==.
-	FamTuple T = TTuple(nil)
+	FamTuple T = TTuple{}
 	// FamArray is the type family of a DArray. CANNOT be compared with ==.
 	FamArray T = TArray{}
 	// FamTable is the type family of a DTable. CANNOT be compared with ==.
@@ -241,6 +244,15 @@ func (tTime) Oid() oid.Oid             { return oid.T_time }
 func (tTime) SQLName() string          { return "time" }
 func (tTime) IsAmbiguous() bool        { return false }
 
+type tTimeTZ struct{}
+
+func (tTimeTZ) String() string           { return "timetz" }
+func (tTimeTZ) Equivalent(other T) bool  { return UnwrapType(other) == TimeTZ || other == Any }
+func (tTimeTZ) FamilyEqual(other T) bool { return UnwrapType(other) == TimeTZ }
+func (tTimeTZ) Oid() oid.Oid             { return oid.T_timetz }
+func (tTimeTZ) SQLName() string          { return "time with time zone" }
+func (tTimeTZ) IsAmbiguous() bool        { return false }
+
 type tTimestamp struct{}
 
 func (tTimestamp) String() string { return "timestamp" }
@@ -308,19 +320,26 @@ func (tINet) SQLName() string          { return "inet" }
 func (tINet) IsAmbiguous() bool        { return false }
 
 // TTuple is the type of a DTuple.
-type TTuple []T
+type TTuple struct {
+	Types  []T
+	Labels []string
+}
 
 // String implements the fmt.Stringer interface.
 func (t TTuple) String() string {
 	var buf bytes.Buffer
 	buf.WriteString("tuple")
-	if t != nil {
+	if t.Types != nil {
 		buf.WriteByte('{')
-		for i, typ := range t {
+		for i, typ := range t.Types {
 			if i != 0 {
 				buf.WriteString(", ")
 			}
 			buf.WriteString(typ.String())
+			if t.Labels != nil {
+				buf.WriteString(" AS ")
+				buf.WriteString(t.Labels[i])
+			}
 		}
 		buf.WriteByte('}')
 	}
@@ -333,11 +352,20 @@ func (t TTuple) Equivalent(other T) bool {
 		return true
 	}
 	u, ok := UnwrapType(other).(TTuple)
-	if !ok || len(t) != len(u) {
+	if !ok {
 		return false
 	}
-	for i, typ := range t {
-		if !typ.Equivalent(u[i]) {
+	if len(t.Types) == 0 || len(u.Types) == 0 {
+		// Tuples that aren't fully specified (have a nil subtype list) are always
+		// equivalent to other tuples, to allow overloads to specify that they take
+		// an arbitrary tuple type.
+		return true
+	}
+	if len(t.Types) != len(u.Types) {
+		return false
+	}
+	for i, typ := range t.Types {
+		if !typ.Equivalent(u.Types[i]) {
 			return false
 		}
 	}
@@ -358,12 +386,12 @@ func (TTuple) SQLName() string { return "record" }
 
 // IsAmbiguous implements the T interface.
 func (t TTuple) IsAmbiguous() bool {
-	for _, typ := range t {
+	for _, typ := range t.Types {
 		if typ == nil || typ.IsAmbiguous() {
 			return true
 		}
 	}
-	return false
+	return len(t.Types) == 0
 }
 
 // TPlaceholder is the type of a placeholder.
@@ -377,6 +405,9 @@ func (t TPlaceholder) String() string { return fmt.Sprintf("placeholder{%s}", t.
 // Equivalent implements the T interface.
 func (t TPlaceholder) Equivalent(other T) bool {
 	if other == Any {
+		return true
+	}
+	if other.IsAmbiguous() {
 		return true
 	}
 	u, ok := UnwrapType(other).(TPlaceholder)
@@ -480,7 +511,7 @@ func (TTable) SQLName() string { return "anyelement" }
 
 // IsAmbiguous implements the T interface.
 func (a TTable) IsAmbiguous() bool {
-	return a.Cols == nil || a.Cols.IsAmbiguous()
+	return a.Cols.Types == nil || a.Cols.IsAmbiguous()
 }
 
 type tAny struct{}

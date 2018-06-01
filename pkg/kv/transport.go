@@ -21,6 +21,9 @@ import (
 	"sync"
 	"time"
 
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -29,8 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 // A SendOptions structure describes the algorithm for sending RPCs to one or
@@ -128,7 +129,7 @@ func grpcTransportFactoryImpl(
 		})
 	}
 
-	// Put known-unhealthy clients last.
+	// Put known-healthy clients first.
 	splitHealthy(clients)
 
 	return &grpcTransport{
@@ -376,8 +377,10 @@ func (h byHealth) Less(i, j int) bool { return h[i].healthy && !h[j].healthy }
 // without a full RPC stack.
 func SenderTransportFactory(tracer opentracing.Tracer, sender client.Sender) TransportFactory {
 	return func(
-		_ SendOptions, _ *rpc.Context, _ ReplicaSlice, args roachpb.BatchRequest,
+		_ SendOptions, _ *rpc.Context, replicas ReplicaSlice, args roachpb.BatchRequest,
 	) (Transport, error) {
+		// Always send to the first replica.
+		args.Replica = replicas[0].ReplicaDescriptor
 		return &senderTransport{tracer, sender, args, false}, nil
 	}
 }

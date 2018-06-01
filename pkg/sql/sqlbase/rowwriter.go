@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -164,7 +165,6 @@ type RowInserter struct {
 	marshaled []roachpb.Value
 	key       roachpb.Key
 	valueBuf  []byte
-	scratch   []byte
 	value     roachpb.Value
 }
 
@@ -236,6 +236,14 @@ func insertPutFn(
 	b.Put(key, value)
 }
 
+// insertDelFn is used by insertRow to delete existing rows.
+func insertDelFn(ctx context.Context, b putter, key *roachpb.Key, traceKV bool) {
+	if traceKV {
+		log.VEventfDepth(ctx, 1, 2, "Del %s", *key)
+	}
+	b.Del(key)
+}
+
 // insertPutFn is used by insertRow when conflicts should be ignored.
 func insertInvertedPutFn(
 	ctx context.Context, b putter, key *roachpb.Key, value *roachpb.Value, traceKV bool,
@@ -250,6 +258,7 @@ type putter interface {
 	CPut(key, value, expValue interface{})
 	Put(key, value interface{})
 	InitPut(key, value interface{}, failOnTombstones bool)
+	Del(key ...interface{})
 }
 
 // InsertRow adds to the batch the kv operations necessary to insert a table row
@@ -258,7 +267,7 @@ func (ri *RowInserter) InsertRow(
 	ctx context.Context,
 	b putter,
 	values []tree.Datum,
-	ignoreConflicts bool,
+	overwrite bool,
 	checkFKs checkFKConstraints,
 	traceKV bool,
 ) error {
@@ -267,7 +276,7 @@ func (ri *RowInserter) InsertRow(
 	}
 
 	putFn := insertCPutFn
-	if ignoreConflicts {
+	if overwrite {
 		putFn = insertPutFn
 	}
 
@@ -294,79 +303,13 @@ func (ri *RowInserter) InsertRow(
 	}
 
 	// Add the new values.
-	// TODO(dan): This has gotten very similar to the loop in UpdateRow, see if
-	// they can be DRY'd. Ideally, this would also work for
-	// truncateAndBackfillColumnsChunk, which is currently abusing rowUpdater.
-	for i, family := range ri.Helper.TableDesc.Families {
-		if i > 0 {
-			// HACK: MakeFamilyKey appends to its argument, so on every loop iteration
-			// after the first, trim primaryIndexKey so nothing gets overwritten.
-			// TODO(dan): Instead of this, use something like engine.ChunkAllocator.
-			primaryIndexKey = primaryIndexKey[:len(primaryIndexKey):len(primaryIndexKey)]
-		}
-
-		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID {
-			// Storage optimization to store DefaultColumnID directly as a value. Also
-			// backwards compatible with the original BaseFormatVersion.
-
-			idx, ok := ri.InsertColIDtoRowIndex[family.DefaultColumnID]
-			if !ok {
-				continue
-			}
-
-			if ri.marshaled[idx].RawBytes != nil {
-				// We only output non-NULL values. Non-existent column keys are
-				// considered NULL during scanning and the row sentinel ensures we know
-				// the row exists.
-
-				ri.key = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
-				putFn(ctx, b, &ri.key, &ri.marshaled[idx], traceKV)
-				ri.key = nil
-			}
-
-			continue
-		}
-
-		ri.key = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
-		ri.valueBuf = ri.valueBuf[:0]
-
-		var lastColID ColumnID
-		familySortedColumnIDs, ok := ri.Helper.sortedColumnFamily(family.ID)
-		if !ok {
-			panic("invalid family sorted column id map")
-		}
-		for _, colID := range familySortedColumnIDs {
-			idx, ok := ri.InsertColIDtoRowIndex[colID]
-			if !ok || values[idx] == tree.DNull {
-				// Column not being inserted.
-				continue
-			}
-
-			if skip, err := ri.Helper.skipColumnInPK(colID, family.ID, values[idx]); err != nil {
-				return err
-			} else if skip {
-				continue
-			}
-
-			col := ri.InsertCols[idx]
-
-			if lastColID > col.ID {
-				panic(fmt.Errorf("cannot write column id %d after %d", col.ID, lastColID))
-			}
-			colIDDiff := col.ID - lastColID
-			lastColID = col.ID
-			ri.valueBuf, err = EncodeTableValue(ri.valueBuf, colIDDiff, values[idx], ri.scratch)
-			if err != nil {
-				return err
-			}
-		}
-
-		if family.ID == 0 || len(ri.valueBuf) > 0 {
-			ri.value.SetTuple(ri.valueBuf)
-			putFn(ctx, b, &ri.key, &ri.value, traceKV)
-		}
-
-		ri.key = nil
+	ri.valueBuf, err = prepareInsertOrUpdateBatch(ctx, b,
+		&ri.Helper, primaryIndexKey, ri.InsertCols,
+		values, ri.InsertColIDtoRowIndex,
+		ri.marshaled, ri.InsertColIDtoRowIndex,
+		&ri.key, &ri.value, ri.valueBuf, putFn, overwrite, traceKV)
+	if err != nil {
+		return err
 	}
 
 	putFn = insertInvertedPutFn
@@ -376,6 +319,143 @@ func (ri *RowInserter) InsertRow(
 	}
 
 	return nil
+}
+
+// prepareInsertOrUpdateBatch constructs a KV batch that inserts or
+// updates a row in KV.
+// - batch is the KV batch where commands should be appended.
+// - putFn is the functions that can append Put/CPut commands to the batch.
+//   (must be adapted depending on whether 'overwrite' is set)
+// - helper is the rowHelper that knows about the table being modified.
+// - primaryIndexKey is the PK prefix for the current row.
+// - updatedCols is the list of schema columns being updated.
+// - values is the SQL-level row values that are being written.
+// - marshaledValues contains the pre-encoded KV-level row values.
+//   marshaledValues is only used when writing single column families.
+//   Regardless of whether there are single column families,
+//   pre-encoding must occur prior to calling this function to check whether
+//   the encoding is _possible_ (i.e. values fit in the column types, etc).
+// - valColIDMapping/marshaledColIDMapping is the mapping from column
+//   IDs into positions of the slices values or marshaledValues.
+// - kvKey and kvValues must be heap-allocated scratch buffers to write
+//   roachpb.Key and roachpb.Value values.
+// - rawValueBuf must be a scratch byte array. This must be reinitialized
+//   to an empty slice on each call but can be preserved at its current
+//   capacity to avoid allocations. The function returns the slice.
+// - overwrite must be set to true for UPDATE and UPSERT.
+// - traceKV is to be set to log the KV operations added to the batch.
+func prepareInsertOrUpdateBatch(
+	ctx context.Context,
+	batch putter,
+	helper *rowHelper,
+	primaryIndexKey []byte,
+	updatedCols []ColumnDescriptor,
+	values []tree.Datum,
+	valColIDMapping map[ColumnID]int,
+	marshaledValues []roachpb.Value,
+	marshaledColIDMapping map[ColumnID]int,
+	kvKey *roachpb.Key,
+	kvValue *roachpb.Value,
+	rawValueBuf []byte,
+	putFn func(ctx context.Context, b putter, key *roachpb.Key, value *roachpb.Value, traceKV bool),
+	overwrite, traceKV bool,
+) ([]byte, error) {
+	for i, family := range helper.TableDesc.Families {
+		update := false
+		for _, colID := range family.ColumnIDs {
+			if _, ok := marshaledColIDMapping[colID]; ok {
+				update = true
+				break
+			}
+		}
+		if !update {
+			continue
+		}
+
+		if i > 0 {
+			// HACK: MakeFamilyKey appends to its argument, so on every loop iteration
+			// after the first, trim primaryIndexKey so nothing gets overwritten.
+			// TODO(dan): Instead of this, use something like engine.ChunkAllocator.
+			primaryIndexKey = primaryIndexKey[:len(primaryIndexKey):len(primaryIndexKey)]
+		}
+
+		*kvKey = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
+		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID {
+			// Storage optimization to store DefaultColumnID directly as a value. Also
+			// backwards compatible with the original BaseFormatVersion.
+
+			idx, ok := marshaledColIDMapping[family.DefaultColumnID]
+			if !ok {
+				continue
+			}
+
+			if marshaledValues[idx].RawBytes == nil {
+				if overwrite {
+					// If the new family contains a NULL value, then we must
+					// delete any pre-existing row.
+					insertDelFn(ctx, batch, kvKey, traceKV)
+				}
+			} else {
+				// We only output non-NULL values. Non-existent column keys are
+				// considered NULL during scanning and the row sentinel ensures we know
+				// the row exists.
+				putFn(ctx, batch, kvKey, &marshaledValues[idx], traceKV)
+			}
+
+			continue
+		}
+
+		rawValueBuf = rawValueBuf[:0]
+
+		var lastColID ColumnID
+		familySortedColumnIDs, ok := helper.sortedColumnFamily(family.ID)
+		if !ok {
+			return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
+				"programming error: invalid family sorted column id map")
+		}
+		for _, colID := range familySortedColumnIDs {
+			idx, ok := valColIDMapping[colID]
+			if !ok || values[idx] == tree.DNull {
+				// Column not being updated or inserted.
+				continue
+			}
+
+			if skip, err := helper.skipColumnInPK(colID, family.ID, values[idx]); err != nil {
+				return nil, err
+			} else if skip {
+				continue
+			}
+
+			col := updatedCols[idx]
+
+			if lastColID > col.ID {
+				return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
+					"programming error: cannot write column id %d after %d", col.ID, lastColID)
+			}
+			colIDDiff := col.ID - lastColID
+			lastColID = col.ID
+			var err error
+			rawValueBuf, err = EncodeTableValue(rawValueBuf, colIDDiff, values[idx], nil)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if family.ID != 0 && len(rawValueBuf) == 0 {
+			if overwrite {
+				// The family might have already existed but every column in it is being
+				// set to NULL, so delete it.
+				insertDelFn(ctx, batch, kvKey, traceKV)
+			}
+		} else {
+			kvValue.SetTuple(rawValueBuf)
+			putFn(ctx, batch, kvKey, kvValue, traceKV)
+		}
+
+		*kvKey = nil
+	}
+
+	return rawValueBuf, nil
 }
 
 // EncodeIndexesForRow encodes the provided values into their primary and
@@ -412,7 +492,6 @@ type RowUpdater struct {
 	key             roachpb.Key
 	indexEntriesBuf []IndexEntry
 	valueBuf        []byte
-	scratch         []byte
 	value           roachpb.Value
 }
 
@@ -653,7 +732,7 @@ func (ru *RowUpdater) UpdateRow(
 		return nil, errors.Errorf("got %d values but expected %d", len(updateValues), len(ru.UpdateCols))
 	}
 
-	primaryIndexKey, secondaryIndexEntries, err := ru.Helper.encodeIndexes(ru.FetchColIDtoRowIndex, oldValues)
+	primaryIndexKey, oldSecondaryIndexEntries, err := ru.Helper.encodeIndexes(ru.FetchColIDtoRowIndex, oldValues)
 	if err != nil {
 		return nil, err
 	}
@@ -667,8 +746,8 @@ func (ru *RowUpdater) UpdateRow(
 	// The secondary index entries returned by rowHelper.encodeIndexes are only
 	// valid until the next call to encodeIndexes. We need to copy them so that
 	// we can compare against the new secondary index entries.
-	secondaryIndexEntries = append(ru.indexEntriesBuf[:0], secondaryIndexEntries...)
-	ru.indexEntriesBuf = secondaryIndexEntries
+	oldSecondaryIndexEntries = append(ru.indexEntriesBuf[:0], oldSecondaryIndexEntries...)
+	ru.indexEntriesBuf = oldSecondaryIndexEntries
 
 	// Check that the new value types match the column types. This needs to
 	// happen before index encoding because certain datum types (i.e. tuple)
@@ -712,10 +791,10 @@ func (ru *RowUpdater) UpdateRow(
 			return nil, err
 		}
 
-		ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID)
-		for i := range newSecondaryIndexEntries {
-			if !bytes.Equal(newSecondaryIndexEntries[i].Key, secondaryIndexEntries[i].Key) {
-				ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID)
+		ru.Fks.addCheckForIndex(ru.Helper.TableDesc.PrimaryIndex.ID, ru.Helper.TableDesc.PrimaryIndex.Type)
+		for i := range ru.Helper.Indexes {
+			if !bytes.Equal(newSecondaryIndexEntries[i].Key, oldSecondaryIndexEntries[i].Key) {
+				ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
 			}
 		}
 
@@ -745,130 +824,75 @@ func (ru *RowUpdater) UpdateRow(
 	}
 
 	// Add the new values.
-	// TODO(dan): This has gotten very similar to the loop in insertRow, see if
-	// they can be DRY'd. Ideally, this would also work for
-	// truncateAndBackfillColumnsChunk, which is currently abusing rowUpdater.
-	for i, family := range ru.Helper.TableDesc.Families {
-		update := false
-		for _, colID := range family.ColumnIDs {
-			if _, ok := ru.updateColIDtoRowIndex[colID]; ok {
-				update = true
-				break
-			}
-		}
-		if !update {
-			continue
-		}
-
-		if i > 0 {
-			// HACK: MakeFamilyKey appends to its argument, so on every loop iteration
-			// after the first, trim primaryIndexKey so nothing gets overwritten.
-			// TODO(dan): Instead of this, use something like engine.ChunkAllocator.
-			primaryIndexKey = primaryIndexKey[:len(primaryIndexKey):len(primaryIndexKey)]
-		}
-
-		if len(family.ColumnIDs) == 1 && family.ColumnIDs[0] == family.DefaultColumnID {
-			// Storage optimization to store DefaultColumnID directly as a value. Also
-			// backwards compatible with the original BaseFormatVersion.
-
-			idx, ok := ru.updateColIDtoRowIndex[family.DefaultColumnID]
-			if !ok {
-				continue
-			}
-
-			ru.key = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
-			if traceKV {
-				log.VEventf(ctx, 2, "Put %s -> %v", keys.PrettyPrint(ru.Helper.primIndexValDirs, ru.key), ru.marshaled[idx].PrettyPrint())
-			}
-			batch.Put(&ru.key, &ru.marshaled[idx])
-			ru.key = nil
-
-			continue
-		}
-
-		ru.key = keys.MakeFamilyKey(primaryIndexKey, uint32(family.ID))
-		ru.valueBuf = ru.valueBuf[:0]
-
-		var lastColID ColumnID
-		familySortedColumnIDs, ok := ru.Helper.sortedColumnFamily(family.ID)
-		if !ok {
-			panic("invalid family sorted column id map")
-		}
-		for _, colID := range familySortedColumnIDs {
-			idx, ok := ru.FetchColIDtoRowIndex[colID]
-			if !ok {
-				return nil, errors.Errorf("column %d was expected to be fetched, but wasn't", colID)
-			}
-			if ru.newValues[idx] == tree.DNull {
-				continue
-			}
-
-			if skip, err := ru.Helper.skipColumnInPK(colID, family.ID, ru.newValues[idx]); err != nil {
-				return nil, err
-			} else if skip {
-				continue
-			}
-
-			col := ru.FetchCols[idx]
-
-			if lastColID > col.ID {
-				panic(fmt.Errorf("cannot write column id %d after %d", col.ID, lastColID))
-			}
-			colIDDiff := col.ID - lastColID
-			lastColID = col.ID
-			ru.valueBuf, err = EncodeTableValue(ru.valueBuf, colIDDiff, ru.newValues[idx], ru.scratch)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		if family.ID != 0 && len(ru.valueBuf) == 0 {
-			// The family might have already existed but every column in it is being
-			// set to NULL, so delete it.
-			if traceKV {
-				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.Helper.primIndexValDirs, ru.key))
-			}
-
-			batch.Del(&ru.key)
-		} else {
-			ru.value.SetTuple(ru.valueBuf)
-			if traceKV {
-				log.VEventf(ctx, 2, "Put %s -> %v", keys.PrettyPrint(ru.Helper.primIndexValDirs, ru.key), ru.value.PrettyPrint())
-			}
-			batch.Put(&ru.key, &ru.value)
-		}
-
-		ru.key = nil
+	ru.valueBuf, err = prepareInsertOrUpdateBatch(ctx, b,
+		&ru.Helper, primaryIndexKey, ru.FetchCols,
+		ru.newValues, ru.FetchColIDtoRowIndex,
+		ru.marshaled, ru.updateColIDtoRowIndex,
+		&ru.key, &ru.value, ru.valueBuf, insertPutFn, true /* overwrite */, traceKV)
+	if err != nil {
+		return ru.newValues, nil
 	}
 
 	// Update secondary indexes.
-	for i, newSecondaryIndexEntry := range newSecondaryIndexEntries {
-		secondaryIndexEntry := secondaryIndexEntries[i]
+	// We're iterating through all of the indexes, which should have corresponding entries in both oldSecondaryIndexEntries
+	// and newSecondaryIndexEntries. Inverted indexes could potentially have more entries at the end of both and we will
+	// update those separately.
+	for i, index := range ru.Helper.Indexes {
+		oldSecondaryIndexEntry := oldSecondaryIndexEntries[i]
+		newSecondaryIndexEntry := newSecondaryIndexEntries[i]
+
+		// We're skipping inverted indexes in this loop, but appending the inverted index entry to the back of
+		// newSecondaryIndexEntries to process later. For inverted indexes we need to remove all old entries before adding
+		// new ones.
+		if index.Type == IndexDescriptor_INVERTED {
+			newSecondaryIndexEntries = append(newSecondaryIndexEntries, newSecondaryIndexEntry)
+			oldSecondaryIndexEntries = append(oldSecondaryIndexEntries, oldSecondaryIndexEntry)
+
+			continue
+		}
+
 		var expValue interface{}
-		if !bytes.Equal(newSecondaryIndexEntry.Key, secondaryIndexEntry.Key) {
-			ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID)
+		if !bytes.Equal(newSecondaryIndexEntry.Key, oldSecondaryIndexEntry.Key) {
+			ru.Fks.addCheckForIndex(ru.Helper.Indexes[i].ID, ru.Helper.Indexes[i].Type)
 			if traceKV {
-				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], secondaryIndexEntry.Key))
+				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], oldSecondaryIndexEntry.Key))
 			}
-			batch.Del(secondaryIndexEntry.Key)
-		} else if !bytes.Equal(newSecondaryIndexEntry.Value.RawBytes, secondaryIndexEntry.Value.RawBytes) {
-			expValue = &secondaryIndexEntry.Value
+			batch.Del(oldSecondaryIndexEntry.Key)
+		} else if !newSecondaryIndexEntry.Value.EqualData(oldSecondaryIndexEntry.Value) {
+			expValue = &oldSecondaryIndexEntry.Value
 		} else {
 			continue
 		}
+
 		if traceKV {
 			log.VEventf(ctx, 2, "CPut %s -> %v", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], newSecondaryIndexEntry.Key), newSecondaryIndexEntry.Value.PrettyPrint())
 		}
 		batch.CPut(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
 	}
 
-	// We're deleting indexes in a delete only state.
-	for i, deletedSecondaryIndexEntry := range deleteOldSecondaryIndexEntries {
-		ru.Fks.addCheckForIndex(ru.DeleteHelper.Indexes[i].ID)
-		if traceKV {
-			log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(ru.DeleteHelper.secIndexValDirs[i], deletedSecondaryIndexEntry.Key))
+	// We're deleting indexes in a delete only state. We're bounding this by the number of indexes because inverted
+	// indexed will be handled separately.
+	if ru.DeleteHelper != nil {
+		for _, deletedSecondaryIndexEntry := range deleteOldSecondaryIndexEntries {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", deletedSecondaryIndexEntry.Key)
+			}
+			batch.Del(deletedSecondaryIndexEntry.Key)
 		}
-		batch.Del(deletedSecondaryIndexEntry.Key)
+	}
+
+	// We're removing all of the inverted index entries from the row being updated.
+	for i := len(ru.Helper.Indexes); i < len(oldSecondaryIndexEntries); i++ {
+		if traceKV {
+			log.VEventf(ctx, 2, "Del %s", oldSecondaryIndexEntries[i].Key)
+		}
+		batch.Del(oldSecondaryIndexEntries[i].Key)
+	}
+
+	putFn := insertInvertedPutFn
+	// We're adding all of the inverted index entries from the row being updated.
+	for i := len(ru.Helper.Indexes); i < len(newSecondaryIndexEntries); i++ {
+		putFn(ctx, b, &newSecondaryIndexEntries[i].Key, &newSecondaryIndexEntries[i].Value, traceKV)
 	}
 
 	if ru.cascader != nil {

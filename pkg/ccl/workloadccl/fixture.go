@@ -107,6 +107,11 @@ func generatorToGCSFolder(config FixtureConfig, gen workload.Generator) string {
 	)
 }
 
+// FixtureURL returns the URL for pre-computed Generator data stored on GCS.
+func FixtureURL(config FixtureConfig, gen workload.Generator) string {
+	return fmt.Sprintf("gs://%s/%s", config.GCSBucket, generatorToGCSFolder(config, gen))
+}
+
 // GetFixture returns a handle for pre-computed Generator data stored on GCS. It
 // is expected that the generator will have had Configure called on it.
 func GetFixture(
@@ -203,9 +208,9 @@ func (c *groupCSVWriter) groupWriteCSVs(
 			newBytesWritten := atomic.AddInt64(&c.csvBytesWritten, w.Attrs().Size)
 			d := timeutil.Since(c.start)
 			throughput := float64(newBytesWritten) / (d.Seconds() * float64(1<<20) /* 1MiB */)
-			log.Infof(ctx, `wrote csv %s [%d,%d] of %d rows (%.2f%% (%s) in %s: %.1f MB/s)`,
-				table.Name, rowStart, rowIdx, table.InitialRowCount,
-				float64(100*table.InitialRowCount)/float64(rowIdx),
+			log.Infof(ctx, `wrote csv %s [%d,%d] of %d row batches (%.2f%% (%s) in %s: %.1f MB/s)`,
+				table.Name, rowStart, rowIdx, table.InitialRows.NumBatches,
+				float64(100*rowIdx)/float64(table.InitialRows.NumBatches),
 				humanizeutil.IBytes(newBytesWritten), d, throughput)
 
 			return nil
@@ -254,7 +259,8 @@ func (c *groupCSVWriter) groupWriteCSVs(
 func csvServerPaths(
 	csvServerURL string, gen workload.Generator, table workload.Table, numNodes int,
 ) []string {
-	if table.InitialRowCount == 0 {
+	if table.InitialRows.Batch == nil {
+		// Some workloads don't support initial table data.
 		return nil
 	}
 
@@ -262,18 +268,21 @@ func csvServerPaths(
 	// files also means larger jobs table entries, so this is a balance. The
 	// IMPORT code round-robins the files in an import per node, so it's best to
 	// have some integer multiple of the number of nodes in the cluster, which
-	// will guarantee that the work is balanced across the cluster.
-	numFiles := numNodes * 10
-	rowStep := table.InitialRowCount / (numFiles)
+	// will guarantee that the work is balanced across the cluster. In practice,
+	// even as few as 100 files caused jobs badness when creating tpcc fixtures,
+	// so our "integer multiple" is picked to be 1 to minimize this effect. Too
+	// bad about the progress tracking granularity.
+	numFiles := numNodes
+	rowStep := table.InitialRows.NumBatches / numFiles
 	if rowStep == 0 {
 		rowStep = 1
 	}
 
 	var paths []string
-	for rowIdx := 0; rowIdx < table.InitialRowCount; {
+	for rowIdx := 0; rowIdx < table.InitialRows.NumBatches; {
 		chunkRowStart, chunkRowEnd := rowIdx, rowIdx+rowStep
-		if chunkRowEnd > table.InitialRowCount {
-			chunkRowEnd = table.InitialRowCount
+		if chunkRowEnd > table.InitialRows.NumBatches {
+			chunkRowEnd = table.InitialRows.NumBatches
 		}
 
 		params := url.Values{
@@ -336,10 +345,12 @@ func MakeFixture(
 		g.Go(func() error {
 			defer close(tableCSVPathsCh)
 			if len(config.CSVServerURL) == 0 {
-				startRow, endRow := 0, table.InitialRowCount
+				startRow, endRow := 0, table.InitialRows.NumBatches
 				return c.groupWriteCSVs(gCtx, tableCSVPathsCh, table, startRow, endRow)
 			}
-			const numNodesQuery = `SELECT COUNT(node_id) FROM crdb_internal.gossip_liveness`
+			// Specify an explicit empty prefix for crdb_internal to avoid an error if
+			// the database we're connected to does not exist.
+			const numNodesQuery = `SELECT COUNT(node_id) FROM "".crdb_internal.gossip_liveness`
 			var numNodes int
 			if err := sqlDB.QueryRow(numNodesQuery).Scan(&numNodes); err != nil {
 				return err
@@ -401,11 +412,18 @@ func RestoreFixture(ctx context.Context, sqlDB *gosql.DB, fixture Fixture, datab
 		g.Go(func() error {
 			// The IMPORT ... CSV DATA command generates a backup with the table in
 			// database `csv`.
+			start := timeutil.Now()
 			importStmt := fmt.Sprintf(`RESTORE csv.%s FROM $1 WITH into_db=$2`, table.TableName)
-			if _, err := sqlDB.Exec(importStmt, table.BackupURI, database); err != nil {
+			var rows, index, bytes int64
+			var discard interface{}
+			if err := sqlDB.QueryRow(importStmt, table.BackupURI, database).Scan(
+				&discard, &discard, &discard, &rows, &index, &discard, &bytes,
+			); err != nil {
 				return err
 			}
-			log.Infof(gCtx, `loaded %s`, table.TableName)
+			log.Infof(gCtx, `loaded %s (%s, %d rows, %d index entries, %v)`,
+				table.TableName, timeutil.Since(start).Round(time.Second), rows, index, humanizeutil.IBytes(bytes),
+			)
 			return nil
 		})
 	}

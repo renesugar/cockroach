@@ -266,24 +266,24 @@ func TablesNeededForFKs(
 	}
 }
 
-// spanKVFetcher is an kvFetcher that returns a set slice of kvs.
-type spanKVFetcher struct {
-	kvs []roachpb.KeyValue
+// SpanKVFetcher is an kvFetcher that returns a set slice of kvs.
+type SpanKVFetcher struct {
+	KVs []roachpb.KeyValue
 }
 
 // nextBatch implements the kvFetcher interface.
-func (f *spanKVFetcher) nextBatch(_ context.Context) (bool, []roachpb.KeyValue, error) {
-	if len(f.kvs) == 0 {
+func (f *SpanKVFetcher) nextBatch(_ context.Context) (bool, []roachpb.KeyValue, error) {
+	if len(f.KVs) == 0 {
 		return false, nil, nil
 	}
-	res := f.kvs
-	f.kvs = nil
+	res := f.KVs
+	f.KVs = nil
 	return true, res, nil
 }
 
 // getRangesInfo implements the kvFetcher interface.
-func (f *spanKVFetcher) getRangesInfo() []roachpb.RangeInfo {
-	panic("getRangesInfo() called on spanKVFetcher")
+func (f *SpanKVFetcher) getRangesInfo() []roachpb.RangeInfo {
+	panic("getRangesInfo() called on SpanKVFetcher")
 }
 
 // fkBatchChecker accumulates foreign key checks and sends them out as a single
@@ -309,7 +309,9 @@ func (f *fkBatchChecker) addCheck(row tree.Datums, source *baseFKHelper) error {
 		return err
 	}
 	r := roachpb.RequestUnion{}
-	scan := roachpb.ScanRequest{Span: span}
+	scan := roachpb.ScanRequest{
+		RequestHeader: roachpb.RequestHeaderFromSpan(span),
+	}
 	r.MustSetInner(&scan)
 	f.batch.Requests = append(f.batch.Requests, r)
 	f.batchIdxToFk = append(f.batchIdxToFk, source)
@@ -335,10 +337,10 @@ func (f *fkBatchChecker) runCheck(
 		return err.GoError()
 	}
 
-	fetcher := spanKVFetcher{}
+	fetcher := SpanKVFetcher{}
 	for i, resp := range br.Responses {
 		fk := f.batchIdxToFk[i]
-		fetcher.kvs = resp.GetInner().(*roachpb.ScanResponse).Rows
+		fetcher.KVs = resp.GetInner().(*roachpb.ScanResponse).Rows
 		if err := fk.rf.StartScanFrom(ctx, &fetcher); err != nil {
 			return err
 		}
@@ -352,8 +354,8 @@ func (f *fkBatchChecker) runCheck(
 					fkValues[valueIdx] = newRow[fk.ids[colID]]
 				}
 				return pgerror.NewErrorf(pgerror.CodeForeignKeyViolationError,
-					"foreign key violation: value %s not found in %s@%s %s",
-					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen])
+					"foreign key violation: value %s not found in %s@%s %s (txn=%s)",
+					fkValues, fk.searchTable.Name, fk.searchIdx.Name, fk.searchIdx.ColumnNames[:fk.prefixLen], f.txn.Proto())
 			}
 		case CheckDeletes:
 			// If we're deleting, then there's a violation if the scan found something.
@@ -568,8 +570,10 @@ func makeFKUpdateHelper(
 	return ret, err
 }
 
-func (fks fkUpdateHelper) addCheckForIndex(indexID IndexID) {
-	fks.indexIDsToCheck[indexID] = struct{}{}
+func (fks fkUpdateHelper) addCheckForIndex(indexID IndexID, descriptorType IndexDescriptor_Type) {
+	if descriptorType == IndexDescriptor_FORWARD {
+		fks.indexIDsToCheck[indexID] = struct{}{}
+	}
 }
 
 func (fks fkUpdateHelper) runIndexChecks(
@@ -647,7 +651,7 @@ func makeBaseFKHelper(
 	tableArgs := RowFetcherTableArgs{
 		Desc:             b.searchTable,
 		Index:            b.searchIdx,
-		ColIdxMap:        ColIDtoRowIndexFromCols(b.searchTable.Columns),
+		ColIdxMap:        b.searchTable.ColumnIdxMap(),
 		IsSecondaryIndex: b.searchIdx.ID != b.searchTable.PrimaryIndex.ID,
 		Cols:             b.searchTable.Columns,
 	}

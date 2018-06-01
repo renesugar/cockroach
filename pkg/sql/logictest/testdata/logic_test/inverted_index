@@ -1,4 +1,4 @@
-# LogicTest: default distsql parallel-stmts
+# LogicTest: default opt distsql distsql-opt distsql-metadata parallel-stmts
 
 statement ok
 CREATE TABLE t (
@@ -19,7 +19,7 @@ statement error pq: column b is of type INT and thus is not indexable with an in
 CREATE INVERTED INDEX foo_inv ON t(b)
 
 statement error pq: column b is of type INT and thus is not indexable with an inverted index
-CREATE INDEX foo_inv2 ON t(b) USING GIN
+CREATE INDEX foo_inv2 ON t USING GIN (b)
 
 statement error pq: syntax error at or near "inverted"
 CREATE UNIQUE INVERTED INDEX foo_inv ON t(b)
@@ -65,18 +65,18 @@ statement ok
 CREATE TABLE t1 (id1 INT PRIMARY KEY, id2 INT, id3 INT);
 
 statement error pq: inverted indexes don't support interleaved tables
-CREATE INDEX c on t1 (id2)
+CREATE INDEX c on t1 USING GIN (id2)
    STORING (id1,id3)
-   INTERLEAVE in PARENT t1 (id2) USING GIN;
+   INTERLEAVE in PARENT t1 (id2);
 
 statement error pq: inverted indexes don't support stored columns
-CREATE INDEX c on t1 (id2) STORING (id1,id3) USING GIN;
+CREATE INDEX c on t1 USING GIN (id2) STORING (id1,id3);
 
 statement error pq: syntax error at or near "storing"
 CREATE INVERTED INDEX c on t1 (id2) STORING (id1,id3);
 
 statement error pq: inverted indexes can't be unique
-CREATE UNIQUE INDEX foo_inv2 ON t(b) USING GIN
+CREATE UNIQUE INDEX foo_inv2 ON t USING GIN (b)
 
 statement ok
 CREATE TABLE d (
@@ -147,15 +147,19 @@ INSERT INTO d VALUES(18, '[]')
 statement ok
 INSERT INTO d VALUES (29,  NULL)
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @>'{"a": "b"}'
+statement ok
+INSERT INTO d VALUES (30,  '{"a": []}')
+
+statement ok
+INSERT INTO d VALUES (31,  '{"a": {"b": "c", "d": "e"}, "f": "g"}')
+
+query IT
+SELECT * from d where b @> NULL ORDER BY a;
 ----
-index-join  0  index-join  ·      ·                                            (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                            (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                    ·                ·
- │          1  ·           spans  /"a"/"b"-/"a"/"b"/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                            (a, b)           ·
-·           1  ·           table  d@primary                                    ·                ·
+
+query IT
+SELECT * from d where b @> (NULL::JSONB) ORDER BY a;
+----
 
 query IT
 SELECT * from d where b @>'{"a": "b"}' ORDER BY a;
@@ -163,48 +167,17 @@ SELECT * from d where b @>'{"a": "b"}' ORDER BY a;
 1  {"a": "b"}
 7  {"a": "b", "c": "d"}
 
-
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @>'{"a": {"b": [1]}}'
-----
-index-join  0  index-join  ·      ·                                                                        (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                                                        (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                                                ·                ·
- │          1  ·           spans  /"a"/"b"/Arr/1-/"a"/"b"/Arr/1/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                                                        (a, b)           ·
-·           1  ·           table  d@primary                                                                ·                ·
-
 query IT
 SELECT * from d where b @> '{"a": {"b": [1]}}' ORDER BY a;
 ----
 4  {"a": {"b": [1]}}
 5  {"a": {"b": [1, [2]]}}
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @> '{"a": {"b": [[2]]}}';
-----
-index-join  0  index-join  ·      ·                                                                                (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                                                                (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                                                        ·                ·
- │          1  ·           spans  /"a"/"b"/Arr/Arr/2-/"a"/"b"/Arr/Arr/2/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                                                                (a, b)           ·
-·           1  ·           table  d@primary                                                                        ·                ·
-
 query IT
 SELECT * from d where b @> '{"a": {"b": [[2]]}}' ORDER BY a;
 ----
 5  {"a": {"b": [1, [2]]}}
 6  {"a": {"b": [[2]]}}
-
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @> '{"a": {"b":true}}';
-----
-index-join  0  index-join  ·      ·                                                             (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                                             (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                                     ·                ·
- │          1  ·           spans  /"a"/"b"/True-/"a"/"b"/False  ·                ·
- └── scan   1  scan        ·      ·                                                             (a, b)           ·
-·           1  ·           table  d@primary                                                     ·                ·
 
 query IT
 SELECT * from d where b @> '{"a": {"b": true}}' ORDER BY a;
@@ -217,30 +190,10 @@ SELECT * from d where b @> '{"a": {"b": [[2]]}}' ORDER BY a;
 5  {"a": {"b": [1, [2]]}}
 6  {"a": {"b": [[2]]}}
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @>'[1]'
-----
-index-join  0  index-join  ·      ·                        (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                        (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                ·                ·
- │          1  ·           spans  /Arr/1-/Arr/1/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                        (a, b)           ·
-·           1  ·           table  d@primary                ·                ·
-
 query IT
 SELECT * from d where b @>'[1]' ORDER BY a;
 ----
 2  [1, 2, 3, 4, "foo"]
-
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @>'[{"a": {"b": [1]}}]'
-----
-index-join  0  index-join  ·      ·                                                                                (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                                                                (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                                                        ·                ·
- │          1  ·           spans  /Arr/"a"/"b"/Arr/1-/Arr/"a"/"b"/Arr/1/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                                                                (a, b)           ·
-·           1  ·           table  d@primary                                                                        ·                ·
 
 query IT
 SELECT * from d where b @>'[{"a": {"b": [1]}}]' ORDER BY a;
@@ -252,6 +205,14 @@ DELETE from d WHERE a=1;
 
 query IT
 SELECT * from d where b @>'{"a": "b"}' ORDER BY a;
+----
+7  {"a": "b", "c": "d"}
+
+statement ok
+PREPARE query (STRING, STRING) AS SELECT * from d where b->$1 = $2 ORDER BY a
+
+query IT
+EXECUTE query ('a', '"b"')
 ----
 7  {"a": "b", "c": "d"}
 
@@ -294,24 +255,6 @@ SELECT * from d where b @> '1.23' ORDER BY a;
 ----
 15  1.23
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @> '[]';
-----
-scan  0  scan  ·       ·          (a, b)  a!=NULL; b!=NULL; key(a)
-·     0  ·     table   d@primary  ·       ·
-·     0  ·     spans   ALL        ·       ·
-·     0  ·     filter  b @> '[]'  ·       ·
-
-
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b @> '{}';
-----
-scan  0  scan  ·       ·          (a, b)  a!=NULL; b!=NULL; key(a)
-·     0  ·     table   d@primary  ·       ·
-·     0  ·     spans   ALL        ·       ·
-·     0  ·     filter  b @> '{}'  ·       ·
-
-
 query IT
 SELECT * from d where b @> '{}' ORDER BY a;
 ----
@@ -322,6 +265,8 @@ SELECT * from d where b @> '{}' ORDER BY a;
 8   {"a": {"b": true}}
 9   {"a": {"b": false}}
 17  {}
+30  {"a": []}
+31  {"a": {"b": "c", "d": "e"}, "f": "g"}
 
 query IT
 SELECT * from d where b @> '[]' ORDER BY a;
@@ -367,26 +312,6 @@ SELECT * from d where b->'a' = '"b"'
 ----
 7  {"a": "b", "c": "d"}
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b->'a' = '"b"'
-----
-index-join  0  index-join  ·      ·                                        (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                        (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                ·                ·
- │          1  ·           spans  /"a"/"b"-/"a"/"b"/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                        (a, b)           ·
-·           1  ·           table  d@primary                                ·                ·
-
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where '"b"' = b->'a'
-----
-index-join  0  index-join  ·      ·                                        (a, b)           b=CONST; a!=NULL; key(a)
- ├── scan   1  scan        ·      ·                                        (a, b[omitted])  b=CONST; a!=NULL; key(a)
- │          1  ·           table  d@foo_inv                                ·                ·
- │          1  ·           spans  /"a"/"b"-/"a"/"b"/PrefixEnd  ·                ·
- └── scan   1  scan        ·      ·                                        (a, b)           ·
-·           1  ·           table  d@primary                                ·                ·
-
 statement ok
 INSERT INTO d VALUES (23,  '{"a": 123.123}')
 
@@ -416,14 +341,24 @@ SELECT * from d where b @> '{"a": [{}]}' ORDER BY a;
 ----
 25  {"a": [{}]}
 
+
+query IT
+SELECT * from d where b @> '{"a": []}' ORDER BY a;
+----
+25  {"a": [{}]}
+30  {"a": []}
+
 query IT
 SELECT * from d where b @> '[{}]' ORDER BY a;
 ----
+16  [{"a": {"b": [1, [2]]}}, "d"]
+20  [{"a": "a"}, {"a": "a"}]
 26  [[], {}]
 
 query IT
 SELECT * from d where b @> '[[]]' ORDER BY a;
 ----
+21  [[[["a"]]], [[["a"]]]]
 26  [[], {}]
 
 statement ok
@@ -463,14 +398,6 @@ query IT
 SELECT * from d where b = NULL;
 ----
 
-query TITTTTT
-EXPLAIN (VERBOSE) SELECT * from d where b IS NULL
-----
-scan  0  scan  ·       ·          (a, b)  a!=NULL; key(a)
-·     0  ·     table   d@primary  ·       ·
-·     0  ·     spans   ALL        ·       ·
-·     0  ·     filter  b IS NULL  ·       ·
-
 query IT
 SELECT * from d where b @> NULL;
 ----
@@ -480,6 +407,67 @@ SELECT * from d where b @> 'null' ORDER BY a;
 ----
 11  null
 27  [true, false, null, 1.23, "a"]
+
+query IT
+SELECT * from d where b @> '{"a": {}}' ORDER BY a;
+----
+3   {"a": {"b": "c"}}
+4   {"a": {"b": [1]}}
+5   {"a": {"b": [1, [2]]}}
+8   {"a": {"b": true}}
+9   {"a": {"b": false}}
+31  {"a": {"b": "c", "d": "e"}, "f": "g"}
+
+query IT
+SELECT * from d where b @> '{"a": []}' ORDER BY a;
+----
+25  {"a": [{}]}
+30  {"a": []}
+
+## Multi-path contains queries
+
+query IT
+SELECT * from d where b @> '{"a": {"b": "c"}, "f": "g"}'
+----
+31  {"a": {"b": "c", "d": "e"}, "f": "g"}
+
+query IT
+SELECT * from d where b @> '{"a": {"b": "c", "d": "e"}, "f": "g"}'
+----
+31  {"a": {"b": "c", "d": "e"}, "f": "g"}
+
+query IT
+SELECT * from d where b @> '{"c": "d", "a": "b"}'
+----
+7  {"a": "b", "c": "d"}
+
+query IT
+SELECT * from d where b @> '{"c": "d", "a": "b", "f": "g"}'
+----
+
+query IT
+SELECT * from d where b @> '{"a": "b", "c": "e"}'
+----
+
+query IT
+SELECT * from d where b @> '{"a": "e", "c": "d"}'
+----
+
+query IT
+SELECT * from d where b @> '["d", {"a": {"b": [1]}}]'
+----
+16  [{"a": {"b": [1, [2]]}}, "d"]
+
+query IT
+SELECT * from d where b @> '["d", {"a": {"b": [[2]]}}]'
+----
+16  [{"a": {"b": [1, [2]]}}, "d"]
+
+query IT
+SELECT * from d where b @> '[{"a": {"b": [[2]]}}, "d"]'
+----
+16  [{"a": {"b": [1, [2]]}}, "d"]
+
 
 statement ok
 CREATE TABLE users (
@@ -495,6 +483,9 @@ INSERT INTO users (user_profile) VALUES  ('{"first_name": "Lola", "last_name": "
 statement ok
 CREATE INVERTED INDEX dogs on users(user_profile);
 
+statement error index "dogs" is inverted and cannot be used for this query
+SELECT COUNT(*) FROM users@dogs
+
 query T
 SELECT user_profile from users where user_profile @> '{"first_name":"Lola"}';
 ----
@@ -504,3 +495,189 @@ query T
 SELECT user_profile from users where user_profile @> '{"first_name":"Ernie"}';
 ----
  {"first_name": "Ernie", "location": "Brooklyn", "status": "Looking for treats"}
+
+statement ok
+CREATE TABLE update_test (i INT PRIMARY KEY, j JSONB, INVERTED INDEX(j));
+
+statement ok
+INSERT INTO update_test VALUES (1, '0');
+
+query IT
+SELECT * from update_test WHERE j @> '0';
+----
+1 0
+
+statement ok
+UPDATE update_test SET j = '{"a":"b", "c":"d"}' WHERE i = 1;
+
+query IT
+SELECT * from update_test WHERE j @> '0';
+----
+
+query IT
+SELECT * from update_test WHERE j @> '{"a":"b"}';
+----
+1 {"a": "b", "c": "d"}
+
+statement ok
+INSERT INTO update_test VALUES (2, '{"longKey1":"longValue1", "longKey2":"longValue2"}');
+
+statement ok
+UPDATE update_test SET j = ('"shortValue"') WHERE i = 2;
+
+query IT
+SELECT * from update_test where j @> '"shortValue"';
+----
+2 "shortValue"
+
+query IT
+SELECT * from update_test where j @> '{"longKey1":"longValue1"}}';
+----
+
+query IT
+SELECT * from update_test where j @> '{"longKey2":"longValue2"}}';
+----
+
+statement ok
+UPDATE update_test SET (i, j) = (10, '{"longKey1":"longValue1", "longKey2":"longValue2"}') WHERE i = 2;
+
+statement ok
+UPDATE update_test SET j = '{"a":"b", "a":"b"}' WHERE i = 1;
+
+statement ok
+UPDATE update_test SET (i, j) = (2, '["a", "a"]') WHERE i = 10;
+
+statement ok
+INSERT INTO update_test VALUES (3, '["a", "b", "c"]');
+
+query IT
+SELECT * from update_test where j @> '["a"]' ORDER BY i;
+----
+2 ["a", "a"]
+3 ["a", "b", "c"]
+
+statement ok
+UPDATE update_test SET j = '["b", "c", "e"]' WHERE i = 3;
+
+query IT
+SELECT * from update_test where j @> '["a"]' ORDER BY i;
+----
+2 ["a", "a"]
+
+query IT
+SELECT * from update_test where j @> '["b"]' ORDER BY i;
+----
+3 ["b", "c", "e"]
+
+
+statement ok
+INSERT INTO update_test VALUES (4, '["a", "b"]');
+
+statement ok
+UPDATE update_test SET j = '["b", "a"]' WHERE i = 4;
+
+query IT
+SELECT * from update_test where j @> '["a"]' ORDER BY i;
+----
+2 ["a", "a"]
+4 ["b", "a"]
+
+query IT
+SELECT * from update_test where j @> '["b"]' ORDER BY i;
+----
+3 ["b", "c", "e"]
+4 ["b", "a"]
+
+statement ok
+UPSERT INTO update_test VALUES (4, '["a", "b"]');
+
+query IT
+SELECT * from update_test where j @> '["a"]' ORDER BY i;
+----
+2 ["a", "a"]
+4 ["a", "b"]
+
+query IT
+SELECT * from update_test where j @> '["b"]' ORDER BY i;
+----
+3 ["b", "c", "e"]
+4 ["a", "b"]
+
+
+statement ok
+UPSERT INTO update_test VALUES (3, '["c", "e", "f"]');
+
+query IT
+SELECT * from update_test where j @> '["c"]' ORDER BY i;
+----
+3  ["c", "e", "f"]
+
+statement ok
+CREATE TABLE del_cascade_test (
+  delete_cascade INT NOT NULL REFERENCES update_test ON DELETE CASCADE
+ ,j JSONB
+ ,INVERTED INDEX(j)
+);
+
+
+statement ok
+CREATE TABLE update_cascade_test (
+ update_cascade INT NOT NULL REFERENCES update_test ON UPDATE CASCADE
+ ,j JSONB
+ ,INVERTED INDEX(j)
+);
+
+statement ok
+INSERT INTO del_cascade_test(delete_cascade, j) VALUES (1, '["a", "b"]'), (2, '{"a":"b", "c":"d"}'), (3, '["b", "c"]')
+
+
+query IT
+SELECT * from del_cascade_test ORDER BY delete_cascade;
+----
+1  ["a", "b"]
+2  {"a": "b", "c": "d"}
+3  ["b", "c"]
+
+statement ok
+DELETE FROM update_test where j @> '["c"]'
+
+query IT
+SELECT * from del_cascade_test ORDER BY delete_cascade;
+----
+1  ["a", "b"]
+2  {"a": "b", "c": "d"}
+
+query IT
+SELECT * from del_cascade_test ORDER BY delete_cascade;
+----
+1  ["a", "b"]
+2  {"a": "b", "c": "d"}
+
+statement ok
+INSERT INTO update_test VALUES (3, '["a", "b", "c"]');
+
+statement ok
+INSERT INTO update_cascade_test(update_cascade, j) VALUES (1, '["a", "b"]'), (2, '{"a":"b", "c":"d"}'), (3, '["b", "c"]')
+
+query IT
+SELECT * from update_cascade_test ORDER BY update_cascade;
+----
+1  ["a", "b"]
+2  {"a": "b", "c": "d"}
+3  ["b", "c"]
+
+statement error pq: foreign key violation: values \[1\] in columns \[i\] referenced in table "del_cascade_test"
+UPDATE update_test SET (i,j)  = (5, '{"a":"b", "a":"b"}') WHERE i = 1;
+
+statement ok
+DROP TABLE del_cascade_test
+
+statement ok
+UPDATE update_test SET (i,j)  = (5, '{"a":"b", "a":"b"}') WHERE i = 1;
+
+query IT
+SELECT * from update_cascade_test ORDER BY update_cascade;
+----
+2  {"a": "b", "c": "d"}
+3  ["b", "c"]
+5  ["a", "b"]

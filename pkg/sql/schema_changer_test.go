@@ -71,6 +71,7 @@ func TestSchemaChangeLease(t *testing.T) {
 		sql.MinSchemaChangeLeaseDuration = minLeaseDuration
 	}()
 
+	const dbDescID = keys.MinNonPredefinedUserDescID
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
 CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
@@ -79,11 +80,12 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	}
 
 	var lease sqlbase.TableDescriptor_SchemaChangeLease
-	var id = sqlbase.ID(keys.MaxReservedDescID + 2)
+	var id = sqlbase.ID(dbDescID + 1)
 	var node = roachpb.NodeID(2)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	changer := sql.NewSchemaChangerForTesting(
 		id, 0, node, *kvDB, nil, jobRegistry,
-		s.InternalExecutor().(*sql.InternalExecutor).ExecCfg)
+		&execCfg)
 
 	ctx := context.TODO()
 
@@ -177,22 +179,22 @@ func TestSchemaChangeProcess(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.TODO())
 
-	var id = sqlbase.ID(keys.MaxReservedDescID + 2)
+	var id = sqlbase.ID(keys.MinNonPredefinedUserDescID + 1 /* skip over DB ID */)
 	var node = roachpb.NodeID(2)
 	stopper := stop.NewStopper()
 	cfg := base.NewLeaseManagerConfig()
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	leaseMgr := sql.NewLeaseManager(
 		log.AmbientContext{Tracer: tracing.NewTracer()},
-		s.InternalExecutor().(*sql.InternalExecutor).ExecCfg,
+		&execCfg,
 		sql.LeaseManagerTestingKnobs{},
 		stopper,
-		&sql.MemoryMetrics{},
 		cfg,
 	)
 	jobRegistry := s.JobRegistry().(*jobs.Registry)
 	defer stopper.Stop(context.TODO())
 	changer := sql.NewSchemaChangerForTesting(
-		id, 0, node, *kvDB, leaseMgr, jobRegistry, s.InternalExecutor().(*sql.InternalExecutor).ExecCfg)
+		id, 0, node, *kvDB, leaseMgr, jobRegistry, &execCfg)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -266,7 +268,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	tableDesc.NextIndexID++
 	changer = sql.NewSchemaChangerForTesting(
 		id, tableDesc.NextMutationID, node, *kvDB, leaseMgr, jobRegistry,
-		s.InternalExecutor().(*sql.InternalExecutor).ExecCfg,
+		&execCfg,
 	)
 	tableDesc.Mutations = append(tableDesc.Mutations, sqlbase.DescriptorMutation{
 		Descriptor_: &sqlbase.DescriptorMutation_Index{Index: index},
@@ -611,7 +613,7 @@ func TestRaceWithBackfill(t *testing.T) {
 	defer tc.Stopper().Stop(context.TODO())
 	kvDB := tc.Server(0).DB()
 	sqlDB := tc.ServerConn(0)
-	execCfg := tc.Server(0).InternalExecutor().(*sql.InternalExecutor).ExecCfg
+	execCfg := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig)
 	jobRegistry := tc.Server(0).JobRegistry().(*jobs.Registry)
 
 	if _, err := sqlDB.Exec(`
@@ -658,7 +660,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		maxValue,
 		2,
 		initBackfillNotification(),
-		execCfg)
+		&execCfg)
 
 	// Drop column.
 	runSchemaChangeWithOperations(
@@ -670,7 +672,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		maxValue,
 		2,
 		initBackfillNotification(),
-		execCfg)
+		&execCfg)
 
 	// Add index.
 	runSchemaChangeWithOperations(
@@ -682,7 +684,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		maxValue,
 		3,
 		initBackfillNotification(),
-		execCfg)
+		&execCfg)
 
 	// Drop index.
 	runSchemaChangeWithOperations(
@@ -694,7 +696,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		maxValue,
 		2,
 		initBackfillNotification(),
-		execCfg)
+		&execCfg)
 
 	// Verify that the index foo over v is consistent, and that column x has
 	// been backfilled properly.
@@ -822,7 +824,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	wg.Add(1)
 	go func() {
 		// Start schema change that eventually runs a partial backfill.
-		if _, err := sqlDB.Exec("CREATE UNIQUE INDEX bar ON t.test (v)"); err != nil {
+		if _, err := sqlDB.Exec("CREATE UNIQUE INDEX bar ON t.test (v)"); err != nil && !testutils.IsError(err, "table is being dropped") {
 			t.Error(err)
 		}
 		wg.Done()
@@ -2895,4 +2897,273 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 99);
 	) {
 		t.Fatal(err)
 	}
+}
+
+// TestIndexBackfillAfterGC verifies that if a GC is done after an index
+// backfill has started, it will error instead of spin forever.
+func TestIndexBackfillAfterGC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var tc serverutils.TestClusterInterface
+	ctx := context.Background()
+
+	runGC := func(sp roachpb.Span) error {
+		if tc == nil {
+			return nil
+		}
+		gcr := roachpb.GCRequest{
+			RequestHeader: roachpb.RequestHeaderFromSpan(sp),
+			Threshold:     tc.Server(0).Clock().Now(),
+		}
+		_, err := client.SendWrapped(ctx, tc.Server(0).DistSender(), &gcr)
+		if err != nil {
+			panic(err)
+		}
+		return nil
+	}
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				return runGC(sp)
+			},
+		},
+	}
+
+	tc = serverutils.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
+	defer tc.Stopper().Stop(context.TODO())
+	db := tc.ServerConn(0)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE DATABASE t`)
+	sqlDB.Exec(t, `CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'))`)
+	sqlDB.Exec(t, `INSERT INTO t.test VALUES (1, 1)`)
+	if _, err := db.Exec(`CREATE UNIQUE INDEX foo ON t.test (v)`); !testutils.IsError(err, `batch timestamp .* must be after GC threshold`) {
+		t.Fatalf("unexpected: %v", err)
+	}
+}
+
+// TestAddComputedColumn verifies that while a column backfill is happening
+// for a computed column, INSERTs and UPDATEs for that column are correct.
+func TestAddComputedColumn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var db *gosql.DB
+	done := false
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				if db == nil || done {
+					return nil
+				}
+				done = true
+				if _, err := db.Exec(`INSERT INTO t.test VALUES (10)`); err != nil {
+					panic(err)
+				}
+				if _, err := db.Exec(`UPDATE t.test SET a = a + 1 WHERE a < 10`); err != nil {
+					panic(err)
+				}
+				return nil
+			},
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: params})
+	defer tc.Stopper().Stop(context.TODO())
+	db = tc.ServerConn(0)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE DATABASE t`)
+	sqlDB.Exec(t, `CREATE TABLE t.test (a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO t.test VALUES (1)`)
+	sqlDB.Exec(t, `ALTER TABLE t.test ADD COLUMN b INT AS (a + 5) STORED`)
+	sqlDB.CheckQueryResults(t, `SELECT * FROM t.test ORDER BY a`, [][]string{{"2", "7"}, {"10", "15"}})
+}
+
+func TestSchemaChangeAfterCreateInTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	// A large enough value that the backfills run as part of the
+	// schema change run in many chunks.
+	var maxValue = 4001
+	if util.RaceEnabled {
+		// Race builds are a lot slower, so use a smaller number of rows.
+		maxValue = 200
+	}
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.Exec(`CREATE TABLE t.testing (k INT PRIMARY KEY, v INT, INDEX foo(v));`); err != nil {
+		t.Fatal(err)
+	}
+
+	inserts := make([]string, maxValue+1)
+	for i := 0; i < maxValue+1; i++ {
+		inserts[i] = fmt.Sprintf(`(%d, %d)`, i, maxValue-i)
+	}
+
+	if _, err := tx.Exec(`INSERT INTO t.testing VALUES ` + strings.Join(inserts, ",")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.Exec(`ALTER TABLE t.testing RENAME TO t.test`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run schema changes that are execute Column and Index backfills.
+	if _, err := tx.Exec(`
+ALTER TABLE t.test ADD COLUMN c INT AS (v + 4) STORED, ADD COLUMN d INT DEFAULT 23, ADD CONSTRAINT bar UNIQUE (c)
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.Exec(`DROP INDEX t.test@foo`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkTableKeyCount(context.TODO(), kvDB, 2, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that the index bar over is consistent, and that columns c, d
+	// have been backfilled properly.
+	rows, err := sqlDB.Query(`SELECT c, d from t.test@bar`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for ; rows.Next(); count++ {
+		var c int
+		var d int
+		if err := rows.Scan(&c, &d); err != nil {
+			t.Errorf("row %d scan failed: %s", count, err)
+			continue
+		}
+		if count+4 != c {
+			t.Errorf("e = %d, v = %d", count, c)
+		}
+		if 23 != d {
+			t.Errorf("e = %d, v = %d", 23, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	eCount := maxValue + 1
+	if eCount != count {
+		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
+	}
+
+	// The descriptor version hasn't changed.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if tableDesc.Version != 1 {
+		t.Fatalf("invalid version = %d", tableDesc.Version)
+	}
+}
+
+// TestCancelSchemaChange tests that a CANCEL JOB run midway through column
+// and index backfills is canceled.
+func TestCancelSchemaChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const (
+		numNodes = 3
+		maxValue = 100
+	)
+
+	var sqlDB *sqlutils.SQLRunner
+	var db *gosql.DB
+	params, _ := tests.CreateTestServerParams()
+	doCancel := false
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			BackfillChunkSize: 10,
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				if !doCancel {
+					return nil
+				}
+				if _, err := db.Exec(`CANCEL JOB (
+					SELECT id FROM [SHOW JOBS]
+					WHERE
+						type = 'SCHEMA CHANGE' AND
+						status = $1 AND
+						description NOT LIKE 'ROLL BACK%'
+				)`, jobs.StatusRunning); err != nil {
+					panic(err)
+				}
+				return nil
+			},
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs:      params,
+	})
+	defer tc.Stopper().Stop(context.TODO())
+	db = tc.ServerConn(0)
+	kvDB := tc.Server(0).DB()
+	sqlDB = sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `
+		CREATE DATABASE t;
+		CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
+	`)
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(db, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Split the table into multiple ranges.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	const numSplits = numNodes * 2
+	for i := numSplits - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i%numNodes, maxValue/numSplits*i)
+	}
+
+	ctx := context.TODO()
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	doCancel = true
+	if _, err := db.Exec(`ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')`); !testutils.IsError(err, "job canceled") {
+		t.Fatalf("unexpected %v", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX ON t.test (v)`); !testutils.IsError(err, "job canceled") {
+		t.Fatalf("unexpected %v", err)
+	}
+
+	doCancel = false
+	sqlDB.Exec(t, `ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.2')`)
+	sqlDB.Exec(t, `CREATE INDEX ON t.test (v)`)
 }

@@ -34,7 +34,7 @@ func TestInitialKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const keysPerDesc = 2
-	const nonDescKeys = 2
+	const nonDescKeys = 5
 
 	ms := sqlbase.MakeMetadataSchema()
 	kv := ms.GetInitialValues()
@@ -44,7 +44,7 @@ func TestInitialKeys(t *testing.T) {
 	}
 
 	// Add an additional table.
-	sqlbase.SystemAllowedPrivileges[keys.MaxReservedDescID] = privilege.Lists{{privilege.ALL}}
+	sqlbase.SystemAllowedPrivileges[keys.MaxReservedDescID] = privilege.List{privilege.ALL}
 	desc, err := sql.CreateTestTableDescriptor(
 		context.TODO(),
 		keys.SystemDatabaseID,
@@ -81,7 +81,7 @@ func TestInitialKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := i, int64(keys.MaxReservedDescID+1); a != e {
+	if a, e := i, int64(keys.MinUserDescID); a != e {
 		t.Fatalf("Expected next descriptor ID to be %d, was %d", e, a)
 	}
 }
@@ -103,33 +103,26 @@ func TestSystemTableLiterals(t *testing.T) {
 		id     sqlbase.ID
 		schema string
 		pkg    sqlbase.TableDescriptor
-		// Starting with the RoleMembers table, all newly created tables have two sets of privileges:
-		// one for "root", another for "admin". Previous tables get them through a migration.
-		hasAdmin bool
 	}
 
 	for _, test := range []testcase{
-		{keys.NamespaceTableID, sqlbase.NamespaceTableSchema, sqlbase.NamespaceTable, false},
-		{keys.DescriptorTableID, sqlbase.DescriptorTableSchema, sqlbase.DescriptorTable, false},
-		{keys.UsersTableID, sqlbase.UsersTableSchema, sqlbase.UsersTable, false},
-		{keys.ZonesTableID, sqlbase.ZonesTableSchema, sqlbase.ZonesTable, false},
-		{keys.LeaseTableID, sqlbase.LeaseTableSchema, sqlbase.LeaseTable, false},
-		{keys.EventLogTableID, sqlbase.EventLogTableSchema, sqlbase.EventLogTable, false},
-		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable, false},
-		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable, false},
-		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable, false},
-		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable, false},
-		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable, false},
-		{keys.TableStatisticsTableID, sqlbase.TableStatisticsTableSchema, sqlbase.TableStatisticsTable, false},
-		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable, false},
-		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable, true},
+		{keys.NamespaceTableID, sqlbase.NamespaceTableSchema, sqlbase.NamespaceTable},
+		{keys.DescriptorTableID, sqlbase.DescriptorTableSchema, sqlbase.DescriptorTable},
+		{keys.UsersTableID, sqlbase.UsersTableSchema, sqlbase.UsersTable},
+		{keys.ZonesTableID, sqlbase.ZonesTableSchema, sqlbase.ZonesTable},
+		{keys.LeaseTableID, sqlbase.LeaseTableSchema, sqlbase.LeaseTable},
+		{keys.EventLogTableID, sqlbase.EventLogTableSchema, sqlbase.EventLogTable},
+		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable},
+		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable},
+		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable},
+		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable},
+		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable},
+		{keys.TableStatisticsTableID, sqlbase.TableStatisticsTableSchema, sqlbase.TableStatisticsTable},
+		{keys.LocationsTableID, sqlbase.LocationsTableSchema, sqlbase.LocationsTable},
+		{keys.RoleMembersTableID, sqlbase.RoleMembersTableSchema, sqlbase.RoleMembersTable},
 	} {
-		var privs *sqlbase.PrivilegeDescriptor
-		if test.hasAdmin {
-			privs = sqlbase.NewCustomSuperuserPrivilegeDescriptor(sqlbase.SystemDesiredPrivileges(test.id))
-		} else {
-			privs = sqlbase.NewCustomRootPrivilegeDescriptor(sqlbase.SystemDesiredPrivileges(test.id))
-		}
+		// Always create tables with "admin" privileges included, or CreateTestTableDescriptor fails.
+		privs := sqlbase.NewCustomSuperuserPrivilegeDescriptor(sqlbase.SystemAllowedPrivileges[test.id])
 		gen, err := sql.CreateTestTableDescriptor(
 			context.TODO(),
 			keys.SystemDatabaseID,
@@ -138,8 +131,9 @@ func TestSystemTableLiterals(t *testing.T) {
 			privs,
 		)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("test: %+v, err: %v", test, err)
 		}
+
 		if !proto.Equal(&test.pkg, &gen) {
 			diff := strings.Join(pretty.Diff(&test.pkg, &gen), "\n")
 			t.Errorf("%s table descriptor generated from CREATE TABLE statement does not match "+

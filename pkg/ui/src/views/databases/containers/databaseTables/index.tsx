@@ -18,20 +18,14 @@ import { Bytes } from "src/util/format";
 import { TableInfo } from "src/views/databases/data/tableInfo";
 
 import {
-    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos, grants,
+    DatabaseSummaryBase, DatabaseSummaryExplicitData, databaseDetails, tableInfos as selectTableInfos, grants,
 } from "src/views/databases/containers/databaseSummary";
 
 const databaseTablesSortSetting = new LocalSetting<AdminUIState, SortSetting>(
   "databases/sort_setting/tables", (s) => s.localSettings,
 );
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or TSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const DatabaseTableListSortedTable = SortedTable as new () => SortedTable<TableInfo>;
+class DatabaseTableListSortedTable extends SortedTable<TableInfo> {}
 
 // DatabaseSummaryTables displays a summary section describing the tables
 // contained in a single database.
@@ -130,7 +124,7 @@ class DatabaseSummaryTables extends DatabaseSummaryBase {
 export default connect(
   (state: AdminUIState, ownProps: DatabaseSummaryExplicitData) => {
     return {
-      tableInfos: tableInfos(state, ownProps.name),
+      tableInfos: selectTableInfos(state, ownProps.name),
       sortSetting: databaseTablesSortSetting.selector(state),
       dbResponse: databaseDetails(state)[ownProps.name] && databaseDetails(state)[ownProps.name].data,
       grants: grants(state, ownProps.name),

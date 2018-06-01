@@ -373,7 +373,7 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 		// The expected behavior is for the pgServer to immediately cancel any
 		// ongoing sessions and wait for 1s for the cancellation to take effect.
 		if err := pgServer.DrainImpl(
-			0 /* drainWait */, 1*time.Second, /* cancelWait */
+			0 /* drainWait */, 2*time.Second, /* cancelWait */
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -704,7 +704,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs("hello world"),
 		},
 		"SHOW DATABASE": {
-			baseTest.Results(""),
+			baseTest.Results("defaultdb"),
 		},
 		"SELECT descriptor FROM system.descriptor WHERE descriptor != $1 LIMIT 1": {
 			baseTest.SetArgs([]byte("abc")).Results([]byte("\x12!\n\x06system\x10\x01\x1a\x15\n\t\n\x05admin\x100\n\b\n\x04root\x100")),
@@ -716,7 +716,7 @@ func TestPGPreparedQuery(t *testing.T) {
 				Results("isRole", "BOOL", false, false, "{}"),
 		},
 		"SHOW DATABASES": {
-			baseTest.Results("d").Results("system"),
+			baseTest.Results("d").Results("defaultdb").Results("postgres").Results("system"),
 		},
 		"SHOW GRANTS ON system.users": {
 			baseTest.Results("system", "public", "users", sqlbase.AdminRole, "DELETE").
@@ -909,6 +909,9 @@ func TestPGPreparedQuery(t *testing.T) {
 		},
 		"SELECT $1::TIME": {
 			baseTest.SetArgs("12:00:00").Results("0000-01-01T12:00:00Z"),
+		},
+		"SELECT $1::TIMETZ": {
+			baseTest.SetArgs("12:00:00-07").Results("0000-01-01T19:00:00Z"),
 		},
 		"SELECT $1:::FLOAT[]": {
 			baseTest.SetArgs("{}").Results("{}"),
@@ -1234,7 +1237,19 @@ func TestPGPreparedExec(t *testing.T) {
 			},
 		},
 		{
+			"CANCEL JOBS SELECT $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
 			"RESUME JOB $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
+			"RESUME JOBS SELECT $1",
 			[]preparedExecTest{
 				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
 			},
@@ -1246,9 +1261,33 @@ func TestPGPreparedExec(t *testing.T) {
 			},
 		},
 		{
+			"PAUSE JOBS SELECT $1",
+			[]preparedExecTest{
+				baseTest.SetArgs(123).Error("pq: job with ID 123 does not exist"),
+			},
+		},
+		{
 			"CANCEL QUERY $1",
 			[]preparedExecTest{
 				baseTest.SetArgs("01").Error("pq: could not cancel query 00000000000000000000000000000001: query ID 00000000000000000000000000000001 not found"),
+			},
+		},
+		{
+			"CANCEL QUERIES SELECT $1",
+			[]preparedExecTest{
+				baseTest.SetArgs("01").Error("pq: could not cancel query 00000000000000000000000000000001: query ID 00000000000000000000000000000001 not found"),
+			},
+		},
+		{
+			"CANCEL SESSION $1",
+			[]preparedExecTest{
+				baseTest.SetArgs("01").Error("pq: could not cancel session 00000000000000000000000000000001: session ID 00000000000000000000000000000001 not found"),
+			},
+		},
+		{
+			"CANCEL SESSIONS SELECT $1",
+			[]preparedExecTest{
+				baseTest.SetArgs("01").Error("pq: could not cancel session 00000000000000000000000000000001: session ID 00000000000000000000000000000001 not found"),
 			},
 		},
 		// An empty string is valid in postgres.

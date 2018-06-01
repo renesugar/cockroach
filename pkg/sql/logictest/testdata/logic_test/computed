@@ -1,4 +1,4 @@
-# LogicTest: default parallel-stmts distsql
+# LogicTest: default opt parallel-stmts distsql distsql-opt distsql-metadata
 
 statement ok
 CREATE TABLE with_no_column_refs (
@@ -103,6 +103,28 @@ DELETE FROM x
 
 statement ok
 DELETE FROM x
+
+statement ok
+DROP TABLE x
+
+statement ok
+CREATE TABLE x (
+  a INT NOT NULL,
+  b INT,
+  c INT AS (a) STORED,
+  d INT AS (a + b) STORED
+)
+
+statement ok
+INSERT INTO x (a) VALUES (1)
+
+statement error null value in column "a" violates not-null constraint
+INSERT INTO x (b) VALUES (1)
+
+query II
+SELECT c, d FROM x
+----
+1  NULL
 
 statement ok
 DROP TABLE x
@@ -272,7 +294,7 @@ CREATE TABLE y (
   b INT AS (a) STORED
 )
 
-statement error column name "a" not found
+statement error column "a" does not exist
 CREATE TABLE y (
   b INT AS (a) STORED
 )
@@ -403,14 +425,6 @@ CREATE TABLE x (
   b TEXT AS (a->>'q') STORED,
   INDEX (b) STORING (k)
 )
-
-query TTT
-EXPLAIN SELECT b FROM x ORDER BY b
-----
-render     ·      ·
- └── scan  ·      ·
-·          table  x@x_b_idx
-·          spans  ALL
 
 statement error cannot write directly to computed column
 INSERT INTO x (k, a, b) VALUES (1, '{"q":"xyz"}', 'not allowed!'), (2, '{"q":"abc"}', 'also not allowed')
@@ -623,9 +637,49 @@ WHERE table_name = 'x' and generation_expression = ''
 ----
 1
 
-# TODO(justin): #22652
-statement error adding a computed column via ALTER not supported
-ALTER TABLE x ADD COLUMN c INT AS (4) STORED
+statement ok
+INSERT INTO x VALUES (3)
+
+# Verify computed columns work.
+statement ok
+ALTER TABLE x ADD COLUMN c INT AS (a + 4) STORED
+
+query TT
+SHOW CREATE TABLE x
+----
+x  CREATE TABLE x (
+    a INT NULL,
+    b INT NULL AS (a * 2) STORED,
+    c INT NULL AS (a + 4) STORED,
+    FAMILY "primary" (a, b, rowid, c)
+)
+
+statement ok
+INSERT INTO x VALUES (6)
+
+query III
+SELECT * FROM x ORDER BY a
+----
+3 6 7
+6 12 10
+
+# Verify error if a default and computed column are added at the same time.
+statement error column "d" does not exist
+ALTER TABLE x ADD COLUMN d INT DEFAULT 15, ADD COLUMN e INT AS (d + a) STORED
+
+# Verify a bad statement fails.
+statement error could not parse "a" as type int
+ALTER TABLE x ADD COLUMN d INT AS (a + 'a') STORED
+
+statement error could not parse "a" as type int
+ALTER TABLE x ADD COLUMN d INT AS ('a') STORED
+
+statement error unsupported binary operator
+ALTER TABLE x ADD COLUMN d INT AS (a / 0) STORED
+
+# Verify an error during computation fails.
+statement error division by zero
+ALTER TABLE x ADD COLUMN d INT AS (a // 0) STORED
 
 statement ok
 DROP TABLE x
@@ -654,3 +708,24 @@ INSERT INTO x (a) SELECT 1
 
 statement ok
 DROP TABLE x
+
+# Verify errors emitted from computed columns contain the column name
+statement ok
+CREATE TABLE error_check (k INT PRIMARY KEY, s STRING, i INT AS (s::INT) STORED)
+
+statement ok
+INSERT INTO error_check VALUES(1, '1')
+
+statement error computed column i:
+INSERT INTO error_check VALUES(2, 'foo')
+
+statement error computed column i:
+UPDATE error_check SET s = 'foo' WHERE k = 1
+
+# Upsert -> update
+statement error computed column i:
+UPSERT INTO error_check VALUES (1, 'foo')
+
+# Upsert -> insert
+statement error computed column i:
+UPSERT INTO error_check VALUES (3, 'foo')

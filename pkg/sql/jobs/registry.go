@@ -16,8 +16,10 @@ package jobs
 
 import (
 	"context"
+	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -34,7 +36,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-var nodeLivenessLogLimiter = log.Every(5 * time.Second)
+const defaultLeniencySetting = 60 * time.Second
+
+var (
+	nodeLivenessLogLimiter = log.Every(5 * time.Second)
+	// LeniencySetting is the amount of time to defer any attempts to
+	// reschedule a job.  Visible for testing.
+	LeniencySetting = settings.RegisterDurationSetting(
+		"jobs.registry.leniency",
+		"the amount of time to defer any attempts to reschedule a job",
+		defaultLeniencySetting)
+)
 
 // NodeLiveness is the subset of storage.NodeLiveness's interface needed
 // by Registry.
@@ -44,6 +56,30 @@ type NodeLiveness interface {
 }
 
 // Registry creates Jobs and manages their leases and cancelation.
+//
+// Job information is stored in the `system.jobs` table.  Each node will
+// poll this table and establish a lease on any claimed job. Registry
+// calculates its own liveness for a node based on the expiration time
+// of the underlying node-liveness lease.  This is because we want to
+// allow jobs assigned to temporarily non-live (i.e. saturated) nodes to
+// continue without being canceled.
+//
+// When a lease has been determined to be stale, a node may attempt to
+// claim the relevant job. Thus, a Registry must occasionally
+// re-validate its own leases to ensure that another node has not stolen
+// the work and cancel the local job if so.
+//
+// Prior versions of Registry used the node's epoch value to determine
+// whether or not a job should be stolen.  The current implementation
+// uses a time-based approach, where a node's last reported expiration
+// timestamp is used to calculate a liveness value for the purpose
+// of job scheduling.
+//
+// Mixed-version operation between epoch- and time-based nodes works
+// since we still publish epoch information in the leases for time-based
+// nodes.  From the perspective of a time-based node, an epoch-based
+// node simply behaves as though its leniency period is 0. Epoch-based
+// nodes will see time-based nodes delay the act of stealing a job.
 type Registry struct {
 	ac       log.AmbientContext
 	db       *client.DB
@@ -55,6 +91,9 @@ type Registry struct {
 
 	mu struct {
 		syncutil.Mutex
+		// epoch is present to support older nodes that are not using
+		// the timestamp-based approach to determine when to steal jobs.
+		// TODO: Remove this and deprecate Lease.Epoch proto field
 		epoch int64
 		// jobs holds a map from job id to its context cancel func. This should
 		// be populated with jobs that are currently being run (and owned) by
@@ -106,6 +145,21 @@ func MakeRegistry(
 	r.mu.epoch = 1
 	r.mu.jobs = make(map[int64]context.CancelFunc)
 	return r
+}
+
+// lenientNow returns the timestamp after which we should attempt
+// to steal a job from a node whose liveness is failing.  This allows
+// jobs coordinated by a node which is temporarily saturated to continue.
+func (r *Registry) lenientNow() hlc.Timestamp {
+	// We see this in tests.
+	var offset time.Duration
+	if r.settings == cluster.NoSettings {
+		offset = defaultLeniencySetting
+	} else {
+		offset = LeniencySetting.Get(&r.settings.SV)
+	}
+
+	return r.clock.Now().Add(-offset.Nanoseconds(), 0)
 }
 
 // makeCtx returns a new context from r's ambient context and an associated
@@ -216,7 +270,7 @@ func (r *Registry) Start(
 			select {
 			case <-time.After(adoptInterval):
 				if err := r.maybeAdoptJob(ctx, nl); err != nil {
-					log.Errorf(ctx, "error while adopting jobs: %+v", err)
+					log.Errorf(ctx, "error while adopting jobs: %s", err)
 				}
 			case <-stopper.ShouldStop():
 				return
@@ -241,18 +295,10 @@ func (r *Registry) maybeCancelJobs(ctx context.Context, nl NodeLiveness) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// TODO(benesch): this logic is correct but too aggressive. Jobs created
-	// immediately after a liveness failure but before we've updated our cached
-	// epoch will be unnecessarily canceled.
-	//
-	// Additionally consider handling the case where our locally-cached liveness
-	// record is expired, but a non-expired liveness record has, in fact, been
-	// successfully persisted. Rather than canceling all jobs immediately, we
-	// could instead wait to see if we managed a successful heartbeat at the
-	// current epoch. The additional complexity this requires is not clearly
-	// worthwhile.
-	sameEpoch := liveness.Epoch == r.mu.epoch
-	if !sameEpoch || !liveness.IsLive(r.clock.Now(), r.clock.MaxOffset()) {
+	// If we haven't persisted a liveness record within the leniency
+	// interval, we'll cancel all of our jobs.
+	if !liveness.IsLive(r.lenientNow(), r.clock.MaxOffset()) {
+		log.Warning(ctx, "canceling all jobs due to liveness failure")
 		r.cancelAll(ctx)
 		r.mu.epoch = liveness.Epoch
 	}
@@ -277,6 +323,22 @@ func (r *Registry) getJobFn(ctx context.Context, txn *client.Txn, id int64) (*Jo
 func (r *Registry) Cancel(ctx context.Context, txn *client.Txn, id int64) error {
 	job, resumer, err := r.getJobFn(ctx, txn, id)
 	if err != nil {
+		// Special case schema change jobs to mark the job as canceled.
+		if job != nil {
+			payload := job.Payload()
+			// TODO(mjibson): Use an unfortunate workaround to enable canceling of
+			// schema change jobs by comparing the string description. When a schema
+			// change job fails or is canceled, a new job is created with the ROLL BACK
+			// prefix. These rollback jobs cannot be canceled. We could add a field to
+			// the payload proto to indicate if this job is cancelable or not, but in
+			// a split version cluster an older node could pick up the schema change
+			// and fail to clear/set that field appropriately. Thus it seems that the
+			// safest way for now (i.e., without a larger jobs/schema change refactor)
+			// is to hack this up with a string comparison.
+			if payload.Type() == TypeSchemaChange && !strings.HasPrefix(job.Record.Description, "ROLL BACK") {
+				return job.WithTxn(txn).canceled(ctx, NoopFn)
+			}
+		}
 		return err
 	}
 	return job.WithTxn(txn).canceled(ctx, resumer.OnFailOrCancel)
@@ -419,20 +481,16 @@ func AddResumeHook(fn ResumeHookFn) {
 }
 
 func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
-	var rows []tree.Datums
-	if err := r.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		var err error
-		const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2) ORDER BY created DESC`
-		rows, _ /* cols */, err = r.ex.QueryRowsInTransaction(
-			ctx, "adopt-job", txn, stmt, StatusPending, StatusRunning)
-		return err
-	}); err != nil {
+	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2) ORDER BY created DESC`
+	rows, _ /* cols */, err := r.ex.Query(
+		ctx, "adopt-job", nil /* txn */, stmt, StatusPending, StatusRunning,
+	)
+	if err != nil {
 		return err
 	}
 
 	type nodeStatus struct {
 		isLive bool
-		epoch  int64
 	}
 	nodeStatusMap := map[roachpb.NodeID]*nodeStatus{
 		// 0 is not a valid node ID, but we treat it as an always-dead node so that
@@ -440,11 +498,24 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 		0: {isLive: false},
 	}
 	{
-		now, maxOffset := r.clock.Now(), r.clock.MaxOffset()
+		// We subtract the leniency interval here to artificially
+		// widen the range of times over which the job registry will
+		// consider the node to be alive.  We rely on the fact that
+		// only a live node updates its own expiration.  Thus, the
+		// expiration time can be used as a reasonable measure of
+		// when the node was last seen.
+		now, maxOffset := r.lenientNow(), r.clock.MaxOffset()
 		for _, liveness := range nl.GetLivenesses() {
 			nodeStatusMap[liveness.NodeID] = &nodeStatus{
 				isLive: liveness.IsLive(now, maxOffset),
-				epoch:  liveness.Epoch,
+			}
+
+			// Don't try to start any more jobs unless we're really live,
+			// otherwise we'd just immediately cancel them.
+			if liveness.NodeID == r.nodeID.Get() {
+				if !liveness.IsLive(r.clock.Now(), maxOffset) {
+					return nil
+				}
 			}
 		}
 	}
@@ -484,6 +555,10 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 			// overcautiously cancel all jobs due to e.g. a slow heartbeat response.
 			// If that heartbeat managed to successfully extend the liveness lease,
 			// we'll have stopped running jobs on which we still had valid leases.
+			//
+			// This path also takes care of the case where a node adopts a job
+			// and is then restarted; the node will attempt to restart
+			// any previously-leased job.
 			needsResume = !running
 		} else {
 			// If we are currently running a job that another node has the lease on,
@@ -499,7 +574,7 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 					*id, payload.Lease.NodeID)
 				continue
 			}
-			needsResume = nodeStatus.epoch > payload.Lease.Epoch || !nodeStatus.isLive
+			needsResume = !nodeStatus.isLive
 		}
 
 		if !needsResume {

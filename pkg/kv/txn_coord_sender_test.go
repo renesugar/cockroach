@@ -436,8 +436,9 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	{
 		var ba roachpb.BatchRequest
 		ba.Add(&roachpb.EndTransactionRequest{
-			Commit: false,
-			Span:   roachpb.Span{Key: initialTxn.Proto().Key},
+			RequestHeader: roachpb.RequestHeader{Key: initialTxn.Proto().Key},
+			Commit:        false,
+			Poison:        true,
 		})
 		ba.Txn = initialTxn.Proto()
 		if _, pErr := tc.TxnCoordSenderFactory.wrapped.Send(context.Background(), ba); pErr != nil {
@@ -464,7 +465,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 // getTxn fetches the requested key and returns the transaction info.
 func getTxn(db *client.DB, txn *roachpb.Transaction) (*roachpb.Transaction, *roachpb.Error) {
 	hb := &roachpb.HeartbeatTxnRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: txn.Key,
 		},
 	}
@@ -710,11 +711,10 @@ func TestTxnCoordSenderCancel(t *testing.T) {
 
 	// Commit the transaction. Note that we cancel the transaction when the
 	// commit is sent which stresses the TxnCoordSender.tryAsyncAbort code
-	// path. We'll either succeed, get a "does not exist" error, or get a
-	// context canceled error. Anything else is unexpected.
+	// path. We'll either succeed, or get a context canceled error. Anything else
+	// is unexpected.
 	err := txn.CommitOrCleanup(ctx)
-	if err != nil && err.Error() != context.Canceled.Error() &&
-		!testutils.IsError(err, "TransactionStatusError: does not exist") {
+	if err != nil && err.Error() != context.Canceled.Error() {
 		t.Fatal(err)
 	}
 }
@@ -723,24 +723,46 @@ func TestTxnCoordSenderCancel(t *testing.T) {
 // transactions and intents after the lastUpdateNanos exceeds the timeout.
 func TestTxnCoordSenderGCTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := createTestDB(t)
+	// Add a testing request filter which pauses a get request for the
+	// key until after the signal channel is closed.
+	key := roachpb.Key("a")
+	value := []byte("value")
+	signal := make(chan struct{})
+	knobs := &storage.StoreTestingKnobs{
+		DisableScanner:    true,
+		DisableSplitQueue: true,
+		TestingRequestFilter: func(ba roachpb.BatchRequest) *roachpb.Error {
+			for _, req := range ba.Requests {
+				if getReq, ok := req.GetInner().(*roachpb.GetRequest); ok && getReq.Key.Equal(key) {
+					<-signal
+				}
+			}
+			return nil
+		},
+	}
+
+	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), knobs)
 	defer s.Stop()
 
 	// Set heartbeat interval to 1ms for testing.
-	tc := s.DB.GetSender().(*TxnCoordSender)
-	tc.TxnCoordSenderFactory.heartbeatInterval = 1 * time.Millisecond
+	s.DB.GetFactory().(*TxnCoordSenderFactory).heartbeatInterval = 1 * time.Millisecond
 
 	txn := client.NewTxn(s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	key := roachpb.Key("a")
-	if err := txn.Put(context.TODO(), key, []byte("value")); err != nil {
+	tc := txn.Sender().(*TxnCoordSender)
+	if err := txn.Put(context.TODO(), key, value); err != nil {
 		t.Fatal(err)
 	}
+	errCh := make(chan error)
+	go func() {
+		if _, err := txn.Get(context.TODO(), key); err != nil {
+			errCh <- err
+		} else {
+			errCh <- errors.New("expected error")
+		}
+	}()
 
 	// Now, advance clock past the default client timeout.
-	// Locking the TxnCoordSender to prevent a data race.
-	tc.mu.Lock()
 	s.Manual.Increment(defaultClientTimeout.Nanoseconds() + 1)
-	tc.mu.Unlock()
 
 	testutils.SucceedsSoon(t, func() error {
 		// Locking the TxnCoordSender to prevent a data race.
@@ -753,7 +775,15 @@ func TestTxnCoordSenderGCTimeout(t *testing.T) {
 		return nil
 	})
 
+	// Verify all intents have been cleaned up.
 	verifyCleanup(key, s.Eng, t, tc)
+
+	// Verify that the inflight get request receives a transaction
+	// aborted error.
+	close(signal)
+	if err := <-errCh; !testutils.IsError(err, "txn aborted") {
+		t.Errorf("expected transaction aborted error; got %s", err)
+	}
 }
 
 // TestTxnCoordSenderGCWithCancel verifies that the coordinator cleans up extant
@@ -1178,8 +1208,8 @@ func TestTxnCoordSenderSingleRoundtripTxn(t *testing.T) {
 
 	var ba roachpb.BatchRequest
 	key := roachpb.Key("test")
-	ba.Add(&roachpb.BeginTransactionRequest{Span: roachpb.Span{Key: key}})
-	ba.Add(&roachpb.PutRequest{Span: roachpb.Span{Key: key}})
+	ba.Add(&roachpb.BeginTransactionRequest{RequestHeader: roachpb.RequestHeader{Key: key}})
+	ba.Add(&roachpb.PutRequest{RequestHeader: roachpb.RequestHeader{Key: key}})
 	ba.Add(&roachpb.EndTransactionRequest{})
 	txn := roachpb.MakeTransaction("test", key, 0, 0, clock.Now(), 0)
 	ba.Txn = &txn
@@ -1236,8 +1266,8 @@ func TestTxnCoordSenderErrorWithIntent(t *testing.T) {
 
 			var ba roachpb.BatchRequest
 			key := roachpb.Key("test")
-			ba.Add(&roachpb.BeginTransactionRequest{Span: roachpb.Span{Key: key}})
-			ba.Add(&roachpb.PutRequest{Span: roachpb.Span{Key: key}})
+			ba.Add(&roachpb.BeginTransactionRequest{RequestHeader: roachpb.RequestHeader{Key: key}})
+			ba.Add(&roachpb.PutRequest{RequestHeader: roachpb.RequestHeader{Key: key}})
 			ba.Add(&roachpb.EndTransactionRequest{})
 			txn := roachpb.MakeTransaction("test", key, 0, 0, clock.Now(), 0)
 			ba.Txn = &txn
@@ -1441,14 +1471,14 @@ func TestTxnOnePhaseCommit(t *testing.T) {
 // createNonCancelableDB returns a client DB and a sender. The sender
 // will be used for every transaction sent through the DB, so use with
 // care. The point is that every invocation of TxnCoordSender.Send will
-// be supplied a context with Done()==nil. Note that the returned
-// database will use a factory with ridiculously short client timeout
-// and heartbeat interval settings to make tests fast.
-func createNonCancelableDB(db *client.DB) (*client.DB, *TxnCoordSender) {
+// be supplied a context with Done()==nil.
+func createNonCancelableDB(
+	db *client.DB, hbInterval time.Duration, clientTimeout time.Duration,
+) *client.DB {
 	// Create the single txn coord for this test.
-	tc := db.GetSender().(*TxnCoordSender)
-	tc.TxnCoordSenderFactory.heartbeatInterval = 2 * time.Millisecond
-	tc.TxnCoordSenderFactory.clientTimeout = 1 * time.Millisecond
+	tc := db.GetFactory().New(client.RootTxn).(*TxnCoordSender)
+	tc.heartbeatInterval = hbInterval
+	tc.clientTimeout = clientTimeout
 
 	// client.Txn supplies a non-cancelable context, which makes the
 	// transaction coordinator ignore timeout-based abandonment and use the
@@ -1459,7 +1489,7 @@ func createNonCancelableDB(db *client.DB) (*client.DB, *TxnCoordSender) {
 			return tc.Send(context.Background(), ba)
 		})
 	}
-	return client.NewDB(factory, tc.TxnCoordSenderFactory.clock), tc
+	return client.NewDB(factory, tc.TxnCoordSenderFactory.clock)
 }
 
 func TestTxnAbandonCount(t *testing.T) {
@@ -1474,7 +1504,9 @@ func TestTxnAbandonCount(t *testing.T) {
 	var count int
 	doneErr := errors.New("retry on abandoned successful; exiting")
 
-	db, tc := createNonCancelableDB(s.DB)
+	hbInterval := 2 * time.Millisecond
+	clientTimeout := 1 * time.Millisecond
+	db := createNonCancelableDB(s.DB, hbInterval, clientTimeout)
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		count++
@@ -1495,7 +1527,7 @@ func TestTxnAbandonCount(t *testing.T) {
 			// Note that we must bump the clock before every attempt (not just once)
 			// because otherwise there is a race in which we bump, a heartbeat happens
 			// at the new timestamp, and the transaction never expires.
-			manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
+			manual.Increment(int64(clientTimeout + hbInterval*2))
 			err := checkTxnMetricsOnce(
 				t, metrics, "abandon txn", 0, 0, 1 /* abandons */, 0, 0,
 			)
@@ -1529,7 +1561,11 @@ func TestTxnReadAfterAbandon(t *testing.T) {
 
 	var count int
 	doneErr := errors.New("retry on abandoned successful; exiting")
-	db, tc := createNonCancelableDB(s.DB)
+
+	hbInterval := s.DB.GetFactory().(*TxnCoordSenderFactory).heartbeatInterval
+	clientTimeout := s.DB.GetFactory().(*TxnCoordSenderFactory).clientTimeout
+	db := createNonCancelableDB(s.DB, hbInterval, clientTimeout)
+
 	err := db.Txn(context.Background(), func(ctx context.Context, txn *client.Txn) error {
 		count++
 		if count == 2 {
@@ -1547,7 +1583,7 @@ func TestTxnReadAfterAbandon(t *testing.T) {
 
 		testutils.SucceedsSoon(t, func() error {
 			// See #22762 for very similar code and an explanation.
-			manual.Increment(int64(tc.TxnCoordSenderFactory.clientTimeout + tc.TxnCoordSenderFactory.heartbeatInterval*2))
+			manual.Increment(int64(clientTimeout + hbInterval*2))
 			err := checkTxnMetricsOnce(t, metrics, "abandon txn", 0, 0, 1 /* abandons */, 0, 0)
 			if err == nil {
 				return nil

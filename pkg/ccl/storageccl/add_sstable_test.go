@@ -340,8 +340,8 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 				Timestamp: hlc.Timestamp{WallTime: nowNanos},
 			},
 			Args: &roachpb.AddSSTableRequest{
-				Span: roachpb.Span{Key: keys.MinKey, EndKey: keys.MaxKey},
-				Data: sstBytes,
+				RequestHeader: roachpb.RequestHeader{Key: keys.MinKey, EndKey: keys.MaxKey},
+				Data:          sstBytes,
 			},
 			Stats: &enginepb.MVCCStats{},
 		}
@@ -354,7 +354,7 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 		// stats. Make sure recomputing from scratch gets the same answer as
 		// applying the diff to the stats
 		beforeStats := func() enginepb.MVCCStats {
-			iter := e.NewIterator(false)
+			iter := e.NewIterator(engine.IterOptions{})
 			defer iter.Close()
 			beforeStats, err := engine.ComputeStatsGo(iter, engine.NilKey, engine.MVCCKeyMax, nowNanos)
 			if err != nil {
@@ -368,12 +368,12 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 		if err := e.WriteFile(filename, sstBytes); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := e.IngestExternalFile(ctx, filename, true /* modify the sst */); err != nil {
+		if err := e.IngestExternalFiles(ctx, []string{filename}, true /* modify the sst */); err != nil {
 			t.Fatalf("%+v", err)
 		}
 
 		afterStats := func() enginepb.MVCCStats {
-			iter := e.NewIterator(false)
+			iter := e.NewIterator(engine.IterOptions{})
 			defer iter.Close()
 			afterStats, err := engine.ComputeStatsGo(iter, engine.NilKey, engine.MVCCKeyMax, nowNanos)
 			if err != nil {

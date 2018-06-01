@@ -101,6 +101,7 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b SMALLSERIAL)`},
 		{`CREATE TABLE a (b BIGSERIAL)`},
 		{`CREATE TABLE a (b TIME)`},
+		{`CREATE TABLE a (b TIME WITH TIME ZONE)`},
 		{`CREATE TABLE a (b UUID)`},
 		{`CREATE TABLE a (b INET)`},
 		{`CREATE TABLE a (b INT NULL)`},
@@ -309,10 +310,13 @@ func TestParse(t *testing.T) {
 		{`DROP SEQUENCE a.b CASCADE`},
 		{`DROP SEQUENCE a, b CASCADE`},
 
-		{`CANCEL JOB a`},
-		{`CANCEL QUERY a`},
-		{`RESUME JOB a`},
-		{`PAUSE JOB a`},
+		{`CANCEL JOBS SELECT a`},
+		{`CANCEL QUERIES SELECT a`},
+		{`CANCEL SESSIONS SELECT a`},
+		{`CANCEL QUERIES IF EXISTS SELECT a`},
+		{`CANCEL SESSIONS IF EXISTS SELECT a`},
+		{`RESUME JOBS SELECT a`},
+		{`PAUSE JOBS SELECT a`},
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
@@ -358,12 +362,12 @@ func TestParse(t *testing.T) {
 		{`SHOW STATISTICS FOR TABLE t`},
 		{`SHOW STATISTICS FOR TABLE d.t`},
 		{`SHOW HISTOGRAM 123`},
-		{`SHOW TESTING_RANGES FROM TABLE d.t`},
-		{`SHOW TESTING_RANGES FROM TABLE t`},
-		{`SHOW TESTING_RANGES FROM INDEX d.t@i`},
-		{`SHOW TESTING_RANGES FROM INDEX t@i`},
-		{`SHOW TESTING_RANGES FROM INDEX d.i`},
-		{`SHOW TESTING_RANGES FROM INDEX i`},
+		{`SHOW EXPERIMENTAL_RANGES FROM TABLE d.t`},
+		{`SHOW EXPERIMENTAL_RANGES FROM TABLE t`},
+		{`SHOW EXPERIMENTAL_RANGES FROM INDEX d.t@i`},
+		{`SHOW EXPERIMENTAL_RANGES FROM INDEX t@i`},
+		{`SHOW EXPERIMENTAL_RANGES FROM INDEX d.i`},
+		{`SHOW EXPERIMENTAL_RANGES FROM INDEX i`},
 		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`},
 		{`EXPERIMENTAL SHOW ZONE CONFIGURATIONS`},
 		{`EXPERIMENTAL SHOW ZONE CONFIGURATION FOR RANGE default`},
@@ -380,8 +384,8 @@ func TestParse(t *testing.T) {
 		// Tables are the default, but can also be specified with
 		// GRANT x ON TABLE y. However, the stringer does not output TABLE.
 		{`SHOW GRANTS`},
-		{`SHOW GRANTS ON foo`},
-		{`SHOW GRANTS ON foo, db.foo`},
+		{`SHOW GRANTS ON TABLE foo`},
+		{`SHOW GRANTS ON TABLE foo, db.foo`},
 		{`SHOW GRANTS ON DATABASE foo, bar`},
 		{`SHOW GRANTS ON DATABASE foo FOR bar`},
 		{`SHOW GRANTS FOR bar, baz`},
@@ -411,14 +415,20 @@ func TestParse(t *testing.T) {
 		{`PREPARE a (STRING) AS BACKUP DATABASE a TO $1`},
 		{`PREPARE a AS RESTORE DATABASE a FROM 'b'`},
 		{`PREPARE a (STRING) AS RESTORE DATABASE a FROM $1`},
-		{`PREPARE a AS CANCEL QUERY 1`},
-		{`PREPARE a (STRING) AS CANCEL QUERY $1`},
-		{`PREPARE a AS CANCEL JOB 1`},
-		{`PREPARE a (INT) AS CANCEL JOB $1`},
-		{`PREPARE a AS PAUSE JOB 1`},
-		{`PREPARE a (INT) AS PAUSE JOB $1`},
-		{`PREPARE a AS RESUME JOB 1`},
-		{`PREPARE a (INT) AS RESUME JOB $1`},
+		{`PREPARE a AS CANCEL QUERIES SELECT 1`},
+		{`PREPARE a (STRING) AS CANCEL QUERIES SELECT $1`},
+		{`PREPARE a AS CANCEL QUERIES IF EXISTS SELECT 1`},
+		{`PREPARE a (STRING) AS CANCEL QUERIES IF EXISTS SELECT $1`},
+		{`PREPARE a AS CANCEL SESSIONS SELECT 1`},
+		{`PREPARE a (STRING) AS CANCEL SESSIONS SELECT $1`},
+		{`PREPARE a AS CANCEL SESSIONS IF EXISTS SELECT 1`},
+		{`PREPARE a (STRING) AS CANCEL SESSIONS IF EXISTS SELECT $1`},
+		{`PREPARE a AS CANCEL JOBS SELECT 1`},
+		{`PREPARE a (INT) AS CANCEL JOBS SELECT $1`},
+		{`PREPARE a AS PAUSE JOBS SELECT 1`},
+		{`PREPARE a (INT) AS PAUSE JOBS SELECT $1`},
+		{`PREPARE a AS RESUME JOBS SELECT 1`},
+		{`PREPARE a (INT) AS RESUME JOBS SELECT $1`},
 		{`PREPARE a AS IMPORT TABLE a CREATE USING 'b' CSV DATA ('c') WITH temp = 'd'`},
 		{`PREPARE a (STRING, STRING, STRING) AS IMPORT TABLE a CREATE USING $1 CSV DATA ($2) WITH temp = $3`},
 
@@ -432,8 +442,8 @@ func TestParse(t *testing.T) {
 
 		// Tables are the default, but can also be specified with
 		// GRANT x ON TABLE y. However, the stringer does not output TABLE.
-		{`GRANT SELECT ON foo TO root`},
-		{`GRANT SELECT, DELETE, UPDATE ON foo, db.foo TO root, bar`},
+		{`GRANT SELECT ON TABLE foo TO root`},
+		{`GRANT SELECT, DELETE, UPDATE ON TABLE foo, db.foo TO root, bar`},
 		{`GRANT DROP ON DATABASE foo TO root`},
 		{`GRANT ALL ON DATABASE foo TO root, test`},
 		{`GRANT SELECT, INSERT ON DATABASE bar TO foo, bar, baz`},
@@ -444,8 +454,8 @@ func TestParse(t *testing.T) {
 
 		// Tables are the default, but can also be specified with
 		// REVOKE x ON TABLE y. However, the stringer does not output TABLE.
-		{`REVOKE SELECT ON foo FROM root`},
-		{`REVOKE UPDATE, DELETE ON foo, db.foo FROM root, bar`},
+		{`REVOKE SELECT ON TABLE foo FROM root`},
+		{`REVOKE UPDATE, DELETE ON TABLE foo, db.foo FROM root, bar`},
 		{`REVOKE INSERT ON DATABASE foo FROM root`},
 		{`REVOKE ALL ON DATABASE foo FROM root, test`},
 		{`REVOKE SELECT, INSERT ON DATABASE bar FROM foo, bar, baz`},
@@ -516,8 +526,15 @@ func TestParse(t *testing.T) {
 		{`SELECT EXISTS (SELECT 1)`},
 		{`SELECT (VALUES (1))`},
 		{`SELECT (1, 2, 3)`},
+		{`SELECT ((1, 2, 3) AS a, b, c)`},
 		{`SELECT (ROW(1, 2, 3))`},
+		{`SELECT (ROW(1, 2, 3) AS a, b, c)`},
+		{`SELECT ((ROW(1, 2, 3) AS a, b, c)).a`},
+		{`SELECT ((ROW(1, 2, 3) AS a, b, c)).*`},
 		{`SELECT (ROW())`},
+		{`SELECT (ROW() AS a)`},
+		{`SELECT ((ROW() AS a)).a`},
+		{`SELECT ((ROW() AS a)).*`},
 		{`SELECT (TABLE a)`},
 		{`SELECT 0x1`},
 		{`SELECT 'Deutsch' COLLATE "DE"`},
@@ -573,6 +590,7 @@ func TestParse(t *testing.T) {
 		{`SELECT BYTES 'foo'`},
 		{`SELECT DATE 'foo'`},
 		{`SELECT TIME 'foo'`},
+		{`SELECT TIME WITH TIME ZONE 'foo'`},
 		{`SELECT TIMESTAMP 'foo'`},
 		{`SELECT TIMESTAMP WITH TIME ZONE 'foo'`},
 
@@ -695,6 +713,10 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE a = b(c, d)`},
 		{`SELECT a FROM t WHERE a = count(*)`},
 		{`SELECT a FROM t WHERE a = IF(b, c, d)`},
+		{`SELECT a FROM t WHERE a = IFERROR(b, c, d)`},
+		{`SELECT a FROM t WHERE a = IFERROR(b, c)`},
+		{`SELECT a FROM t WHERE a = ISERROR(b)`},
+		{`SELECT a FROM t WHERE a = ISERROR(b, c)`},
 		{`SELECT a FROM t WHERE a = IFNULL(b, c)`},
 		{`SELECT a FROM t WHERE a = NULLIF(b, c)`},
 		{`SELECT a FROM t WHERE a = COALESCE(a, b, c, d, e)`},
@@ -774,6 +796,8 @@ func TestParse(t *testing.T) {
 		{`SET TRANSACTION PRIORITY NORMAL`},
 		{`SET TRANSACTION PRIORITY HIGH`},
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY HIGH`},
+		{`SET TRACING = off`},
+		{`SET TRACING = 'cluster', 'kv'`},
 		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE`},
 		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT`},
 		{`SET CLUSTER SETTING a = 3`},
@@ -793,6 +817,13 @@ func TestParse(t *testing.T) {
 		{`SELECT * FROM t@{FORCE_INDEX=[123],NO_INDEX_JOIN}`},
 		{`SELECT * FROM [123 AS t]@[456]`},
 		{`SELECT * FROM [123 AS t]@{FORCE_INDEX=[456],NO_INDEX_JOIN}`},
+
+		{`SELECT (1 + 2).*`},
+		{`SELECT (1 + 2).col`},
+		{`SELECT (abc.def).col`},
+		{`SELECT (i.keys).col`},
+		{`SELECT (i.keys).*`},
+		{`SELECT (ARRAY['a', 'b', 'c']).name`},
 
 		{`TABLE a`}, // Shorthand for: SELECT * FROM a; used e.g. in CREATE VIEW v AS TABLE t
 		{`TABLE [123 AS a]`},
@@ -863,6 +894,11 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE a ALTER COLUMN b DROP DEFAULT`},
 		{`ALTER TABLE a ALTER COLUMN b DROP NOT NULL`},
 		{`ALTER TABLE a ALTER b DROP NOT NULL`},
+		{`ALTER TABLE a ALTER COLUMN b DROP STORED`},
+
+		{`ALTER TABLE a ALTER b TYPE INT`},
+		{`ALTER TABLE a ALTER COLUMN b SET DATA TYPE INT`},
+		{`ALTER TABLE a ALTER COLUMN b SET DATA TYPE STRING COLLATE en USING b::STRING`},
 
 		{`COPY t FROM STDIN`},
 		{`COPY t (a, b, c) FROM STDIN`},
@@ -875,10 +911,10 @@ func TestParse(t *testing.T) {
 		{`ALTER INDEX i SPLIT AT VALUES (1)`},
 		{`ALTER INDEX d.i SPLIT AT VALUES (2)`},
 
-		{`ALTER TABLE a TESTING_RELOCATE VALUES (ARRAY[1], 1)`},
-		{`ALTER TABLE a TESTING_RELOCATE SELECT * FROM t`},
-		{`ALTER TABLE d.a TESTING_RELOCATE VALUES (ARRAY[1, 2, 3], 'b', 2)`},
-		{`ALTER INDEX d.i TESTING_RELOCATE VALUES (ARRAY[1], 2)`},
+		{`ALTER TABLE a EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1)`},
+		{`ALTER TABLE a EXPERIMENTAL_RELOCATE SELECT * FROM t`},
+		{`ALTER TABLE d.a EXPERIMENTAL_RELOCATE VALUES (ARRAY[1, 2, 3], 'b', 2)`},
+		{`ALTER INDEX d.i EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 2)`},
 
 		{`ALTER TABLE a SCATTER`},
 		{`ALTER TABLE a SCATTER FROM (1, 2, 3) TO (4, 5, 6)`},
@@ -918,28 +954,38 @@ func TestParse(t *testing.T) {
 		{`EXPERIMENTAL SCRUB TABLE x WITH OPTIONS PHYSICAL, INDEX (index_name), CONSTRAINT (cst_name)`},
 		{`EXPERIMENTAL SCRUB TABLE x WITH OPTIONS PHYSICAL, INDEX ALL, CONSTRAINT ALL`},
 
-		{`BACKUP foo TO 'bar'`},
-		{`BACKUP foo.foo, baz.baz TO 'bar'`},
+		{`BACKUP TABLE foo TO 'bar'`},
+		{`BACKUP TABLE foo.foo, baz.baz TO 'bar'`},
 		{`SHOW BACKUP 'bar'`},
-		{`BACKUP foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
-		{`BACKUP foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
+		{`BACKUP TABLE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
+		{`BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
 		{`BACKUP DATABASE foo TO 'bar'`},
 		{`BACKUP DATABASE foo, baz TO 'bar'`},
 		{`BACKUP DATABASE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
-		{`RESTORE foo FROM 'bar'`},
-		{`RESTORE foo FROM $1`},
-		{`RESTORE foo FROM $1, $2, 'bar'`},
-		{`RESTORE foo, baz FROM 'bar'`},
-		{`RESTORE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
+		{`RESTORE TABLE foo FROM 'bar'`},
+		{`RESTORE TABLE foo FROM $1`},
+		{`RESTORE TABLE foo FROM $1, $2, 'bar'`},
+		{`RESTORE TABLE foo, baz FROM 'bar'`},
+		{`RESTORE TABLE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
 		{`RESTORE DATABASE foo FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar'`},
 		{`RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
-		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`},
-		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`},
+		{`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
 		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' MYSQLOUTFILE DATA ('path/to/some/file', $1)`},
 		{`IMPORT TABLE foo (id INT PRIMARY KEY, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
 		{`IMPORT TABLE foo (id INT, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
+		{`EXPORT INTO CSV 'a' FROM TABLE a`},
+		{`EXPORT INTO CSV 'a' FROM SELECT * FROM a`},
+		{`EXPORT INTO CSV 's3://my/path/%part%.csv' WITH delimiter = '|' FROM TABLE a`},
+		{`EXPORT INTO CSV 's3://my/path/%part%.csv' WITH delimiter = '|' FROM SELECT a, sum(b) FROM c WHERE d = 1 ORDER BY sum(b) DESC LIMIT 10`},
 		{`SET ROW (1, true, NULL)`},
+
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT TABLE foo TO 'sink'`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT TABLE foo TO 'sink' WITH topic_prefix = 'bar'`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT DATABASE foo TO 'sink'`},
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT TABLE foo TO 'sink' AS OF SYSTEM TIME '1'`},
 
 		// Regression for #15926
 		{`SELECT * FROM ((t1 NATURAL JOIN t2 WITH ORDINALITY AS o1)) WITH ORDINALITY AS o2`},
@@ -951,7 +997,7 @@ func TestParse(t *testing.T) {
 		}
 		s := stmts.String()
 		if d.sql != s {
-			t.Errorf("expected \n%s\n, but found \n%s", d.sql, s)
+			t.Errorf("expected \n%q\n, but found \n%q", d.sql, s)
 		}
 	}
 }
@@ -981,6 +1027,9 @@ func TestParse2(t *testing.T) {
 		{`SELECT TIMESTAMP WITHOUT TIME ZONE 'foo'`, `SELECT TIMESTAMP 'foo'`},
 		{`SELECT CAST('foo' AS TIMESTAMP WITHOUT TIME ZONE)`, `SELECT CAST('foo' AS TIMESTAMP)`},
 		{`SELECT CAST(1 AS "char")`, `SELECT CAST(1 AS CHAR)`},
+		{`SELECT CAST(1 AS "timestamp")`, `SELECT CAST(1 AS TIMESTAMP)`},
+		{`SELECT CAST(1 AS _int8)`, `SELECT CAST(1 AS INT[])`},
+		{`SELECT CAST(1 AS "_int8")`, `SELECT CAST(1 AS INT[])`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
@@ -1064,6 +1113,8 @@ func TestParse2(t *testing.T) {
 			`SELECT current_schema()`},
 		{`SELECT CURRENT_CATALOG`,
 			`SELECT current_database()`},
+		{`SELECT CURRENT_TIME`,
+			`SELECT current_time()`},
 		{`SELECT CURRENT_TIMESTAMP`,
 			`SELECT current_timestamp()`},
 		{`SELECT CURRENT_DATE`,
@@ -1243,6 +1294,7 @@ func TestParse2(t *testing.T) {
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT READ ONLY`,
 			`SET TRANSACTION ISOLATION LEVEL SNAPSHOT, READ ONLY`},
 		{"SET CLUSTER SETTING a TO 1", "SET CLUSTER SETTING a = 1"},
+		{"SET TRACING TO off", "SET TRACING = off"},
 		{"RELEASE foo", "RELEASE SAVEPOINT foo"},
 		{"RELEASE SAVEPOINT foo", "RELEASE SAVEPOINT foo"},
 		{"ROLLBACK", "ROLLBACK TRANSACTION"},
@@ -1259,12 +1311,23 @@ func TestParse2(t *testing.T) {
 		{`DEALLOCATE PREPARE ALL`,
 			`DEALLOCATE ALL`},
 
+		{`CANCEL JOB a`, `CANCEL JOBS VALUES (a)`},
+		{`RESUME JOB a`, `RESUME JOBS VALUES (a)`},
+		{`PAUSE JOB a`, `PAUSE JOBS VALUES (a)`},
+		{`CANCEL QUERY a`, `CANCEL QUERIES VALUES (a)`},
+		{`CANCEL QUERY IF EXISTS a`, `CANCEL QUERIES IF EXISTS VALUES (a)`},
+		{`CANCEL SESSION a`, `CANCEL SESSIONS VALUES (a)`},
+		{`CANCEL SESSION IF EXISTS a`, `CANCEL SESSIONS IF EXISTS VALUES (a)`},
+
 		{`BACKUP DATABASE foo TO bar`,
 			`BACKUP DATABASE foo TO 'bar'`},
 		{`BACKUP DATABASE foo TO "bar.12" INCREMENTAL FROM "baz.34"`,
 			`BACKUP DATABASE foo TO 'bar.12' INCREMENTAL FROM 'baz.34'`},
 		{`RESTORE DATABASE foo FROM bar`,
 			`RESTORE DATABASE foo FROM 'bar'`},
+
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT DATABASE foo TO sink`,
+			`CREATE EXPERIMENTAL_CHANGEFEED EMIT DATABASE foo TO 'sink'`},
 
 		{`SHOW ALL CLUSTER SETTINGS`, `SHOW CLUSTER SETTING all`},
 
@@ -1301,6 +1364,57 @@ func TestParse2(t *testing.T) {
 		{`ALTER USER foo WITH PASSWORD bar`,
 			`ALTER USER 'foo' WITH PASSWORD 'bar'`},
 
+		// Alternative forms for table patterns.
+
+		{`SHOW GRANTS ON foo`,
+			`SHOW GRANTS ON TABLE foo`},
+		{`SHOW GRANTS ON foo, db.foo`,
+			`SHOW GRANTS ON TABLE foo, db.foo`},
+		{`BACKUP foo TO 'bar'`,
+			`BACKUP TABLE foo TO 'bar'`},
+		{`BACKUP foo.foo, baz.baz TO 'bar'`,
+			`BACKUP TABLE foo.foo, baz.baz TO 'bar'`},
+		{`BACKUP foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`,
+			`BACKUP TABLE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
+		{`BACKUP foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`,
+			`BACKUP TABLE foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
+		// Tables named "role" are handled specially to support SHOW GRANTS ON ROLE,
+		// but that special handling should not impact BACKUP.
+		{`BACKUP role TO 'bar'`,
+			`BACKUP TABLE role TO 'bar'`},
+		{`RESTORE foo FROM 'bar'`,
+			`RESTORE TABLE foo FROM 'bar'`},
+		{`RESTORE foo FROM $1`,
+			`RESTORE TABLE foo FROM $1`},
+		{`RESTORE foo FROM $1, $2, 'bar'`,
+			`RESTORE TABLE foo FROM $1, $2, 'bar'`},
+		{`RESTORE foo, baz FROM 'bar'`,
+			`RESTORE TABLE foo, baz FROM 'bar'`},
+		{`RESTORE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`,
+			`RESTORE TABLE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
+		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`,
+			`BACKUP TABLE foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`,
+			`RESTORE TABLE foo FROM 'bar' WITH key1, key2 = 'value'`},
+
+		{`CREATE EXPERIMENTAL_CHANGEFEED EMIT foo TO 'sink'`,
+			`CREATE EXPERIMENTAL_CHANGEFEED EMIT TABLE foo TO 'sink'`},
+
+		{`GRANT SELECT ON foo TO root`,
+			`GRANT SELECT ON TABLE foo TO root`},
+		{`GRANT SELECT, DELETE, UPDATE ON foo, db.foo TO root, bar`,
+			`GRANT SELECT, DELETE, UPDATE ON TABLE foo, db.foo TO root, bar`},
+		// Tables named "role" are handled specially to support SHOW GRANTS ON ROLE,
+		// but that special handling should not impact GRANT.
+		{`GRANT SELECT ON role TO root`,
+			`GRANT SELECT ON TABLE role TO root`},
+		{`REVOKE SELECT ON foo FROM root`,
+			`REVOKE SELECT ON TABLE foo FROM root`},
+		{`REVOKE UPDATE, DELETE ON foo, db.foo FROM root, bar`,
+			`REVOKE UPDATE, DELETE ON TABLE foo, db.foo FROM root, bar`},
+
+		// RBAC-related statements.
+
 		{`CREATE ROLE foo`,
 			`CREATE ROLE 'foo'`},
 		{`CREATE ROLE IF NOT EXISTS foo`,
@@ -1309,6 +1423,18 @@ func TestParse2(t *testing.T) {
 			`DROP ROLE 'foo', 'bar'`},
 		{`DROP ROLE IF EXISTS foo, bar`,
 			`DROP ROLE IF EXISTS 'foo', 'bar'`},
+
+		// Clarify the ambiguity between "ON ROLE" (RBAC) and "ON ROLE"
+		// (regular table named "role").
+		{`SHOW GRANTS ON role`, `SHOW GRANTS ON ROLE`},
+		{`SHOW GRANTS ON "role"`, `SHOW GRANTS ON TABLE role`},
+		{`SHOW GRANTS ON role foo`, `SHOW GRANTS ON ROLE foo`},
+		{`SHOW GRANTS ON role, foo`, `SHOW GRANTS ON TABLE role, foo`},
+		{`SHOW GRANTS ON role foo, bar`, `SHOW GRANTS ON ROLE foo, bar`},
+		{`SHOW GRANTS ON "role", foo`, `SHOW GRANTS ON TABLE role, foo`},
+		{`SHOW GRANTS ON "role".foo`, `SHOW GRANTS ON TABLE role.foo`},
+		{`SHOW GRANTS ON role.foo`, `SHOW GRANTS ON TABLE role.foo`},
+		{`SHOW GRANTS ON role.*`, `SHOW GRANTS ON TABLE role.*`},
 
 		{
 			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE NO ACTION ON DELETE NO ACTION)`,
@@ -1377,6 +1503,10 @@ func TestParse2(t *testing.T) {
 		{
 			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON UPDATE SET DEFAULT ON DELETE RESTRICT)`,
 			`CREATE TABLE a (b INT, FOREIGN KEY (b) REFERENCES other ON DELETE RESTRICT ON UPDATE SET DEFAULT)`,
+		},
+		{
+			`ALTER TABLE a ALTER b DROP STORED`,
+			`ALTER TABLE a ALTER COLUMN b DROP STORED`,
 		},
 	}
 	for _, d := range testData {
@@ -1575,7 +1705,7 @@ SELECT 1e-
        ^
 HINT: try \h SELECT`},
 		{"SELECT foo''",
-			`syntax error at or near ""
+			`type does not exist at or near ""
 SELECT foo''
           ^
 `},
@@ -1665,14 +1795,14 @@ HINT: try \h ALTER TABLE`,
 		},
 		{
 			`SELECT CAST(1.2+2.3 AS notatype)`,
-			`syntax error at or near "notatype"
+			`type does not exist at or near "notatype"
 SELECT CAST(1.2+2.3 AS notatype)
                        ^
 `,
 		},
 		{
 			`SELECT ANNOTATE_TYPE(1.2+2.3, notatype)`,
-			`syntax error at or near "notatype"
+			`type does not exist at or near "notatype"
 SELECT ANNOTATE_TYPE(1.2+2.3, notatype)
                               ^
 `,
@@ -1692,13 +1822,6 @@ ALTER TABLE t RENAME TO t[TRUE]
 `,
 		},
 		{
-			`SELECT (1 + 2).*`,
-			`syntax error at or near "."
-SELECT (1 + 2).*
-              ^
-`,
-		},
-		{
 			`TABLE abc[TRUE]`,
 			`syntax error at or near "["
 TABLE abc[TRUE]
@@ -1711,13 +1834,6 @@ TABLE abc[TRUE]
 UPDATE kv SET k[0] = 9
                ^
 HINT: try \h UPDATE`,
-		},
-		{
-			`SELECT (ARRAY['a', 'b', 'c']).name`,
-			`syntax error at or near "."
-SELECT (ARRAY['a', 'b', 'c']).name
-                             ^
-`,
 		},
 		{
 			`SELECT (0) FROM y[array[]]`,
@@ -1756,7 +1872,7 @@ SELECT 1 + ANY ARRAY[1, 2, 3]
 		},
 		{
 			`SELECT 'f'::"blah"`,
-			`syntax error at or near "blah"
+			`type does not exist at or near "blah"
 SELECT 'f'::"blah"
             ^
 `,
@@ -1789,11 +1905,62 @@ UPDATE foo SET a.b = 1
                  ^
 HINT: See: https://github.com/cockroachdb/cockroach/issues/8318`,
 		},
+		{
+			`SELECT * FROM ab, LATERAL (SELECT * FROM kv)`,
+			`unimplemented at or near "EOF"
+SELECT * FROM ab, LATERAL (SELECT * FROM kv)
+                                            ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/24560`,
+		},
+		{
+			`SELECT * FROM ab, LATERAL foo(a)`,
+			`unimplemented at or near "EOF"
+SELECT * FROM ab, LATERAL foo(a)
+                                ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/24560`,
+		},
+		// Ensure that the support for ON ROLE <namelist> doesn't leak
+		// where it should not be recognized.
+		{
+			`GRANT SELECT ON ROLE foo, bar TO blix`,
+			`syntax error at or near "foo"
+GRANT SELECT ON ROLE foo, bar TO blix
+                     ^
+HINT: try \h GRANT`,
+		},
+		{
+			`REVOKE SELECT ON ROLE foo, bar FROM blix`,
+			`syntax error at or near "foo"
+REVOKE SELECT ON ROLE foo, bar FROM blix
+                      ^
+HINT: try \h REVOKE`,
+		},
+		{
+			`BACKUP ROLE foo, bar TO 'baz'`,
+			`syntax error at or near "foo"
+BACKUP ROLE foo, bar TO 'baz'
+            ^
+HINT: try \h BACKUP`,
+		},
+		{
+			`RESTORE ROLE foo, bar FROM 'baz'`,
+			`syntax error at or near "foo"
+RESTORE ROLE foo, bar FROM 'baz'
+             ^
+HINT: try \h RESTORE`,
+		},
+		{
+			`SELECT max(a ORDER BY b) FROM ab`,
+			`unimplemented at or near ")"
+SELECT max(a ORDER BY b) FROM ab
+                       ^
+HINT: See: https://github.com/cockroachdb/cockroach/issues/23620`,
+		},
 	}
 	for _, d := range testData {
 		_, err := Parse(d.sql)
 		if err == nil {
-			t.Errorf("expected error, got nil")
+			t.Errorf("expected error, got nil for:\n%s", d.sql)
 			continue
 		}
 		msg := err.Error()

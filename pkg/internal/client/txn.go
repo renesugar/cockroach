@@ -188,11 +188,6 @@ func (txn *Txn) IsCommitted() bool {
 	return txn.status() == roachpb.COMMITTED
 }
 
-// IsAborted returns true if the transaction has the aborted status.
-func (txn *Txn) IsAborted() bool {
-	return txn.status() == roachpb.ABORTED
-}
-
 // SetUserPriority sets the transaction's user priority. Transactions default to
 // normal user priority. The user priority must be set before any operations are
 // performed on the transaction.
@@ -924,7 +919,7 @@ func (txn *Txn) Send(
 			}
 			// Set the key in the begin transaction request to the txn's anchor key.
 			bt := &roachpb.BeginTransactionRequest{
-				Span: roachpb.Span{
+				RequestHeader: roachpb.RequestHeader{
 					Key: txn.mu.Proto.Key,
 				},
 			}
@@ -942,6 +937,25 @@ func (txn *Txn) Send(
 
 		if elideEndTxn {
 			ba.Requests = ba.Requests[:lastIndex]
+		}
+
+		// Set the sequence number of each individual Request. The sequence
+		// number is used for replay and reordering protection. At the Store, a
+		// sequence number less than or equal to the last observed one (on a
+		// given key) incurs a transaction restart (if the request is
+		// transactional).
+		//
+		// This semantic could be adjusted in the future to provide idempotency
+		// for replays and re-issues. However, a side effect of providing this
+		// property is that reorder protection would no longer be provided by
+		// the counter, so ordering guarantees between requests within the same
+		// transaction would need to be strengthened elsewhere (e.g. by the
+		// transport layer).
+		for _, ru := range ba.Requests {
+			txn.mu.Proto.Sequence++
+			oldHeader := ru.GetInner().Header()
+			oldHeader.Sequence = txn.mu.Proto.Sequence
+			ru.GetInner().SetHeader(oldHeader)
 		}
 
 		// Clone the Txn's Proto so that future modifications can be made without
@@ -1187,13 +1201,8 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
 	txn.mu.Proto.Timestamp = ts
 	txn.mu.Proto.OrigTimestamp = ts
 	txn.mu.Proto.MaxTimestamp = ts
+	txn.mu.Proto.OrigTimestampWasObserved = true
 	txn.mu.Unlock()
-	// The deadline-checking code checks that the `Timestamp` field of the proto
-	// hasn't exceeded the deadline. Since we set the Timestamp field each retry,
-	// it won't ever exceed the deadline, and thus setting the deadline here is
-	// not strictly needed. However, it doesn't do anything incorrect and it will
-	// possibly find problems if things change in the future, so it is left in.
-	txn.UpdateDeadlineMaybe(ctx, ts)
 }
 
 // GenerateForcedRetryableError returns a HandledRetryableTxnError that will
@@ -1212,10 +1221,39 @@ func (txn *Txn) GenerateForcedRetryableError(msg string) error {
 		txn.ID(),
 		roachpb.MakeTransaction(
 			txn.DebugName(),
-			nil, // baseKey
+			nil, // aseKey
 			txn.UserPriority(),
 			txn.Isolation(),
 			txn.db.clock.Now(),
 			txn.db.clock.MaxOffset().Nanoseconds(),
 		))
+}
+
+// IsSerializablePushAndRefreshNotPossible returns true if the transaction is
+// serializable, its timestamp has been pushed and there's no chance that
+// refreshing the read spans will succeed later (thus allowing the transaction
+// to commit and not be restarted). Used to detect whether the txn is guaranteed
+// to get a retriable error later.
+//
+// Note that this method allows for false negatives: sometimes the client only
+// figures out that it's been pushed when it sends an EndTransaction - i.e. it's
+// possible for the txn to have been pushed asynchoronously by some other
+// operation (usually, but not exclusively, by a high-priority txn with
+// conflicting writes).
+func (txn *Txn) IsSerializablePushAndRefreshNotPossible() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	origTimestamp := txn.Proto().OrigTimestamp
+	origTimestamp.Forward(txn.Proto().RefreshedTimestamp)
+	isTxnPushed := txn.Proto().Timestamp != origTimestamp
+	// We check OrigTimestampWasObserved here because, if that's set, refreshing
+	// of reads is not performed.
+	return txn.Proto().Isolation == enginepb.SERIALIZABLE &&
+		isTxnPushed && txn.mu.Proto.OrigTimestampWasObserved
+}
+
+// Type returns the transaction's type.
+func (txn *Txn) Type() TxnType {
+	return txn.typ
 }

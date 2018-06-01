@@ -35,7 +35,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 	var err error
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		_, tableDesc, err = expandIndexName(ctx, p, n.Index, true /* requireTable */)
 	})
 	if err != nil {
@@ -77,13 +77,15 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 		return nil, fmt.Errorf("index name %q already exists", string(n.NewName))
 	}
 
-	tableDesc.RenameIndexDescriptor(idx, string(n.NewName))
+	if err := tableDesc.RenameIndexDescriptor(idx, string(n.NewName)); err != nil {
+		return nil, err
+	}
 
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return nil, err
 	}
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	if err := tableDesc.Validate(ctx, p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
 		return nil, err
 	}
 	if err := p.txn.Put(ctx, descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {

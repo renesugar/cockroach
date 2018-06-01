@@ -16,6 +16,8 @@ fi
 
 case "${cmd}" in
     create)
+    echo -n "Enter your dev license key (if any): "
+    read cr_dev_license
     gcloud compute instances \
            create "${NAME}" \
            --machine-type "custom-24-32768" \
@@ -27,12 +29,17 @@ case "${cmd}" in
            --boot-disk-type "pd-ssd" \
            --boot-disk-device-name "${NAME}" \
            --scopes "default,cloud-platform"
+    gcloud compute firewall-rules create "${NAME}-mosh" --allow udp:60000-61000
 
     # Retry while vm and sshd to start up.
     retry gcloud compute ssh "${NAME}" --command=true
 
     gcloud compute copy-files "build/bootstrap" "${NAME}:bootstrap"
     gcloud compute ssh "${NAME}" --ssh-flag="-A" --command="./bootstrap/bootstrap-debian.sh"
+
+    if [[ -n "${cr_dev_license}" ]]; then
+        $0 ssh "echo COCKROACH_DEV_LICENSE=${cr_dev_license} >> ~/.bashrc_bootstrap"
+    fi
 
     # Install automatic shutdown after ten minutes of operation without a
     # logged in user. To disable this, `sudo touch /.active`.
@@ -45,11 +52,30 @@ case "${cmd}" in
     stop)
     gcloud compute instances stop "${NAME}"
     ;;
-    delete)
-    gcloud compute instances delete "${NAME}"
+    delete|destroy)
+    status=0
+    gcloud compute firewall-rules delete "${NAME}-mosh" || status=$((status+1))
+    gcloud compute instances delete "${NAME}" || status=$((status+1))
+    exit ${status}
     ;;
     ssh)
     retry gcloud compute ssh "${NAME}" --ssh-flag="-A" "$@"
+    ;;
+    mosh)
+    # An alternative solution would be to run gcloud compute config-ssh after
+    # starting or creating the vm, which adds stanzas to ~/.ssh/config that
+    # make `ssh $HOST` (and by extension, hopefully, mosh).
+    read -r -a arr <<< "$(gcloud compute ssh "${NAME}" --dry-run)"
+    host="${arr[-1]}"
+    unset 'arr[${#arr[@]}-1]'
+    mosh --ssh=$(printf '%q' "${arr}") $host
+    ;;
+    scp)
+    # Example: $0 scp gceworker-youruser:go/src/github.com/cockroachdb/cockroach/cockroach-data/logs gcelogs --recurse
+    retry gcloud compute scp "$@"
+    ;;
+    ip)
+    gcloud compute instances describe --format="value(networkInterfaces[0].accessConfigs[0].natIP)" "${NAME}"
     ;;
     sync)
     if ! hash unison 2>/dev/null; then

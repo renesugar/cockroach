@@ -22,7 +22,6 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"go/build"
 	"io"
 	"net/url"
 	"os"
@@ -81,16 +80,15 @@ import (
 //
 // Input files for unit testing are stored alongside the source code
 // in the `testdata` subdirectory. The input files for the larger
-// `bigtest` are stored in a separate repository.
+// TestSqlLiteLogic tests are stored in a separate repository.
 //
 // The test input is expressed using a domain-specific language, called
 // Test-Script, defined by SQLite's "Sqllogictest".  The official home
 // of Sqllogictest and Test-Script is
 //      https://www.sqlite.org/sqllogictest/
 //
-// (CockroachDB's `bigtest` is actually a fork of the Sqllogictest
-// test files; its input files are hosted at
-// https://github.com/cockroachdb/sqllogictest )
+// (the TestSqlLiteLogic test uses a fork of the Sqllogictest test files;
+// its input files are hosted at https://github.com/cockroachdb/sqllogictest)
 //
 // Test-Script is line-oriented. It supports both statements which
 // generate no result rows, and queries that produce result rows. The
@@ -116,6 +114,13 @@ import (
 //    example:
 //      statement ok
 //      CREATE TABLE kv (k INT PRIMARY KEY, v INT)
+//
+//
+//  - statement count N
+//    Like "statement ok" but expect a final RowsAffected count of N.
+//    example:
+//      statement count 2
+//      INSERT INTO kv VALUES (1,2), (2,3)
 //
 //  - statement error <regexp>
 //    Runs the statement that follows and expects an
@@ -240,8 +245,8 @@ import (
 // -d <glob>  selects all files matching <glob>. This can mix and
 //            match wildcards (*/?) or groups like {a,b,c}.
 //
-// -bigtest   cancels any -d setting and selects all relevant input
-//            files from CockroachDB's fork of Sqllogictest.
+// -bigtest   enable the long-running SqlLiteLogic test, which uses files from
+//            CockroachDB's fork of Sqllogictest.
 //
 // Configuration:
 //
@@ -308,10 +313,8 @@ var (
 	varRE     = regexp.MustCompile(`\$[a-zA-Z][a-zA-Z_0-9]*`)
 
 	// Input selection
-	logictestdata = flag.String("d", "testdata/logic_test/[^.]*", "test data glob")
-	bigtest       = flag.Bool(
-		"bigtest", false, "use the big set of logic test files (overrides testdata)",
-	)
+	logictestdata = flag.String("d", "", "glob that selects subset of files to run")
+	bigtest       = flag.Bool("bigtest", false, "enable the long-running SqlLiteLogic test")
 	defaultConfig = flag.String(
 		"config", "default",
 		"customizes the default test cluster configuration for files that lack LogicTest directives",
@@ -355,17 +358,24 @@ type testClusterConfig struct {
 	name                string
 	numNodes            int
 	useFakeSpanResolver bool
+	// if non-empty, overrides the default optimizer mode.
+	overrideOptimizerMode string
 	// if non-empty, overrides the default distsql mode.
 	overrideDistSQLMode string
 	// if set, queries using distSQL processors that can fall back to disk do
 	// so immediately, using only their disk-based implementation.
 	distSQLUseDisk bool
+	// if set, enables DistSQL metadata propagation tests.
+	distSQLMetadataTestEnabled bool
+	// if set and the -test.short flag is passed, skip this config.
+	skipShort bool
 	// if set, any logic statement expected to succeed and parallelizable
 	// using RETURNING NOTHING syntax will be parallelized transparently.
 	// See logicStatement.parallelizeStmts.
 	parallelStmts    bool
 	bootstrapVersion *cluster.ClusterVersion
 	serverVersion    *roachpb.Version
+	disableUpgrade   int32
 }
 
 // logicTestConfigs contains all possible cluster configs. A test file can
@@ -376,18 +386,24 @@ type testClusterConfig struct {
 // via -config).
 var logicTestConfigs = []testClusterConfig{
 	{name: "default", numNodes: 1, overrideDistSQLMode: "Off"},
-	{name: "default-v1.1@v1.0", numNodes: 1, overrideDistSQLMode: "Off",
+	{name: "default-v1.1@v1.0-noupgrade", numNodes: 1, overrideDistSQLMode: "Off",
 		bootstrapVersion: &cluster.ClusterVersion{
 			UseVersion:     cluster.VersionByKey(cluster.VersionBase),
 			MinimumVersion: cluster.VersionByKey(cluster.VersionBase),
 		},
-		serverVersion: &roachpb.Version{Major: 1, Minor: 1},
+		serverVersion:  &roachpb.Version{Major: 1, Minor: 1},
+		disableUpgrade: 1,
 	},
+	{name: "opt", numNodes: 1, overrideDistSQLMode: "Off", overrideOptimizerMode: "On"},
 	{name: "parallel-stmts", numNodes: 1, parallelStmts: true, overrideDistSQLMode: "Off"},
 	{name: "distsql", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On"},
+	{name: "distsql-opt", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On", overrideOptimizerMode: "On"},
+	{name: "distsql-metadata", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On", distSQLMetadataTestEnabled: true, skipShort: true},
 	{name: "distsql-disk", numNodes: 3, useFakeSpanResolver: true, overrideDistSQLMode: "On", distSQLUseDisk: true},
 	{name: "5node", numNodes: 5, overrideDistSQLMode: "Off"},
 	{name: "5node-distsql", numNodes: 5, overrideDistSQLMode: "On"},
+	{name: "5node-distsql-opt", numNodes: 5, overrideDistSQLMode: "On", overrideOptimizerMode: "On"},
+	{name: "5node-distsql-metadata", numNodes: 5, overrideDistSQLMode: "On", distSQLMetadataTestEnabled: true, skipShort: true},
 	{name: "5node-distsql-disk", numNodes: 5, overrideDistSQLMode: "On", distSQLUseDisk: true},
 }
 
@@ -441,6 +457,8 @@ type logicStatement struct {
 	// expected pgcode for the error, if any. "" indicates the
 	// test does not check the pgwire error code.
 	expectErrCode string
+	// expected rows affected count. -1 to avoid testing this.
+	expectCount int64
 }
 
 // readSQL reads the lines of a SQL statement or query until the first blank
@@ -801,25 +819,6 @@ func (t *logicTest) outf(format string, args ...interface{}) {
 // It returns a cleanup function to be run when the credentials
 // are no longer needed.
 func (t *logicTest) setUser(user string) func() {
-	var outDBName string
-
-	if t.db != nil {
-		var inDBName string
-
-		if err := t.db.QueryRow("SHOW DATABASE").Scan(&inDBName); err != nil {
-			t.Fatal(err)
-		}
-
-		defer func() {
-			if inDBName != outDBName {
-				// Propagate the DATABASE setting to the newly-live connection.
-				if _, err := t.db.Exec(fmt.Sprintf("SET DATABASE = '%s'", inDBName)); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}()
-	}
-
 	if t.clients == nil {
 		t.clients = map[string]*gosql.DB{}
 	}
@@ -827,16 +826,13 @@ func (t *logicTest) setUser(user string) func() {
 		t.db = db
 		t.user = user
 
-		if err := t.db.QueryRow("SHOW DATABASE").Scan(&outDBName); err != nil {
-			t.Fatal(err)
-		}
-
 		// No cleanup necessary, but return a no-op func to avoid nil pointer dereference.
 		return func() {}
 	}
 
 	addr := t.cluster.Server(t.nodeIdx).ServingAddr()
 	pgURL, cleanupFunc := sqlutils.PGUrl(t.t, addr, "TestLogic", url.User(user))
+	pgURL.Path = "test"
 	db, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
@@ -872,17 +868,25 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 					AssertUnaryExprReturnTypes:  true,
 					AssertFuncExprReturnTypes:   true,
 				},
+				Upgrade: &server.UpgradeTestingKnobs{
+					DisableUpgrade: cfg.disableUpgrade,
+				},
 			},
+			UseDatabase: "test",
 		},
 		// For distributed SQL tests, we use the fake span resolver; it doesn't
 		// matter where the data really is.
 		ReplicationMode: base.ReplicationManual,
 	}
+
+	distSQLKnobs := &distsqlrun.TestingKnobs{MetadataTestLevel: distsqlrun.Off}
 	if cfg.distSQLUseDisk {
-		params.ServerArgs.Knobs.DistSQL = &distsqlrun.TestingKnobs{
-			MemoryLimitBytes: 1,
-		}
+		distSQLKnobs.MemoryLimitBytes = 1
 	}
+	if cfg.distSQLMetadataTestEnabled {
+		distSQLKnobs.MetadataTestLevel = distsqlrun.NoExplain
+	}
+	params.ServerArgs.Knobs.DistSQL = distSQLKnobs
 
 	if cfg.serverVersion != nil {
 		// If we want to run a specific server version, we assume that it
@@ -942,9 +946,15 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 
 	if _, err := t.db.Exec(`
 CREATE DATABASE test;
-SET DATABASE = test;
 `); err != nil {
 		t.Fatal(err)
+	}
+
+	// Enable the cost-based optimizer rather than the heuristic planner.
+	if cfg.overrideOptimizerMode != "" {
+		if _, err := t.db.Exec(fmt.Sprintf("SET EXPERIMENTAL_OPT = %s;", cfg.overrideOptimizerMode)); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if _, err := t.db.Exec(fmt.Sprintf("CREATE USER %s;", server.TestUser)); err != nil {
@@ -1185,12 +1195,20 @@ func (t *logicTest) processSubtest(
 
 		case "statement":
 			stmt := logicStatement{
-				pos: fmt.Sprintf("\n%s:%d", path, s.line+subtest.lineLineIndexIntoFile),
+				pos:         fmt.Sprintf("\n%s:%d", path, s.line+subtest.lineLineIndexIntoFile),
+				expectCount: -1,
 			}
 			// Parse "statement error <regexp>"
 			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
 				stmt.expectErrCode = m[1]
 				stmt.expectErr = m[2]
+			}
+			if len(fields) >= 3 && fields[1] == "count" {
+				n, err := strconv.ParseInt(fields[2], 10, 64)
+				if err != nil {
+					return err
+				}
+				stmt.expectCount = n
 			}
 			if _, err := stmt.readSQL(t, s, false /* allowSeparator */); err != nil {
 				return err
@@ -1541,7 +1559,17 @@ func (t *logicTest) execStatement(stmt logicStatement) (bool, error) {
 	if *showSQL {
 		t.outf("%s;", stmt.sql)
 	}
-	_, err := t.db.Exec(stmt.sql)
+	res, err := t.db.Exec(stmt.sql)
+	if err == nil && stmt.expectCount >= 0 {
+		var count int64
+		count, err = res.RowsAffected()
+
+		// If err becomes non-nil here, we'll catch it below.
+
+		if err == nil && count != stmt.expectCount {
+			t.Errorf("%s: %s\nexpected %d rows affected, got %d", stmt.pos, stmt.sql, stmt.expectCount, count)
+		}
+	}
 
 	// General policy for failing vs. continuing:
 	// - we want to do as much work as possible;
@@ -1826,8 +1854,9 @@ var skipLogicTests = envutil.EnvOrDefaultBool("COCKROACH_LOGIC_TESTS_SKIP", fals
 var logicTestsConfigExclude = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_SKIP_CONFIG", "")
 var logicTestsConfigFilter = envutil.EnvOrDefaultString("COCKROACH_LOGIC_TESTS_CONFIG", "")
 
-// RunLogicTest is the main entry point for the logic test.
-func RunLogicTest(t *testing.T) {
+// RunLogicTest is the main entry point for the logic test. The globs parameter
+// specifies the default sets of files to run.
+func RunLogicTest(t *testing.T, globs ...string) {
 	if testutils.NightlyStress() {
 		// See https://github.com/cockroachdb/cockroach/pull/10966.
 		t.Skip()
@@ -1837,48 +1866,15 @@ func RunLogicTest(t *testing.T) {
 		t.Skip("COCKROACH_LOGIC_TESTS_SKIP")
 	}
 
-	// run the logic tests indicated by the bigtest and logictestdata flags.
-	// A new cluster is set up for each separate file in the test.
-	var globs []string
-	if *bigtest {
-		logicTestPath := build.Default.GOPATH + "/src/github.com/cockroachdb/sqllogictest"
-		if _, err := os.Stat(logicTestPath); os.IsNotExist(err) {
-			fullPath, err := filepath.Abs(logicTestPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Fatalf("unable to find sqllogictest repo: %s\n"+
-				"git clone https://github.com/cockroachdb/sqllogictest %s",
-				logicTestPath, fullPath)
-			return
-		}
-		globs = []string{
-			logicTestPath + "/test/index/between/*/*.test",
-			logicTestPath + "/test/index/commute/*/*.test",
-			logicTestPath + "/test/index/delete/*/*.test",
-			logicTestPath + "/test/index/in/*/*.test",
-			logicTestPath + "/test/index/orderby/*/*.test",
-			logicTestPath + "/test/index/orderby_nosort/*/*.test",
-			logicTestPath + "/test/index/view/*/*.test",
-
-			// TODO(pmattis): Incompatibilities in numeric types.
-			// For instance, we type SUM(int) as a decimal since all of our ints are
-			// int64.
-			// logicTestPath + "/test/random/expr/*.test",
-
-			// TODO(pmattis): We don't support correlated subqueries.
-			// logicTestPath + "/test/select*.test",
-
-			// TODO(pmattis): We don't support unary + on strings.
-			// logicTestPath + "/test/index/random/*/*.test",
-			// [uses joins] logicTestPath + "/test/random/aggregates/*.test",
-			// [uses joins] logicTestPath + "/test/random/groupby/*.test",
-			// [uses joins] logicTestPath + "/test/random/select/*.test",
-		}
-	} else {
+	// Override default glob sets if -d flag was specified.
+	if *logictestdata != "" {
 		globs = []string{*logictestdata}
 	}
 
+	// Set time.Local to time.UTC to circumvent pq's timetz parsing flaw.
+	time.Local = time.UTC
+
+	// A new cluster is set up for each separate file in the test.
 	var paths []string
 	for _, g := range globs {
 		match, err := filepath.Glob(g)
@@ -1926,6 +1922,9 @@ func RunLogicTest(t *testing.T) {
 		}
 		// Top-level test: one per test configuration.
 		t.Run(cfg.name, func(t *testing.T) {
+			if testing.Short() && cfg.skipShort {
+				t.Skip("config skipped by -test.short")
+			}
 			if logicTestsConfigExclude != "" && cfg.name == logicTestsConfigExclude {
 				t.Skip("config excluded via env var")
 			}

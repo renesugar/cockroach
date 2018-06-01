@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -76,7 +77,7 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 	var table *TableDescriptor
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
-	params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+	params.p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		table, err = params.p.resolveTableForZone(params.ctx, &n.zoneSpecifier)
 	})
 	if err != nil {
@@ -152,12 +153,45 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		if err := zone.Validate(); err != nil {
 			return fmt.Errorf("could not validate zone config: %s", err)
 		}
+		if err := validateZoneAttrsAndLocalities(
+			params.ctx,
+			params.extendedEvalCtx.StatusServer.Nodes,
+			*yamlConfig,
+		); err != nil {
+			return err
+		}
 	}
 
 	hasNewSubzones := yamlConfig != nil && index != nil
 	n.run.numAffected, err = writeZoneConfig(params.ctx, params.p.txn,
 		targetID, table, zone, params.extendedEvalCtx.ExecCfg, hasNewSubzones)
-	return err
+	if err != nil {
+		return err
+	}
+
+	var eventLogType EventLogType
+	info := struct {
+		Target string
+		Config string `json:",omitempty"`
+		User   string
+	}{
+		Target: config.CLIZoneSpecifier(&n.zoneSpecifier),
+		User:   params.SessionData().User,
+	}
+	if yamlConfig == nil {
+		eventLogType = EventLogRemoveZoneConfig
+	} else {
+		eventLogType = EventLogSetZoneConfig
+		info.Config = *yamlConfig
+	}
+	return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
+		params.ctx,
+		params.p.txn,
+		eventLogType,
+		int32(targetID),
+		int32(params.extendedEvalCtx.NodeID),
+		info,
+	)
 }
 
 func (n *setZoneConfigNode) Next(runParams) (bool, error) { return false, nil }
@@ -165,6 +199,92 @@ func (n *setZoneConfigNode) Values() tree.Datums          { return nil }
 func (*setZoneConfigNode) Close(context.Context)          {}
 
 func (n *setZoneConfigNode) FastPathResults() (int, bool) { return n.run.numAffected, true }
+
+type nodeGetter func(context.Context, *serverpb.NodesRequest) (*serverpb.NodesResponse, error)
+
+// validateZoneAttrsAndLocalities ensures that all constraints/lease preferences
+// specified in the new zone config snippet are actually valid, meaning that
+// they match at least one node. This protects against user typos causing
+// zone configs that silently don't work as intended.
+//
+// Note that this really only catches typos in required constraints -- we don't
+// want to reject prohibited constraints whose attributes/localities don't
+// match any of the current nodes because it's a reasonable use case to add
+// prohibited constraints for a new set of nodes before adding the new nodes to
+// the cluster. If you had to first add one of the nodes before creating the
+// constraints, data could be replicated there that shouldn't be.
+func validateZoneAttrsAndLocalities(
+	ctx context.Context, getNodes nodeGetter, yamlConfig string,
+) error {
+	// The caller should have already parsed the yaml once into a pre-populated
+	// zone config, so this shouldn't ever fail, but we want to re-parse it so
+	// that we only verify newly-set fields, not existing ones.
+	var zone config.ZoneConfig
+	if err := yaml.UnmarshalStrict([]byte(yamlConfig), &zone); err != nil {
+		return fmt.Errorf("could not parse zone config: %s", err)
+	}
+
+	if len(zone.Constraints) == 0 && len(zone.LeasePreferences) == 0 {
+		return nil
+	}
+
+	// Given that we have something to validate, do the work to retrieve the
+	// set of attributes and localities present on at least one node.
+	nodes, err := getNodes(ctx, &serverpb.NodesRequest{})
+	if err != nil {
+		return err
+	}
+
+	// Accumulate a unique list of constraints to validate.
+	toValidate := make([]config.Constraint, 0)
+	addToValidate := func(c config.Constraint) {
+		var alreadyInList bool
+		for _, val := range toValidate {
+			if c == val {
+				alreadyInList = true
+				break
+			}
+		}
+		if !alreadyInList {
+			toValidate = append(toValidate, c)
+		}
+	}
+	for _, constraints := range zone.Constraints {
+		for _, constraint := range constraints.Constraints {
+			addToValidate(constraint)
+		}
+	}
+	for _, leasePreferences := range zone.LeasePreferences {
+		for _, constraint := range leasePreferences.Constraints {
+			addToValidate(constraint)
+		}
+	}
+
+	// Check that each constraint matches some store somewhere in the cluster.
+	for _, constraint := range toValidate {
+		var found bool
+	node:
+		for _, node := range nodes.Nodes {
+			for _, store := range node.StoreStatuses {
+				// We could alternatively use config.storeHasConstraint here to catch
+				// typos in prohibited constraints as well, but as noted in the
+				// function-level comment that could break very reasonable use cases
+				// for prohibited constraints.
+				if config.StoreMatchesConstraint(store.Desc, constraint) {
+					found = true
+					break node
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf(
+				"constraint %q matches no existing nodes within the cluster - did you enter it correctly?",
+				constraint)
+		}
+	}
+
+	return nil
+}
 
 func writeZoneConfig(
 	ctx context.Context,
@@ -201,10 +321,8 @@ func writeZoneConfig(
 		}
 	}
 
-	internalExecutor := InternalExecutor{ExecCfg: execCfg}
-
 	if zone.IsSubzonePlaceholder() && len(zone.Subzones) == 0 {
-		return internalExecutor.ExecuteStatementInTransaction(ctx, "set zone", txn,
+		return execCfg.InternalExecutor.Exec(ctx, "delete-zone", txn,
 			"DELETE FROM system.zones WHERE id = $1", targetID)
 	}
 
@@ -212,7 +330,7 @@ func writeZoneConfig(
 	if err != nil {
 		return 0, fmt.Errorf("could not marshal zone config: %s", err)
 	}
-	return internalExecutor.ExecuteStatementInTransaction(ctx, "set zone", txn,
+	return execCfg.InternalExecutor.Exec(ctx, "update-zone", txn,
 		"UPSERT INTO system.zones (id, config) VALUES ($1, $2)", targetID, buf)
 }
 
@@ -234,4 +352,35 @@ func getZoneConfigRaw(
 		return config.ZoneConfig{}, err
 	}
 	return zone, nil
+}
+
+func removeIndexZoneConfigs(
+	ctx context.Context,
+	txn *client.Txn,
+	execCfg *ExecutorConfig,
+	tableID sqlbase.ID,
+	indexDescs []sqlbase.IndexDescriptor,
+) error {
+	tableDesc, err := sqlbase.GetTableDescFromID(ctx, txn, tableID)
+	if err != nil {
+		return err
+	}
+
+	zone, err := getZoneConfigRaw(ctx, txn, tableID)
+	if err != nil {
+		return err
+	}
+
+	for _, indexDesc := range indexDescs {
+		zone.DeleteIndexSubzones(uint32(indexDesc.ID))
+	}
+
+	hasNewSubzones := false
+	_, err = writeZoneConfig(ctx, txn, tableID, tableDesc, zone, execCfg, hasNewSubzones)
+	if sqlbase.IsCCLRequiredError(err) {
+		return sqlbase.NewCCLRequiredError(fmt.Errorf("schema change requires a CCL binary "+
+			"because table %q has at least one remaining index or partition with a zone config",
+			tableDesc.Name))
+	}
+	return err
 }

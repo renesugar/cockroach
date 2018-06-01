@@ -55,7 +55,7 @@ func generateValuesSpec(
 	return spec, nil
 }
 
-func TestValues(t *testing.T) {
+func TestValuesProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	rng, _ := randutil.NewPseudoRand()
 	for _, numRows := range []int{0, 1, 10, 13, 15} {
@@ -72,15 +72,14 @@ func TestValues(t *testing.T) {
 					out := &RowBuffer{}
 					st := cluster.MakeTestingClusterSettings()
 					flowCtx := FlowCtx{
-						Ctx:      context.Background(),
 						Settings: st,
 					}
 
-					v, err := newValuesProcessor(&flowCtx, &spec, &PostProcessSpec{}, out)
+					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &PostProcessSpec{}, out)
 					if err != nil {
 						t.Fatal(err)
 					}
-					v.Run(nil)
+					v.Run(context.Background(), nil)
 					if !out.ProducerClosed {
 						t.Fatalf("output RowReceiver not closed")
 					}
@@ -120,6 +119,43 @@ func TestValues(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func BenchmarkValuesProcessor(b *testing.B) {
+	const numCols = 2
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+
+	flowCtx := FlowCtx{
+		Settings: st,
+		EvalCtx:  evalCtx,
+	}
+	post := PostProcessSpec{}
+	output := RowDisposer{}
+	for _, numRows := range []int{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+		for _, rowsPerChunk := range []int{1, 4, 16} {
+			b.Run(fmt.Sprintf("rows=%d,chunkSize=%d", numRows, rowsPerChunk), func(b *testing.B) {
+				rows := makeIntRows(numRows, numCols)
+				spec, err := generateValuesSpec(twoIntCols, rows, rowsPerChunk)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				b.SetBytes(int64(8 * numRows * numCols))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &post, &output)
+					if err != nil {
+						b.Fatal(err)
+					}
+					v.Run(context.Background(), nil /* wg */)
+				}
+			})
 		}
 	}
 }

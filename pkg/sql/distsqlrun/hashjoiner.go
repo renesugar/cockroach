@@ -97,6 +97,11 @@ type hashJoiner struct {
 	// Used by tests to force a storedSide.
 	forcedStoredSide *joinSide
 
+	// bucketIterator is an iterator that is used during the probePhase to read
+	// the rows that we've added to our hash table, and, depending on the join
+	// type, to mark those rows as seen.
+	bucketIterator rowMarkerIterator
+
 	// testingKnobMemFailPoint specifies a phase in which the hashJoiner will
 	// fail at a random point during this phase.
 	testingKnobMemFailPoint hashJoinPhase
@@ -112,8 +117,11 @@ type hashJoiner struct {
 
 var _ Processor = &hashJoiner{}
 
+const hashJoinerProcName = "hash joiner"
+
 func newHashJoiner(
 	flowCtx *FlowCtx,
+	processorID int32,
 	spec *HashJoinerSpec,
 	leftSource RowSource,
 	rightSource RowSource,
@@ -132,6 +140,7 @@ func newHashJoiner(
 	}
 	if err := h.joinerBase.init(
 		flowCtx,
+		processorID,
 		leftSource.OutputTypes(),
 		rightSource.OutputTypes(),
 		spec.Type,
@@ -141,21 +150,28 @@ func newHashJoiner(
 		uint32(numMergedColumns),
 		post,
 		output,
+		procStateOpts{}, // hashJoiner doesn't implement RowSource and so doesn't use it.
 	); err != nil {
 		return nil, err
 	}
 	return h, nil
 }
 
-// Run is part of the processor interface.
-func (h *hashJoiner) Run(wg *sync.WaitGroup) {
+// Run is part of the Processor interface.
+func (h *hashJoiner) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
 
-	ctx := log.WithLogTag(h.flowCtx.Ctx, "HashJoiner", nil)
-	ctx, span := processorSpan(ctx, "hash joiner")
-	defer tracing.FinishSpan(span)
+	pushTrailingMeta := func(ctx context.Context) {
+		sendTraceData(ctx, h.out.output)
+	}
+
+	h.leftSource.Start(ctx)
+	h.rightSource.Start(ctx)
+	h.startInternal(ctx, hashJoinerProcName)
+	defer tracing.FinishSpan(h.span)
+	ctx = h.ctx // h.ctx was set by the startInternal() call above.
 
 	h.cancelChecker = sqlbase.NewCancelChecker(ctx)
 
@@ -168,7 +184,7 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 	useTempStorage := settingUseTempStorageJoins.Get(&st.SV) ||
 		h.flowCtx.testingKnobs.MemoryLimitBytes > 0 ||
 		h.testingKnobMemFailPoint != unset
-	rowContainerMon := h.flowCtx.EvalCtx.Mon
+	rowContainerMon := h.evalCtx.Mon
 	if useTempStorage {
 		// Limit the memory use by creating a child monitor with a hard limit.
 		// The hashJoiner will overflow to disk if this limit is not enough.
@@ -188,11 +204,10 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 		rowContainerMon = &limitedMon
 	}
 
-	evalCtx := h.flowCtx.NewEvalCtx()
 	h.rows[leftSide].initWithMon(
-		nil /* ordering */, h.leftSource.OutputTypes(), evalCtx, rowContainerMon)
+		nil /* ordering */, h.leftSource.OutputTypes(), h.evalCtx, rowContainerMon)
 	h.rows[rightSide].initWithMon(
-		nil /* ordering */, h.rightSource.OutputTypes(), evalCtx, rowContainerMon)
+		nil /* ordering */, h.rightSource.OutputTypes(), h.evalCtx, rowContainerMon)
 	defer h.rows[leftSide].Close(ctx)
 	defer h.rows[rightSide].Close(ctx)
 
@@ -212,7 +227,7 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 			// the consumer.
 			log.Infof(ctx, "buffer phase error %s", err)
 		}
-		DrainAndClose(ctx, h.out.output, err /* cause */, h.leftSource, h.rightSource)
+		DrainAndClose(ctx, h.out.output, err /* cause */, pushTrailingMeta, h.leftSource, h.rightSource)
 		return
 	}
 
@@ -229,7 +244,7 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 			// the consumer.
 			log.Infof(ctx, "build phase error %s", err)
 		}
-		DrainAndClose(ctx, h.out.output, err /* cause */, h.leftSource, h.rightSource)
+		DrainAndClose(ctx, h.out.output, err /* cause */, pushTrailingMeta, h.leftSource, h.rightSource)
 		return
 	}
 	defer storedRows.Close(ctx)
@@ -241,7 +256,7 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 	if row != nil {
 		if err := storedRows.AddRow(ctx, row); err != nil {
 			log.Infof(ctx, "unable to add row to disk %s", err)
-			DrainAndClose(ctx, h.out.output, err /* cause */, h.leftSource, h.rightSource)
+			DrainAndClose(ctx, h.out.output, err /* cause */, pushTrailingMeta, h.leftSource, h.rightSource)
 			return
 		}
 	}
@@ -262,7 +277,7 @@ func (h *hashJoiner) Run(wg *sync.WaitGroup) {
 			// point.
 			log.Infof(ctx, "probe phase error %s", err)
 		}
-		DrainAndClose(ctx, h.out.output, err /* cause */, srcToClose)
+		DrainAndClose(ctx, h.out.output, err /* cause */, pushTrailingMeta, srcToClose)
 	}
 }
 
@@ -473,11 +488,18 @@ func (h *hashJoiner) probeRow(
 	// probeMatched specifies whether the row we are probing with has at least
 	// one match.
 	probeMatched := false
-	i, err := storedRows.NewBucketIterator(ctx, row, h.eqCols[otherSide(h.storedSide)])
-	if err != nil {
-		return false, err
+	if h.bucketIterator == nil {
+		i, err := storedRows.NewBucketIterator(ctx, row, h.eqCols[otherSide(h.storedSide)])
+		if err != nil {
+			return false, err
+		}
+		h.bucketIterator = i
+	} else {
+		if err := h.bucketIterator.Reset(ctx, row); err != nil {
+			return false, err
+		}
 	}
-	defer i.Close()
+	i := h.bucketIterator
 	for i.Rewind(); ; i.Next() {
 		if ok, err := i.Valid(); err != nil {
 			return false, err
@@ -537,7 +559,7 @@ func (h *hashJoiner) probeRow(
 			if shouldEmit {
 				consumerStatus, err := h.out.EmitRow(ctx, renderedRow)
 				if err != nil || consumerStatus != NeedMoreRows {
-					return true, nil
+					return true, err
 				} else if h.joinType == sqlbase.IntersectAllJoin {
 					// We found a match, so we are done with this row.
 					return false, nil
@@ -569,6 +591,14 @@ func (h *hashJoiner) probeRow(
 func (h *hashJoiner) probePhase(
 	ctx context.Context, storedRows hashRowContainer,
 ) (earlyExit bool, _ error) {
+	defer func() {
+		// probeRow will create a bucket iterator if there is work to do. Make
+		// sure the iterator gets cleaned up at the end of the probe phase.
+		if h.bucketIterator != nil {
+			h.bucketIterator.Close()
+		}
+	}()
+
 	side := otherSide(h.storedSide)
 
 	src := h.leftSource

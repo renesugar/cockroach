@@ -1,6 +1,7 @@
 import _ from "lodash";
 import React from "react";
 import PropTypes from "prop-types";
+import { Helmet } from "react-helmet";
 import { InjectedRouter, RouterState } from "react-router";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
@@ -108,16 +109,6 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
     },
   );
 
-  static title({ params }: { params: { [name: string]: any } }) {
-    const dashboard = params[dashboardNameAttr];
-
-    if (dashboard in dashboards) {
-      return dashboards[dashboard].label + " Dashboard";
-    }
-
-    return "Cluster Metrics";
-  }
-
   refresh(props = this.props) {
     if (!props.nodesQueryValid) {
       props.refreshNodes();
@@ -152,12 +143,13 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
   }
 
   render() {
-    const { params, nodesSummary, hoverState, hoverOn, hoverOff } = this.props;
+    const { params, nodesSummary } = this.props;
     const selectedDashboard = params[dashboardNameAttr];
     const dashboard = _.has(dashboards, selectedDashboard)
       ? selectedDashboard
       : defaultDashboard;
 
+    const title = dashboards[dashboard].label + " Dashboard";
     const selectedNode = params[nodeIDAttr] || "";
     const nodeSources = (selectedNode !== "") ? [selectedNode] : null;
 
@@ -187,6 +179,12 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       tooltipSelection,
     };
 
+    const forwardParams = {
+      hoverOn: this.props.hoverOn,
+      hoverOff: this.props.hoverOff,
+      hoverState: this.props.hoverState,
+    };
+
     // Generate graphs for the current dashboard, wrapping each one in a
     // MetricsDataProvider with a unique key.
     const graphs = dashboards[dashboard].component(dashboardProps);
@@ -195,46 +193,52 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       return (
         <div key={key}>
           <MetricsDataProvider id={key}>
-            { React.cloneElement(graph, { hoverOn, hoverOff, hoverState }) }
+            { React.cloneElement(graph, forwardParams) }
           </MetricsDataProvider>
         </div>
       );
     });
 
-    return <div>
-      <PageConfig>
-        <PageConfigItem>
-          <Dropdown
-            title="Graph"
-            options={this.nodeDropdownOptions(this.props.nodesSummary)}
-            selected={selectedNode}
-            onChange={this.nodeChange}
-          />
-        </PageConfigItem>
-        <PageConfigItem>
-          <Dropdown
-            title="Dashboard"
-            options={dashboardDropdownOptions}
-            selected={dashboard}
-            onChange={this.dashChange}
-          />
-        </PageConfigItem>
-        <PageConfigItem>
-          <TimeScaleDropdown />
-        </PageConfigItem>
-      </PageConfig>
-      <section className="section">
-        <div className="l-columns">
-          <div className="chart-group l-columns__left">
-            { graphComponents }
+    return (
+      <div>
+        <Helmet>
+          <title>{ title }</title>
+        </Helmet>
+        <section className="section"><h1>{ title }</h1></section>
+        <PageConfig>
+          <PageConfigItem>
+            <Dropdown
+              title="Graph"
+              options={this.nodeDropdownOptions(this.props.nodesSummary)}
+              selected={selectedNode}
+              onChange={this.nodeChange}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <Dropdown
+              title="Dashboard"
+              options={dashboardDropdownOptions}
+              selected={dashboard}
+              onChange={this.dashChange}
+            />
+          </PageConfigItem>
+          <PageConfigItem>
+            <TimeScaleDropdown />
+          </PageConfigItem>
+        </PageConfig>
+        <section className="section">
+          <div className="l-columns">
+            <div className="chart-group l-columns__left">
+              { graphComponents }
+            </div>
+            <div className="l-columns__right">
+              <Alerts />
+              <ClusterSummaryBar nodesSummary={this.props.nodesSummary} nodeSources={nodeSources} />
+            </div>
           </div>
-          <div className="l-columns__right">
-            <Alerts />
-            <ClusterSummaryBar nodesSummary={this.props.nodesSummary} nodeSources={nodeSources} />
-          </div>
-        </div>
-      </section>
-    </div>;
+        </section>
+      </div>
+    );
   }
 }
 

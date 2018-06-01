@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -100,6 +101,11 @@ func TestMakeTableDescColumns(t *testing.T) {
 		{
 			"TIME",
 			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIME},
+			true,
+		},
+		{
+			"TIMETZ",
+			sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMETZ},
 			true,
 		},
 		{
@@ -273,7 +279,7 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	}
 	desc.PrimaryIndex = sqlbase.IndexDescriptor{}
 
-	err = desc.ValidateTable()
+	err = desc.ValidateTable(cluster.MakeTestingClusterSettings())
 	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}

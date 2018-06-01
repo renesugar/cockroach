@@ -67,19 +67,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-// rg1 returns a wrapping sender that changes all requests to range 0 to
-// requests to range 1.
-// This function is DEPRECATED. Send your requests to the right range by
-// properly initializing the request header.
-func rg1(s *storage.Store) client.Sender {
-	return client.Wrap(s, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
-		if ba.RangeID == 0 {
-			ba.RangeID = 1
-		}
-		return ba
-	})
-}
-
 // createTestStore creates a test store using an in-memory
 // engine.
 func createTestStore(t testing.TB, stopper *stop.Stopper) (*storage.Store, *hlc.ManualClock) {
@@ -196,6 +183,7 @@ type multiTestContext struct {
 	manualClock *hlc.ManualClock
 	clock       *hlc.Clock
 	rpcContext  *rpc.Context
+	injEngines  bool
 
 	nodeIDtoAddrMu struct {
 		*syncutil.RWMutex
@@ -214,6 +202,8 @@ type multiTestContext struct {
 	dbs         []*client.DB
 	gossips     []*gossip.Gossip
 	storePools  []*storage.StorePool
+	dirCleanups []func()
+	caches      []engine.RocksDBCache
 	// We use multiple stoppers so we can restart different parts of the
 	// test individually. transportStopper is for 'transport', and the
 	// 'stoppers' slice corresponds to the 'stores'.
@@ -250,12 +240,16 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 		mCopy.storeConfig = nil
 		mCopy.clocks = nil
 		mCopy.clock = nil
+		mCopy.engines = nil
+		mCopy.engineStoppers = nil
+		mCopy.injEngines = false
 		mCopy.timeUntilStoreDead = 0
 		var empty multiTestContext
 		if !reflect.DeepEqual(empty, mCopy) {
 			t.Fatalf("illegal fields set in multiTestContext:\n%s", pretty.Diff(empty, mCopy))
 		}
 	}
+
 	m.t = t
 
 	m.nodeIDtoAddrMu.RWMutex = &syncutil.RWMutex{}
@@ -346,6 +340,14 @@ func (m *multiTestContext) Stop() {
 			}
 		}
 		m.transportStopper.Stop(context.TODO())
+
+		for _, cleanup := range m.dirCleanups {
+			cleanup()
+		}
+
+		for _, cache := range m.caches {
+			cache.Release()
+		}
 
 		for _, s := range m.engineStoppers {
 			s.Stop(context.TODO())
@@ -650,7 +652,7 @@ func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 	ambient := log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}
 	m.distSenders[idx] = kv.NewDistSender(kv.DistSenderConfig{
 		AmbientCtx: ambient,
-		Clock:      m.clock,
+		Clock:      m.clocks[idx],
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
 			ds:               &m.distSenders[idx],
@@ -664,12 +666,12 @@ func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 		ambient,
 		m.storeConfig.Settings,
 		m.distSenders[idx],
-		m.clock,
+		m.clocks[idx],
 		false,
 		stopper,
 		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	m.dbs[idx] = client.NewDB(tcsFactory, m.clock)
+	m.dbs[idx] = client.NewDB(tcsFactory, m.clocks[idx])
 }
 
 func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.NodeLiveness) {
@@ -678,7 +680,7 @@ func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.Node
 		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer},
 		m.storeConfig.Settings,
 		m.gossips[idx],
-		m.clock,
+		m.clocks[idx],
 		storage.MakeStorePoolNodeLivenessFunc(nodeLiveness),
 		/* deterministic */ false,
 	)
@@ -697,10 +699,24 @@ func (m *multiTestContext) addStore(idx int) {
 	var needBootstrap bool
 	if len(m.engines) > idx {
 		eng = m.engines[idx]
+		needBootstrap = m.injEngines
 	} else {
 		engineStopper := stop.NewStopper()
 		m.engineStoppers = append(m.engineStoppers, engineStopper)
-		eng = engine.NewInMem(roachpb.Attributes{}, 1<<20)
+
+		dir, cleanup := testutils.TempDir(m.t)
+		cache := engine.NewRocksDBCache(1 << 20)
+		var err error
+		eng, err = engine.NewRocksDB(engine.RocksDBConfig{
+			Dir:       dir,
+			MustExist: false,
+		}, cache)
+		if err != nil {
+			m.t.Fatal(err)
+		}
+
+		m.dirCleanups = append(m.dirCleanups, cleanup)
+		m.caches = append(m.caches, cache)
 		engineStopper.AddCloser(eng)
 		m.engines = append(m.engines, eng)
 		needBootstrap = true
@@ -744,8 +760,8 @@ func (m *multiTestContext) addStore(idx int) {
 	m.populateDB(idx, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[idx] = storage.NewNodeLiveness(
-		ambient, m.clocks[idx], m.dbs[idx], m.gossips[idx],
-		nlActive, nlRenewal, metric.TestSampleInterval,
+		ambient, m.clocks[idx], m.dbs[idx], m.engines, m.gossips[idx],
+		nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(idx, m.nodeLivenesses[idx])
 	cfg.DB = m.dbs[idx]
@@ -831,7 +847,7 @@ func (m *multiTestContext) addStore(idx int) {
 		ch: make(chan struct{}),
 	}
 	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, func(ctx context.Context) {
-		now := m.clock.Now()
+		now := clock.Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
 			log.Warning(ctx, err)
 		}
@@ -904,8 +920,8 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.populateDB(i, stopper)
 	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[i] = storage.NewNodeLiveness(
-		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.gossips[i],
-		nlActive, nlRenewal, metric.TestSampleInterval,
+		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.engines,
+		m.gossips[i], nlActive, nlRenewal, cfg.Settings, metric.TestSampleInterval,
 	)
 	m.populateStorePool(i, m.nodeLivenesses[i])
 	cfg.DB = m.dbs[i]
@@ -924,7 +940,7 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	m.transport.GetCircuitBreaker(m.idents[i].NodeID).Reset()
 	m.mu.Unlock()
 	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
-		now := m.clock.Now()
+		now := m.clocks[i].Now()
 		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
 			log.Warning(ctx, err)
 		}
@@ -1122,7 +1138,7 @@ func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, des
 func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 	results := make([]int64, len(m.engines))
 	for i, eng := range m.engines {
-		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clock.Now(), true, nil)
+		val, _, err := engine.MVCCGet(context.Background(), eng, key, m.clocks[i].Now(), true, nil)
 		if err != nil {
 			log.VEventf(context.TODO(), 1, "engine %d: error reading from key %s: %s", i, key, err)
 		} else if val == nil {
@@ -1263,7 +1279,7 @@ func (m *multiTestContext) getRaftLeader(rangeID roachpb.RangeID) *storage.Repli
 // the default replica for the specified key.
 func getArgs(key roachpb.Key) *roachpb.GetRequest {
 	return &roachpb.GetRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 	}
@@ -1273,7 +1289,7 @@ func getArgs(key roachpb.Key) *roachpb.GetRequest {
 // the default replica for the specified key / value.
 func putArgs(key roachpb.Key, value []byte) *roachpb.PutRequest {
 	return &roachpb.PutRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 		Value: roachpb.MakeValueFromBytes(value),
@@ -1284,7 +1300,7 @@ func putArgs(key roachpb.Key, value []byte) *roachpb.PutRequest {
 // for the specified key.
 func incrementArgs(key roachpb.Key, inc int64) *roachpb.IncrementRequest {
 	return &roachpb.IncrementRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 		Increment: inc,

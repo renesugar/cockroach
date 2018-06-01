@@ -37,8 +37,8 @@ const TableTruncateChunkSize = indexTruncateChunkSize
 //          mysql requires DROP (for mysql >= 5.1.16, DELETE before that).
 func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, error) {
 	// Since truncation may cascade to a given table any number of times, start by
-	// building the unique set (by ID) of tables to truncate.
-	toTruncate := make(map[sqlbase.ID]struct{}, len(n.Tables))
+	// building the unique set (ID->name) of tables to truncate.
+	toTruncate := make(map[sqlbase.ID]string, len(n.Tables))
 	// toTraverse is the list of tables whose references need to be traversed
 	// while constructing the list of tables that should be truncated.
 	toTraverse := make([]sqlbase.TableDescriptor, 0, len(n.Tables))
@@ -50,7 +50,7 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 		var tableDesc *TableDescriptor
 		// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 		// TODO(vivek): check if the cache can be used.
-		p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+		p.runWithOptions(resolveFlags{skipCache: true}, func() {
 			tableDesc, err = ResolveExistingObject(ctx, p, tn, true /*required*/, requireTableDesc)
 		})
 		if err != nil {
@@ -61,7 +61,7 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 			return nil, err
 		}
 
-		toTruncate[tableDesc.ID] = struct{}{}
+		toTruncate[tableDesc.ID] = tn.FQString()
 		toTraverse = append(toTraverse, *tableDesc)
 	}
 
@@ -72,25 +72,43 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 		idx := len(toTraverse) - 1
 		tableDesc := toTraverse[idx]
 		toTraverse = toTraverse[:idx]
+
+		maybeEnqueue := func(ref sqlbase.ForeignKeyReference, msg string) error {
+			// Check if we're already truncating the referencing table.
+			if _, ok := toTruncate[ref.Table]; ok {
+				return nil
+			}
+			other, err := sqlbase.GetTableDescFromID(ctx, p.txn, ref.Table)
+			if err != nil {
+				return err
+			}
+
+			if n.DropBehavior != tree.DropCascade {
+				return errors.Errorf("%q is %s table %q", tableDesc.Name, msg, other.Name)
+			}
+			if err := p.CheckPrivilege(ctx, other, privilege.DROP); err != nil {
+				return err
+			}
+			otherName, err := p.getQualifiedTableName(ctx, other)
+			if err != nil {
+				return err
+			}
+			toTruncate[other.ID] = otherName
+			toTraverse = append(toTraverse, *other)
+			return nil
+		}
+
 		for _, idx := range tableDesc.AllNonDropIndexes() {
 			for _, ref := range idx.ReferencedBy {
-				// Check if we're already truncating the referencing table.
-				if _, ok := toTruncate[ref.Table]; ok {
-					continue
-				}
-				other, err := sqlbase.GetTableDescFromID(ctx, p.txn, ref.Table)
-				if err != nil {
+				if err := maybeEnqueue(ref, "referenced by foreign key from"); err != nil {
 					return nil, err
 				}
+			}
 
-				if n.DropBehavior != tree.DropCascade {
-					return nil, errors.Errorf("%q is referenced by foreign key from table %q", tableDesc.Name, other.Name)
-				}
-				if err := p.CheckPrivilege(ctx, other, privilege.DROP); err != nil {
+			for _, ref := range idx.InterleavedBy {
+				if err := maybeEnqueue(ref, "interleaved by"); err != nil {
 					return nil, err
 				}
-				toTruncate[other.ID] = struct{}{}
-				toTraverse = append(toTraverse, *other)
 			}
 		}
 	}
@@ -101,9 +119,31 @@ func (p *planner) Truncate(ctx context.Context, n *tree.Truncate) (planNode, err
 	}
 
 	// TODO(knz): move truncate logic to Start/Next so it can be used with SHOW TRACE FOR.
+	// andrei: Also, the current code runs the risk of executing the truncation at
+	// prepare time. That doesn't happen currently because we don't prepare
+	// TRUNCATE statements.
+	if p.extendedEvalCtx.PrepareOnly {
+		return nil, errors.Errorf("programming error: cannot prepare a TRUNCATE statement")
+	}
 	traceKV := p.extendedEvalCtx.Tracing.KVTracingEnabled()
-	for id := range toTruncate {
-		if err := p.truncateTable(p.EvalContext().Ctx(), id, traceKV); err != nil {
+	for id, name := range toTruncate {
+		if err := p.truncateTable(ctx, id, traceKV); err != nil {
+			return nil, err
+		}
+
+		// Log a Truncate Table event for this table.
+		if err := MakeEventLogger(p.extendedEvalCtx.ExecCfg).InsertEventRecord(
+			ctx,
+			p.txn,
+			EventLogTruncateTable,
+			int32(id),
+			int32(p.extendedEvalCtx.NodeID),
+			struct {
+				TableName string
+				Statement string
+				User      string
+			}{name, n.String(), p.SessionData().User},
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -227,7 +267,8 @@ func (p *planner) truncateTable(ctx context.Context, id sqlbase.ID, traceKV bool
 		return err
 	}
 	const insertZoneCfg = `INSERT INTO system.zones (id, config) VALUES ($1, $2)`
-	_, err = p.exec(ctx, insertZoneCfg, newID, zoneCfg)
+	_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		ctx, "insert-zone", p.txn, insertZoneCfg, newID, zoneCfg)
 	return err
 }
 
@@ -235,36 +276,10 @@ func (p *planner) truncateTable(ctx context.Context, id sqlbase.ID, traceKV bool
 func (p *planner) findAllReferences(
 	ctx context.Context, table sqlbase.TableDescriptor,
 ) ([]*sqlbase.TableDescriptor, error) {
-	refs := map[sqlbase.ID]struct{}{}
-	if err := table.ForeachNonDropIndex(func(index *sqlbase.IndexDescriptor) error {
-		for _, a := range index.Interleave.Ancestors {
-			refs[a.TableID] = struct{}{}
-		}
-		for _, c := range index.InterleavedBy {
-			refs[c.Table] = struct{}{}
-		}
-
-		if index.ForeignKey.IsSet() {
-			to := index.ForeignKey.Table
-			refs[to] = struct{}{}
-		}
-
-		for _, c := range index.ReferencedBy {
-			refs[c.Table] = struct{}{}
-		}
-		return nil
-	}); err != nil {
+	refs, err := table.FindAllReferences()
+	if err != nil {
 		return nil, err
 	}
-
-	for _, dest := range table.DependsOn {
-		refs[dest] = struct{}{}
-	}
-
-	for _, c := range table.DependedOnBy {
-		refs[c.ID] = struct{}{}
-	}
-
 	tables := make([]*sqlbase.TableDescriptor, 0, len(refs))
 	for id := range refs {
 		if id == table.ID {

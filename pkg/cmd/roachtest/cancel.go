@@ -37,7 +37,7 @@ import (
 //
 // Once DistSQL queries provide more testing knobs, these tests can likely be
 // replaced with unit tests.
-func init() {
+func registerCancel(r *registry) {
 	runCancel := func(ctx context.Context, t *test, c *cluster,
 		queries []string, warehouses int, useDistsql bool) {
 		c.Put(ctx, cockroach, "./cockroach", c.All())
@@ -47,7 +47,7 @@ func init() {
 		m := newMonitor(ctx, c, c.All())
 		m.Go(func(ctx context.Context) error {
 			t.Status("importing TPCC fixture")
-			c.Run(ctx, 1, fmt.Sprintf(
+			c.Run(ctx, c.Node(1), fmt.Sprintf(
 				"./workload fixtures load tpcc --warehouses=%d {pgurl:1}", warehouses))
 
 			conn := c.Conn(ctx, 1)
@@ -84,7 +84,7 @@ func init() {
 
 				const cancelQuery = `CANCEL QUERY (
 	SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE query not like '%SHOW CLUSTER QUERIES%')`
-				c.Run(ctx, 1, `./cockroach sql --insecure -e "`+cancelQuery+`"`)
+				c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "`+cancelQuery+`"`)
 				cancelStartTime := timeutil.Now()
 
 				select {
@@ -116,17 +116,19 @@ func init() {
 		`SELECT ol_number, sum(s_quantity) FROM tpcc.stock JOIN tpcc.order_line ON s_i_id=ol_i_id WHERE ol_number > 10 GROUP BY ol_number ORDER BY ol_number`,
 	}
 
-	tests.Add(testSpec{
-		Name:  fmt.Sprintf("cancel/tpcc/distsql/w=%d,nodes=%d", warehouses, numNodes),
-		Nodes: nodes(numNodes),
+	r.Add(testSpec{
+		Name:   fmt.Sprintf("cancel/tpcc/distsql/w=%d,nodes=%d", warehouses, numNodes),
+		Nodes:  nodes(numNodes),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runCancel(ctx, t, c, queries, warehouses, true /* useDistsql */)
 		},
 	})
 
-	tests.Add(testSpec{
-		Name:  fmt.Sprintf("cancel/tpcc/local/w=%d,nodes=%d", warehouses, numNodes),
-		Nodes: nodes(numNodes),
+	r.Add(testSpec{
+		Name:   fmt.Sprintf("cancel/tpcc/local/w=%d,nodes=%d", warehouses, numNodes),
+		Nodes:  nodes(numNodes),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runCancel(ctx, t, c, queries, warehouses, false /* useDistsql */)
 		},

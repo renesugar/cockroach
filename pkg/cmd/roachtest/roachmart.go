@@ -20,7 +20,7 @@ import (
 	"fmt"
 )
 
-func init() {
+func registerRoachmart(r *registry) {
 	runRoachmart := func(ctx context.Context, t *test, c *cluster, partition bool) {
 		c.Put(ctx, cockroach, "./cockroach")
 		c.Put(ctx, workload, "./workload")
@@ -31,7 +31,7 @@ func init() {
 			i    int
 			zone string
 		}{
-			{1, "us-east1-b"},
+			{1, "us-central1-b"},
 			{4, "us-west1-b"},
 			{7, "europe-west2-b"},
 		}
@@ -49,7 +49,7 @@ func init() {
 				t.Fatal(err)
 			}
 			defer l.close()
-			if err := c.RunL(ctx, l, nodes[i].i, args...); err != nil {
+			if err := c.RunL(ctx, l, c.Node(nodes[i].i), args...); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -73,9 +73,10 @@ func init() {
 
 	for _, v := range []bool{true, false} {
 		v := v
-		tests.Add(testSpec{
-			Name:  fmt.Sprintf("roachmart/partition=%v", v),
-			Nodes: nodes(9, geo()),
+		r.Add(testSpec{
+			Name:   fmt.Sprintf("roachmart/partition=%v", v),
+			Nodes:  nodes(9, geo(), zones("us-central1-b,us-west1-b,europe-west2-b")),
+			Stable: true, // DO NOT COPY to new tests
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runRoachmart(ctx, t, c, v)
 			},

@@ -80,7 +80,11 @@ func newEncodedFromRoot(v []byte) (*jsonEncoded, error) {
 	return &jsonEncoded{
 		typ:          typ,
 		containerLen: containerLen,
-		value:        v,
+		// Manually set the capacity of the new slice to its length, so we properly
+		// report the memory size of this encoded json object. The original slice
+		// capacity is very large, since it probably points to the backing byte
+		// slice of a kv batch.
+		value: v[:len(v):len(v)],
 	}, nil
 }
 
@@ -644,13 +648,13 @@ func (j *jsonEncoded) Concat(other JSON) (JSON, error) {
 	return decoded.Concat(other)
 }
 
-// RemoveKey implements the JSON interface.
-func (j *jsonEncoded) RemoveKey(key string) (JSON, bool, error) {
+// RemoveString implements the JSON interface.
+func (j *jsonEncoded) RemoveString(s string) (JSON, bool, error) {
 	decoded, err := j.shallowDecode()
 	if err != nil {
 		return nil, false, err
 	}
-	return decoded.RemoveKey(key)
+	return decoded.RemoveString(s)
 }
 
 func (j *jsonEncoded) RemovePath(path []string) (JSON, bool, error) {
@@ -700,6 +704,23 @@ func (j *jsonEncoded) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 		return nil, err
 	}
 	return decoded.encodeInvertedIndexKeys(b)
+}
+
+func (j *jsonEncoded) allPaths() ([]JSON, error) {
+	decoded, err := j.decode()
+	if err != nil {
+		return nil, err
+	}
+	return decoded.allPaths()
+}
+
+// HasContainerLeaf implements the JSON interface.
+func (j *jsonEncoded) HasContainerLeaf() (bool, error) {
+	decoded, err := j.decode()
+	if err != nil {
+		return false, err
+	}
+	return decoded.HasContainerLeaf()
 }
 
 // preprocessForContains implements the JSON interface.

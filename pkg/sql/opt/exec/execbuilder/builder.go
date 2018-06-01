@@ -16,32 +16,41 @@ package execbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
 )
 
 // Builder constructs a tree of execution nodes (exec.Node) from an optimized
-// expression tree (xform.ExprView).
+// expression tree (memo.ExprView).
 type Builder struct {
 	factory exec.Factory
-	ev      xform.ExprView
+	ev      memo.ExprView
+
+	// subqueries accumulates information about subqueries that are part of scalar
+	// expressions we built. Each entry is associated with a tree.Subquery
+	// expression node.
+	subqueries []exec.Subquery
 }
 
 // New constructs an instance of the execution node builder using the
 // given factory to construct nodes. The Build method will build the execution
 // node tree from the given optimized expression tree.
-func New(factory exec.Factory, ev xform.ExprView) *Builder {
+func New(factory exec.Factory, ev memo.ExprView) *Builder {
 	return &Builder{factory: factory, ev: ev}
 }
 
 // Build constructs the execution node tree and returns its root node if no
 // error occurred.
-func (b *Builder) Build() (exec.Node, error) {
-	return b.build(b.ev)
+func (b *Builder) Build() (exec.Plan, error) {
+	root, err := b.build(b.ev)
+	if err != nil {
+		return nil, err
+	}
+	return b.factory.ConstructPlan(root, b.subqueries)
 }
 
-func (b *Builder) build(ev xform.ExprView) (exec.Node, error) {
+func (b *Builder) build(ev memo.ExprView) (exec.Node, error) {
 	if !ev.IsRelational() && !ev.IsEnforcer() {
 		return nil, errors.Errorf("building execution for non-relational operator %s", ev.Operator())
 	}
@@ -49,14 +58,12 @@ func (b *Builder) build(ev xform.ExprView) (exec.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	// TODO(radu): plan.outputCols will be used to apply a final projection.
-	// TODO(radu): check physical props for final presentation.
 	return plan.root, err
 }
 
 // BuildScalar converts a scalar expression to a TypedExpr. Variables are mapped
 // according to the IndexedVarHelper.
-func (b *Builder) BuildScalar(ivh *tree.IndexedVarHelper) tree.TypedExpr {
+func (b *Builder) BuildScalar(ivh *tree.IndexedVarHelper) (tree.TypedExpr, error) {
 	ctx := buildScalarCtx{ivh: *ivh}
 	for i := 0; i < ivh.NumVars(); i++ {
 		ctx.ivarMap.Set(i+1, i)

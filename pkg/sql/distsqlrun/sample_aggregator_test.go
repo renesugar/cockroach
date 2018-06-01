@@ -43,9 +43,9 @@ func TestSampleAggregator(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	flowCtx := FlowCtx{
-		Ctx:      context.Background(),
 		Settings: st,
 		EvalCtx:  evalCtx,
+		gossip:   server.Gossip(),
 		clientDB: kvDB,
 		executor: server.InternalExecutor().(sqlutil.InternalExecutor),
 	}
@@ -107,11 +107,11 @@ func TestSampleAggregator(t *testing.T) {
 		outputs[i] = NewRowBuffer(samplerOutTypes, nil /* rows */, RowBufferArgs{})
 
 		spec := &SamplerSpec{SampleSize: 100, Sketches: sketchSpecs}
-		p, err := newSamplerProcessor(&flowCtx, spec, in, &PostProcessSpec{}, outputs[i])
+		p, err := newSamplerProcessor(&flowCtx, 0 /* processorID */, spec, in, &PostProcessSpec{}, outputs[i])
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(nil /* wg */)
+		p.Run(context.Background(), nil /* wg */)
 	}
 	// Randomly interleave the output rows from the samplers into a single buffer.
 	samplerResults := NewRowBuffer(samplerOutTypes, nil /* rows */, RowBufferArgs{})
@@ -134,11 +134,13 @@ func TestSampleAggregator(t *testing.T) {
 		TableID:          13,
 	}
 
-	agg, err := newSampleAggregator(&flowCtx, spec, samplerResults, &PostProcessSpec{}, finalOut)
+	agg, err := newSampleAggregator(
+		&flowCtx, 0 /* processorID */, spec, samplerResults, &PostProcessSpec{}, finalOut,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agg.Run(nil /* wg */)
+	agg.Run(context.Background(), nil /* wg */)
 	// Make sure there was no error.
 	finalOut.GetRowsNoMeta(t)
 	r := sqlutils.MakeSQLRunner(sqlDB)

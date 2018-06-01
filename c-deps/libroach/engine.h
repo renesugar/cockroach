@@ -41,7 +41,14 @@ struct DBEngine {
   virtual DBIterator* NewIter(rocksdb::ReadOptions*) = 0;
   virtual DBStatus GetStats(DBStatsResult* stats) = 0;
   virtual DBString GetCompactionStats() = 0;
+  virtual DBString GetEnvStats(DBEnvStatsResult* stats) = 0;
   virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents) = 0;
+  virtual DBStatus EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) = 0;
+  virtual DBStatus EnvReadFile(DBSlice path, DBSlice* contents) = 0;
+  virtual DBStatus EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents) = 0;
+  virtual DBStatus EnvSyncFile(rocksdb::WritableFile* file) = 0;
+  virtual DBStatus EnvCloseFile(rocksdb::WritableFile* file) = 0;
+  virtual DBStatus EnvDeleteFile(DBSlice path) = 0;
 
   DBSSTable* GetSSTables(int* n);
   DBString GetUserProperties();
@@ -49,9 +56,10 @@ struct DBEngine {
 
 namespace cockroach {
 
+struct EnvManager;
+
 struct DBImpl : public DBEngine {
-  std::unique_ptr<rocksdb::Env> switching_env;
-  std::unique_ptr<rocksdb::Env> memenv;
+  std::unique_ptr<EnvManager> env_mgr;
   std::unique_ptr<rocksdb::DB> rep_deleter;
   std::shared_ptr<rocksdb::Cache> block_cache;
   std::shared_ptr<DBEventListener> event_listener;
@@ -60,8 +68,8 @@ struct DBImpl : public DBEngine {
   // Construct a new DBImpl from the specified DB.
   // The DB and passed Envs will be deleted when the DBImpl is deleted.
   // Either env can be NULL.
-  DBImpl(rocksdb::DB* r, rocksdb::Env* m, std::shared_ptr<rocksdb::Cache> bc,
-         std::shared_ptr<DBEventListener> event_listener, rocksdb::Env* s_env);
+  DBImpl(rocksdb::DB* r, std::unique_ptr<EnvManager> e, std::shared_ptr<rocksdb::Cache> bc,
+         std::shared_ptr<DBEventListener> event_listener);
   virtual ~DBImpl();
 
   virtual DBStatus AssertPreClose();
@@ -76,7 +84,14 @@ struct DBImpl : public DBEngine {
   virtual DBIterator* NewIter(rocksdb::ReadOptions*);
   virtual DBStatus GetStats(DBStatsResult* stats);
   virtual DBString GetCompactionStats();
+  virtual DBStatus GetEnvStats(DBEnvStatsResult* stats);
   virtual DBStatus EnvWriteFile(DBSlice path, DBSlice contents);
+  virtual DBStatus EnvOpenFile(DBSlice path, rocksdb::WritableFile** file);
+  virtual DBStatus EnvReadFile(DBSlice path, DBSlice* contents);
+  virtual DBStatus EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents);
+  virtual DBStatus EnvSyncFile(rocksdb::WritableFile* file);
+  virtual DBStatus EnvCloseFile(rocksdb::WritableFile* file);
+  virtual DBStatus EnvDeleteFile(DBSlice path);
 };
 
 }  // namespace cockroach

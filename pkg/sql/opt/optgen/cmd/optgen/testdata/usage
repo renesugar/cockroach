@@ -16,9 +16,9 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
-	ifactory   generate interface for factory construct methods
 	ops        generate operator definitions and functions
 	rulenames  generate enumeration of rule names
 
@@ -48,9 +48,9 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
-	ifactory   generate interface for factory construct methods
 	ops        generate operator definitions and functions
 	rulenames  generate enumeration of rule names
 
@@ -81,9 +81,9 @@ Usage:
 The commands are:
 
 	compile    generate the optgen compiled format
+	explorer   generate expression tree exploration rules
 	exprs      generate expression definitions and functions
 	factory    generate expression tree creation and normalization functions
-	ifactory   generate interface for factory construct methods
 	ops        generate operator definitions and functions
 	rulenames  generate enumeration of rule names
 

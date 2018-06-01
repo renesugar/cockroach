@@ -1,0 +1,204 @@
+# =============================================================================
+# select.opt contains normalization rules for the Select operator.
+# =============================================================================
+
+
+# EliminateSelect discards an unnecessary Select operator in the case where its
+# filter is always true. Keep this near the top of the file so that it tends to
+# be checked early.
+[EliminateSelect, Normalize]
+(Select $input:* (True)) => $input
+
+# EnsureSelectFiltersAnd replaces an And operator in a Select filter with the
+# Filters operator. This allows other rules to rely upon the presence of the
+# Filters when matching. See comment at top of bool.opt for more details. This
+# rule is a special-case of the EnsureSelectFilters rule, for performance
+# reasons (no need to construct a new conditions list) in a common case.
+[EnsureSelectFiltersAnd, Normalize]
+(Select
+    $input:*
+    (And $conditions:*)
+)
+=>
+(Select
+    $input
+    (Filters $conditions)
+)
+
+# EnsureSelectFilters adds a Filters operator to a Select's filter condition
+# if it does not already exist. This allows other rules to rely upon the
+# presence of the Filters when matching. See comment at top of bool.opt for
+# more details.
+[EnsureSelectFilters, Normalize]
+(Select
+    $input:*
+    $filter:^(Filters | And | True | False)
+)
+=>
+(Select
+    $input
+    (Filters [ $filter ])
+)
+
+# MergeSelects combines two nested Select operators into a single Select that
+# ANDs the filter conditions of the two Selects.
+[MergeSelects, Normalize]
+(Select
+    (Select
+        $input:*
+        $innerFilter:*
+    )
+    $filter:*
+)
+=>
+(Select
+    $input
+    (ConcatFilters $innerFilter $filter)
+)
+
+# PushSelectIntoProject pushes the Select operator into its Project input. This
+# is typically preferable because it minimizes the number of rows which Project
+# needs to process. This is especially important if Project is adding expensive
+# computed columns.
+[PushSelectIntoProject, Normalize]
+(Select
+    (Project
+        $input:*
+        $projections:*
+    )
+    (Filters
+        $list:[ ... $condition:* & (IsBoundBy $condition $input) ... ]
+    )
+)
+=>
+(Select
+    (Project
+        (Select
+            $input
+            (Filters (ExtractBoundConditions $list $input))
+        )
+        $projections
+    )
+    (Filters (ExtractUnboundConditions $list $input))
+)
+
+# PushSelectIntoJoinLeft pushes Select filter conditions into the left side of
+# an input Join. This is possible in the case of InnerJoin, LeftJoin, SemiJoin,
+# and AntiJoin, as long as the condition has no dependencies on the right side
+# of the join. Right and Full joins are not eligible, since attempting to filter
+# left rows would just result in NULL left rows instead.
+#
+#   -- No row is returned for a.x=1, a.y=2, b.x=1, since the WHERE excludes it.
+#   SELECT * FROM a RIGHT JOIN b ON a.x=b.x WHERE a.y < 0
+#
+#   -- But if the filter is incorrectly pushed down in RIGHT/FULL JOIN case,
+#   -- then a row containing null values on the left side is returned.
+#   SELECT * FROM (SELECT * FROM a WHERE a.y < 0) a RIGHT JOIN b ON a.x=b.x
+#
+# Citations: [1]
+[PushSelectIntoJoinLeft, Normalize]
+(Select
+    $input:(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply |
+            SemiJoin | SemiJoinApply | AntiJoin | AntiJoinApply
+        $left:*
+        $right:*
+        $on:*
+    )
+    $filter:(Filters $list:[ ... $condition:* & (IsBoundBy $condition $left) ... ])
+)
+=>
+(Select
+    ((OpName $input)
+        (Select
+            $left
+            (Filters (ExtractBoundConditions $list $left))
+        )
+        $right
+        $on
+    )
+    (Filters (ExtractUnboundConditions $list $left))
+)
+
+# PushSelectIntoJoinRight is symmetric with PushSelectIntoJoinLeft. It pushes
+# Select filter conditions into the right side of an input Join rather than
+# into the left side. See that rule's comments for more details.
+[PushSelectIntoJoinRight, Normalize]
+(Select
+    $input:(InnerJoin | InnerJoinApply | RightJoin | RightJoinApply
+        $left:*
+        $right:*
+        $on:*
+    )
+    $filter:(Filters $list:[ ... $condition:* & (IsBoundBy $condition $right) ... ])
+)
+=>
+(Select
+    ((OpName $input)
+        $left
+        (Select
+            $right
+            (Filters (ExtractBoundConditions $list $right))
+        )
+        $on
+    )
+    (Filters (ExtractUnboundConditions $list $right))
+)
+
+# MergeSelectInnerJoin merges a Select operator with an InnerJoin input by
+# AND'ing the filter conditions of each and creating a new InnerJoin with that
+# On condition. This is only safe to do with InnerJoin in the general case
+# where the conditions could filter either left or right rows. The special case
+# where a condition filters only one or the other is already taken care of by
+# the PushSelectIntoJoin rules.
+# NOTE: Keep this rule ordered after the PushSelectIntoJoin rules, for
+#       performance reasons. It's better to push down below the join in a
+#       single step, when possible.
+[MergeSelectInnerJoin, Normalize]
+(Select
+    $input:(InnerJoin | InnerJoinApply
+        $left:*
+        $right:*
+        $on:*
+    )
+    $filter:*
+)
+=>
+((OpName $input)
+    $left
+    $right
+    (ConcatFilters $on $filter)
+)
+
+# PushSelectIntoGroupBy pushes a Select condition below a GroupBy in the case
+# where it does not reference any of the aggregation columns. This only works
+# if this is not an instance of the "scalar" GroupBy, which returns only one
+# row, and which exhibits different behavior if the input is empty:
+#   SELECT MAX(y) FROM a
+#
+# If "a" is empty, this returns a single row containing a null value. This is
+# different behavior than a GroupBy with grouping columns, which would return
+# the empty set for a similar query:
+#   SELECT MAX(y) FROM a GROUP BY x
+#
+# Citations: [2]
+[PushSelectIntoGroupBy, Normalize]
+(Select
+    (GroupBy
+        $input:*
+        $aggregations:*
+        $groupingCols:* & ^(IsScalarGroupBy $groupingCols)
+    )
+    (Filters $list:[ ... $condition:* & (IsBoundBy $condition $input) ... ])
+)
+=>
+(Select
+    (GroupBy
+        (Select
+            $input
+            (Filters (ExtractBoundConditions $list $input))
+        )
+        $aggregations
+        $groupingCols
+    )
+    (Filters (ExtractUnboundConditions $list $input))
+)

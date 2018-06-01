@@ -47,3 +47,18 @@
     - The AlgebraicSetOp processor was removed, as it is not used. It was never
       used in plans, but its absence does change the ProcessorCoreUnion message,
       so a version bump is required.
+- Version: 11 (MinAcceptedVersion: 6)
+    - The txn field in the SetupFlowRequest is made nullable. Backfiller flows
+      no longer pass in a txn (it was passed by the gateway, but unused by the
+      remote processors before).
+- Version: 12 (MinAcceptedVersion: 6)
+    - The AggregatorSpec has a new OrderedGroupCols field, which older versions
+      will not recognize.
+- Version: 13 (MinAcceptedVersion: 6)
+    - Add NumRows to ValuesSpec (used for zero-column case). The implementation
+      tolerates this field being unset in existing planning cases (at lest one
+      column).
+- Version: 14 (MinAcceptedVersion: 6)
+    - Enhancements to lookup joins. They now support joining against secondary
+      indexes as well as left outer joins. Left join support required two
+      additional fields on JoinReaderSpec: index_filter_expr and type.

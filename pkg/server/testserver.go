@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
@@ -183,7 +182,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	// Validate the store specs.
 	for _, storeSpec := range params.StoreSpecs {
 		if storeSpec.InMemory {
-			if storeSpec.SizePercent > 0 {
+			if storeSpec.Size.Percent > 0 {
 				panic(fmt.Sprintf("test server does not yet support in memory stores based on percentage of total memory: %s", storeSpec))
 			}
 		}
@@ -231,6 +230,7 @@ type TestServer struct {
 	// Admin UI.
 	authClient struct {
 		httpClient http.Client
+		cookie     *serverpb.SessionCookie
 		once       sync.Once
 		err        error
 	}
@@ -374,16 +374,32 @@ func ExpectedInitialRangeCount(db *client.DB) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	maxDescriptorID := descriptorIDs[len(descriptorIDs)-1]
 
 	// System table splits occur at every possible table boundary between the end
 	// of the system config ID space (keys.MaxSystemConfigDescID) and the system
-	// table with the maximum ID (maxDescriptorID), even when an ID within the
-	// span does not have an associated descriptor.
-	systemTableSplits := int(maxDescriptorID - keys.MaxSystemConfigDescID)
+	// table with the maximum ID (maxSystemDescriptorID), even when an ID within
+	// the span does not have an associated descriptor.
+	maxSystemDescriptorID := descriptorIDs[0]
+	for _, descID := range descriptorIDs {
+		if descID > maxSystemDescriptorID && descID <= keys.MaxReservedDescID {
+			maxSystemDescriptorID = descID
+		}
+	}
+	systemTableSplits := int(maxSystemDescriptorID - keys.MaxSystemConfigDescID)
+
+	// User table splits are analogous to system table splits: they occur at every
+	// possible table boundary between the end of the system ID space
+	// (keys.MaxReservedDescID) and the user table with the maximum ID
+	// (maxUserDescriptorID), even when an ID within the span does not have an
+	// associated descriptor.
+	maxUserDescriptorID := descriptorIDs[len(descriptorIDs)-1]
+	userTableSplits := 0
+	if maxUserDescriptorID >= keys.MaxReservedDescID {
+		userTableSplits = int(maxUserDescriptorID - keys.MaxReservedDescID)
+	}
 
 	// `n` splits create `n+1` ranges.
-	return len(config.StaticSplits()) + systemTableSplits + 1, nil
+	return len(config.StaticSplits()) + systemTableSplits + userTableSplits + 1, nil
 }
 
 // WaitForInitialSplits waits for the server to complete its expected initial
@@ -451,7 +467,7 @@ func (ts *TestServer) Addr() string {
 
 // WriteSummaries implements TestServerInterface.
 func (ts *TestServer) WriteSummaries() error {
-	return ts.node.writeSummaries(context.TODO())
+	return ts.node.writeNodeStatus(context.TODO(), time.Hour)
 }
 
 // AdminURL implements TestServerInterface.
@@ -464,22 +480,30 @@ func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 	return ts.Cfg.GetHTTPClient()
 }
 
-// GetAuthenticatedHTTPClient implements TestServerInterface.
+const authenticatedUserName = "authentic_user"
+
+// GetAuthenticatedHTTPClient implements the TestServerInterface.
 func (ts *TestServer) GetAuthenticatedHTTPClient() (http.Client, error) {
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie()
+	return httpClient, err
+}
+
+func (ts *TestServer) getAuthenticatedHTTPClientAndCookie() (http.Client, *serverpb.SessionCookie, error) {
 	ts.authClient.once.Do(func() {
 		// Create an authentication session for an arbitrary user. We do not
 		// currently have an authorization mechanism, so a specific user is not
 		// necessary.
 		ts.authClient.err = func() error {
-			id, secret, err := ts.authentication.newAuthSession(context.TODO(), "authentic_user")
+			id, secret, err := ts.authentication.newAuthSession(context.TODO(), authenticatedUserName)
 			if err != nil {
 				return err
 			}
-			// Encode a session cookie and store it in a cookie jar.
-			cookie, err := encodeSessionCookie(&serverpb.SessionCookie{
+			rawCookie := &serverpb.SessionCookie{
 				ID:     id,
 				Secret: secret,
-			})
+			}
+			// Encode a session cookie and store it in a cookie jar.
+			cookie, err := encodeSessionCookie(rawCookie)
 			if err != nil {
 				return err
 			}
@@ -498,11 +522,12 @@ func (ts *TestServer) GetAuthenticatedHTTPClient() (http.Client, error) {
 				return err
 			}
 			ts.authClient.httpClient.Jar = cookieJar
+			ts.authClient.cookie = rawCookie
 			return nil
 		}()
 	})
 
-	return ts.authClient.httpClient, ts.authClient.err
+	return ts.authClient.httpClient, ts.authClient.cookie, ts.authClient.err
 }
 
 // MustGetSQLCounter implements TestServerInterface.
@@ -552,14 +577,9 @@ func (ts *TestServer) LeaseManager() interface{} {
 	return ts.leaseMgr
 }
 
-// Executor is part of TestServerInterface.
-func (ts *TestServer) Executor() interface{} {
-	return ts.sqlExecutor
-}
-
 // InternalExecutor is part of TestServerInterface.
 func (ts *TestServer) InternalExecutor() interface{} {
-	return &sql.InternalExecutor{ExecCfg: ts.execCfg}
+	return ts.internalExecutor
 }
 
 // GetNode exposes the Server's Node.
@@ -579,7 +599,7 @@ func (ts *TestServer) DistSQLServer() interface{} {
 
 // SetDistSQLSpanResolver is part of TestServerInterface.
 func (ts *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
-	ts.sqlExecutor.SetDistSQLSpanResolver(spanResolver.(distsqlplan.SpanResolver))
+	ts.execCfg.DistSQLPlanner.SetSpanResolver(spanResolver.(distsqlplan.SpanResolver))
 }
 
 // GetFirstStoreID is part of TestServerInterface.
@@ -624,7 +644,7 @@ func (ts *TestServer) SplitRange(
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
 	}
 	splitReq := roachpb.AdminSplitRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: splitKey,
 		},
 		SplitKey: splitKey,
@@ -709,7 +729,7 @@ func (ts *TestServer) GetRangeLease(
 	ctx context.Context, key roachpb.Key,
 ) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
 	leaseReq := roachpb.LeaseInfoRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: key,
 		},
 	}
@@ -729,6 +749,11 @@ func (ts *TestServer) GetRangeLease(
 	}
 	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().Now(), nil
 
+}
+
+// ExecutorConfig is part of the TestServerInterface.
+func (ts *TestServer) ExecutorConfig() interface{} {
+	return *ts.execCfg
 }
 
 type testServerFactoryImpl struct{}

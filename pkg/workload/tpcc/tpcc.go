@@ -16,10 +16,16 @@
 package tpcc
 
 import (
+	"context"
 	gosql "database/sql"
 	"math/rand"
+	"net/url"
 	"sync"
 
+	"fmt"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -41,8 +47,26 @@ type tpcc struct {
 	fks        bool
 	dbOverride string
 
-	txs         []tx
-	totalWeight int
+	txs []tx
+	// deck contains indexes into the txs slice.
+	deck []int
+
+	auditor *auditor
+
+	reg *workload.HistogramRegistry
+
+	split   bool
+	scatter bool
+
+	partitions        int
+	affinityPartition int
+	zones             []string
+
+	usePostgres  bool
+	serializable bool
+	txOpts       *gosql.TxOptions
+
+	expensiveChecks bool
 
 	randomCIDsCache struct {
 		syncutil.Mutex
@@ -67,16 +91,23 @@ var tpccMeta = workload.Meta{
 	Name: `tpcc`,
 	Description: `TPC-C simulates a transaction processing workload` +
 		` using a rich schema of multiple tables`,
-	Version: `1.0.0`,
+	Version: `2.0.1`,
 	New: func() workload.Generator {
 		g := &tpcc{}
 		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`db`:      {RuntimeOnly: true},
-			`fks`:     {RuntimeOnly: true},
-			`mix`:     {RuntimeOnly: true},
-			`wait`:    {RuntimeOnly: true},
-			`workers`: {RuntimeOnly: true},
+			`db`:                 {RuntimeOnly: true},
+			`fks`:                {RuntimeOnly: true},
+			`mix`:                {RuntimeOnly: true},
+			`partitions`:         {RuntimeOnly: true},
+			`partition-affinity`: {RuntimeOnly: true},
+			`scatter`:            {RuntimeOnly: true},
+			`serializable`:       {RuntimeOnly: true},
+			`split`:              {RuntimeOnly: true},
+			`wait`:               {RuntimeOnly: true},
+			`workers`:            {RuntimeOnly: true},
+			`zones`:              {RuntimeOnly: true},
+			`expensive-checks`:   {RuntimeOnly: true, CheckConsistencyOnly: true},
 		}
 
 		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
@@ -87,7 +118,7 @@ var tpccMeta = workload.Meta{
 		g.nowString = `2006-01-02 15:04:05`
 
 		g.flags.StringVar(&g.mix, `mix`,
-			`newOrder=45,payment=43,orderStatus=4,delivery=4,stockLevel=4`,
+			`newOrder=10,payment=10,orderStatus=1,delivery=1,stockLevel=1`,
 			`Weights for the transaction mix. The default matches the TPCC spec.`)
 		g.flags.BoolVar(&g.doWaits, `wait`, true, `Run in wait mode (include think/keying sleeps)`)
 		g.flags.StringVar(&g.dbOverride, `db`, ``,
@@ -95,7 +126,14 @@ var tpccMeta = workload.Meta{
 		g.flags.IntVar(&g.workers, `workers`, 0,
 			`Number of concurrent workers. Defaults to --warehouses * 10`)
 		g.flags.BoolVar(&g.fks, `fks`, true, `Add the foreign keys`)
+		g.flags.IntVar(&g.partitions, `partitions`, 0, `Partition tables (requires split)`)
+		g.flags.IntVar(&g.affinityPartition, `partition-affinity`, -1, `Run load generator against specific partition (requires partitions)`)
+		g.flags.BoolVar(&g.scatter, `scatter`, false, `Scatter ranges`)
+		g.flags.BoolVar(&g.serializable, `serializable`, false, `Force serializable mode`)
+		g.flags.BoolVar(&g.split, `split`, false, `Split tables`)
+		g.flags.StringSliceVar(&g.zones, "zones", []string{}, "Zones for partitioning, the number of zones should match the number of partitions and the zones used to start cockroach.")
 
+		g.flags.BoolVar(&g.expensiveChecks, `expensive-checks`, false, `Run expensive checks`)
 		return g
 	},
 }
@@ -118,6 +156,32 @@ func (w *tpcc) Hooks() workload.Hooks {
 					w.warehouses, w.warehouses*numWorkersPerWarehouse)
 			}
 
+			if w.partitions != 0 && !w.split {
+				return errors.Errorf(`--partitions requires --split`)
+			}
+
+			if w.affinityPartition != -1 && w.partitions == 0 {
+				return errors.Errorf(`--partition-affinity requires --partitions`)
+			}
+
+			if w.affinityPartition < -1 {
+				return errors.Errorf(`--partition-affinity should be greater than or equal to 0`)
+			}
+
+			if w.affinityPartition > w.partitions-1 {
+				return errors.Errorf(`--partition-affinity should be less than the total number of partitions.`)
+			}
+
+			if len(w.zones) > 0 && (len(w.zones) != w.partitions) {
+				return errors.Errorf(`--zones should have the sames length as --partitions.`)
+			}
+
+			if w.serializable {
+				w.txOpts = &gosql.TxOptions{Isolation: gosql.LevelSerializable}
+			}
+
+			w.auditor = newAuditor(w.warehouses)
+
 			return initializeMix(w)
 		},
 		PostLoad: func(sqlDB *gosql.DB) error {
@@ -139,6 +203,47 @@ func (w *tpcc) Hooks() workload.Hooks {
 			}
 			return nil
 		},
+		PostRun: func(start time.Time) error {
+			w.auditor.runChecks()
+			const totalHeader = "\n_elapsed_______tpmC____efc__avg(ms)__p50(ms)__p90(ms)__p95(ms)__p99(ms)_pMax(ms)"
+			fmt.Println(totalHeader)
+			startElapsed := timeutil.Since(start)
+
+			const newOrderName = `newOrder`
+			w.reg.Tick(func(t workload.HistogramTick) {
+				if newOrderName == t.Name {
+					tpmC := float64(t.Cumulative.TotalCount()) / startElapsed.Seconds() * 60
+					fmt.Printf("%7.1fs %10.1f %5.1f%% %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n",
+						startElapsed.Seconds(),
+						tpmC,
+						100*tpmC/(12.86*float64(w.warehouses)),
+						time.Duration(t.Cumulative.Mean()).Seconds()*1000,
+						time.Duration(t.Cumulative.ValueAtQuantile(50)).Seconds()*1000,
+						time.Duration(t.Cumulative.ValueAtQuantile(90)).Seconds()*1000,
+						time.Duration(t.Cumulative.ValueAtQuantile(95)).Seconds()*1000,
+						time.Duration(t.Cumulative.ValueAtQuantile(99)).Seconds()*1000,
+						time.Duration(t.Cumulative.ValueAtQuantile(100)).Seconds()*1000,
+					)
+				}
+			})
+			return nil
+		},
+		CheckConsistency: func(ctx context.Context, db *gosql.DB) error {
+			// TODO(arjun): We should run each test in a single transaction as
+			// currently we have to shut down load before running the checks.
+			for _, check := range allChecks() {
+				if !w.expensiveChecks && check.expensive {
+					continue
+				}
+				start := timeutil.Now()
+				err := check.f(db)
+				log.Infof(ctx, `check %s took %s`, check.name, timeutil.Since(start))
+				if err != nil {
+					return errors.Wrapf(err, `check failed: %s`, check.name)
+				}
+			}
+			return nil
+		},
 	}
 }
 
@@ -151,58 +256,76 @@ func (w *tpcc) Tables() []workload.Table {
 	}
 
 	warehouse := workload.Table{
-		Name:            `warehouse`,
-		Schema:          tpccWarehouseSchema,
-		InitialRowCount: w.warehouses,
-		InitialRowFn:    w.tpccWarehouseInitialRow,
+		Name:   `warehouse`,
+		Schema: tpccWarehouseSchema,
+		InitialRows: workload.Tuples(
+			w.warehouses,
+			w.tpccWarehouseInitialRow,
+		),
 	}
 	district := workload.Table{
-		Name:            `district`,
-		Schema:          tpccDistrictSchema,
-		InitialRowCount: numDistrictsPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccDistrictInitialRow,
+		Name:   `district`,
+		Schema: tpccDistrictSchema,
+		InitialRows: workload.Tuples(
+			numDistrictsPerWarehouse*w.warehouses,
+			w.tpccDistrictInitialRow,
+		),
 	}
 	customer := workload.Table{
-		Name:            `customer`,
-		Schema:          tpccCustomerSchema,
-		InitialRowCount: numCustomersPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccCustomerInitialRow,
+		Name:   `customer`,
+		Schema: tpccCustomerSchema,
+		InitialRows: workload.Tuples(
+			numCustomersPerWarehouse*w.warehouses,
+			w.tpccCustomerInitialRow,
+		),
 	}
 	history := workload.Table{
-		Name:            `history`,
-		Schema:          tpccHistorySchema,
-		InitialRowCount: numCustomersPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccHistoryInitialRow,
+		Name:   `history`,
+		Schema: tpccHistorySchema,
+		InitialRows: workload.Tuples(
+			numCustomersPerWarehouse*w.warehouses,
+			w.tpccHistoryInitialRow,
+		),
 	}
 	order := workload.Table{
-		Name:            `order`,
-		Schema:          tpccOrderSchema,
-		InitialRowCount: numOrdersPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccOrderInitialRow,
+		Name:   `order`,
+		Schema: tpccOrderSchema,
+		InitialRows: workload.Tuples(
+			numOrdersPerWarehouse*w.warehouses,
+			w.tpccOrderInitialRow,
+		),
 	}
 	newOrder := workload.Table{
-		Name:            `new_order`,
-		Schema:          tpccNewOrderSchema,
-		InitialRowCount: numNewOrdersPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccNewOrderInitialRow,
+		Name:   `new_order`,
+		Schema: tpccNewOrderSchema,
+		InitialRows: workload.Tuples(
+			numNewOrdersPerWarehouse*w.warehouses,
+			w.tpccNewOrderInitialRow,
+		),
 	}
 	item := workload.Table{
-		Name:            `item`,
-		Schema:          tpccItemSchema,
-		InitialRowCount: numItems,
-		InitialRowFn:    w.tpccItemInitialRow,
+		Name:   `item`,
+		Schema: tpccItemSchema,
+		InitialRows: workload.Tuples(
+			numItems,
+			w.tpccItemInitialRow,
+		),
 	}
 	stock := workload.Table{
-		Name:            `stock`,
-		Schema:          tpccStockSchema,
-		InitialRowCount: numStockPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccStockInitialRow,
+		Name:   `stock`,
+		Schema: tpccStockSchema,
+		InitialRows: workload.Tuples(
+			numStockPerWarehouse*w.warehouses,
+			w.tpccStockInitialRow,
+		),
 	}
 	orderLine := workload.Table{
-		Name:            `order_line`,
-		Schema:          tpccOrderLineSchema,
-		InitialRowCount: hackOrderLinesPerWarehouse * w.warehouses,
-		InitialRowFn:    w.tpccOrderLineInitialRow,
+		Name:   `order_line`,
+		Schema: tpccOrderLineSchema,
+		InitialRows: workload.BatchedTuples{
+			NumBatches: numOrdersPerWarehouse * w.warehouses,
+			Batch:      w.tpccOrderLineInitialRowBatch,
+		},
 	}
 	if w.interleaved {
 		district.Schema += tpccDistrictSchemaInterleave
@@ -226,6 +349,13 @@ func (w *tpcc) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
+	parsedURL, err := url.Parse(urls[0])
+	if err != nil {
+		return workload.QueryLoad{}, err
+	}
+
+	w.usePostgres = parsedURL.Port() == "5432"
+
 	nConns := w.warehouses / len(urls)
 	dbs := make([]*gosql.DB, len(urls))
 	for i, url := range urls {
@@ -238,9 +368,64 @@ func (w *tpcc) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 		dbs[i].SetMaxIdleConns(nConns)
 	}
 
+	// We're adding this check here because repartitioning a table can take
+	// upwards of 10 minutes so if a cluster is already set up correctly we won't
+	// do this operation again.
+	alreadyPartitioned, err := isTableAlreadyPartitioned(dbs[0])
+	if err != nil {
+		return workload.QueryLoad{}, err
+	}
+
+	if !alreadyPartitioned {
+		if w.split {
+			splitTables(dbs[0], w.warehouses)
+
+			if w.partitions > 0 {
+				partitionTables(dbs[0], w.warehouses, w.partitions, w.zones)
+			}
+		}
+	} else {
+		fmt.Println("Tables are not being parititioned because they've been previously partitioned.")
+	}
+
+	if w.scatter {
+		scatterRanges(dbs[0])
+	}
+
+	// If no partitions were specified, pretend there is a single partition
+	// containing all warehouses.
+	if w.partitions == 0 {
+		w.partitions = 1
+	}
+	// Assign each DB connection pool to a partition. This assumes that dbs[i] is
+	// a machine that holds partition "i % *partitions".
+	partitionDBs := make([][]*gosql.DB, w.partitions)
+	if w.affinityPartition == -1 {
+		for i, db := range dbs {
+			p := i % w.partitions
+			partitionDBs[p] = append(partitionDBs[p], db)
+		}
+	}
+	for i := range partitionDBs {
+		if partitionDBs[i] == nil {
+			partitionDBs[i] = dbs
+		}
+	}
+
+	w.reg = reg
+
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
 	for workerIdx := 0; workerIdx < w.workers; workerIdx++ {
-		warehouse := workerIdx / numWorkersPerWarehouse
+		warehouse := workerIdx % w.warehouses
+		// NB: Each partition contains "warehouses / partitions" warehouses. See
+		// partitionTables().
+		p := (warehouse * w.partitions) / w.warehouses
+		// Here we're making sure that if we have a warehouse affinity, that we only create
+		// workers for the correct warehouses.
+		if w.affinityPartition != -1 && p != w.affinityPartition {
+			continue
+		}
+		dbs := partitionDBs[p]
 		db := dbs[warehouse%len(dbs)]
 		worker := &worker{
 			config:    w,
@@ -248,13 +433,16 @@ func (w *tpcc) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 			idx:       workerIdx,
 			db:        db,
 			warehouse: warehouse,
+			deckPerm:  make([]int, len(w.deck)),
+			permIdx:   len(w.deck),
 		}
+		copy(worker.deckPerm, w.deck)
+
 		ql.WorkerFns = append(ql.WorkerFns, worker.run)
 	}
-	if w.doWaits {
-		// TODO(dan): doWaits is currently our catch-all for "run this to spec".
-		// It should probably be renamed to match.
-		ql.ResultHist = `newOrder`
+	// Preregister all of the histograms so they always print.
+	for _, tx := range allTxs {
+		reg.GetHandle().Get(tx.name)
 	}
 	return ql, nil
 }

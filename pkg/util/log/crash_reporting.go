@@ -17,12 +17,12 @@ package log
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 
 	raven "github.com/getsentry/raven-go"
@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -98,6 +99,23 @@ func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 		// so ReportPanic should pop four frames.
 		ReportPanic(ctx, sv, r, 4)
 		panic(r)
+	}
+}
+
+// RecoverAndReportNonfatalPanic is an alternative RecoverAndReportPanic that
+// does not re-panic in Release builds.
+func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
+	if r := recover(); r != nil {
+		// The call stack here is usually:
+		// - ReportPanic
+		// - RecoverAndReport
+		// - panic.go
+		// - panic()
+		// so ReportPanic should pop four frames.
+		ReportPanic(ctx, sv, r, 4)
+		if !build.IsRelease() || PanicOnAssertions.Get(sv) {
+			panic(r)
+		}
 	}
 }
 
@@ -307,7 +325,7 @@ func Redact(r interface{}) string {
 		switch t := r.(error).(type) {
 		case runtime.Error:
 			return typAnd(t, t.Error())
-		case syscall.Errno:
+		case sysutil.Errno:
 			return typAnd(t, t.Error())
 		case *os.SyscallError:
 			s := Redact(t.Err)
@@ -324,6 +342,14 @@ func Redact(r interface{}) string {
 			t = &cpy
 
 			t.Old, t.New = "<redacted>", "<redacted>"
+			return typAnd(t, t.Error())
+		case *net.OpError:
+			// It hardly matters, but avoid mutating the original.
+			cpy := *t
+			t = &cpy
+			t.Source = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Addr = &util.UnresolvedAddr{NetworkField: "tcp", AddressField: "redacted"}
+			t.Err = errors.New(Redact(t.Err))
 			return typAnd(t, t.Error())
 		default:
 		}
@@ -437,6 +463,14 @@ func SendCrashReport(
 	tags := map[string]string{
 		"uptime": uptimeTag(timeutil.Now()),
 	}
+
+	for _, f := range tagFns {
+		v := f.value(ctx)
+		if v != "" {
+			tags[f.key] = maybeTruncate(v)
+		}
+	}
+
 	eventID, ch := raven.DefaultClient.Capture(packet, tags)
 	select {
 	case <-ch:
@@ -460,5 +494,27 @@ func ReportOrPanic(
 		panic(fmt.Sprintf(format, reportables...))
 	}
 	Warningf(ctx, format, reportables...)
-	SendCrashReport(ctx, sv, 0 /* depth */, format, reportables)
+	SendCrashReport(ctx, sv, 1 /* depth */, format, reportables)
+}
+
+const maxTagLen = 500
+
+func maybeTruncate(tagValue string) string {
+	if len(tagValue) > maxTagLen {
+		return tagValue[:maxTagLen] + " [...]"
+	}
+	return tagValue
+}
+
+type tagFn struct {
+	key   string
+	value func(context.Context) string
+}
+
+var tagFns []tagFn
+
+// RegisterTagFn adds a function for tagging crash reports based on the context.
+// This is intended to be called by other packages at init time.
+func RegisterTagFn(key string, value func(context.Context) string) {
+	tagFns = append(tagFns, tagFn{key, value})
 }

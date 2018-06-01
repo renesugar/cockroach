@@ -178,9 +178,9 @@ func NeedsRefresh(args Request) bool {
 type Request interface {
 	protoutil.Message
 	// Header returns the request header.
-	Header() Span
+	Header() RequestHeader
 	// SetHeader sets the request header.
-	SetHeader(Span)
+	SetHeader(RequestHeader)
 	// Method returns the request method.
 	Method() Method
 	// ShallowCopy returns a shallow copy of the receiver.
@@ -236,6 +236,7 @@ func (rh *ResponseHeader) combine(otherRH ResponseHeader) error {
 		panic(fmt.Sprintf("combining %+v with %+v", rh.ResumeSpan, otherRH.ResumeSpan))
 	}
 	rh.ResumeSpan = otherRH.ResumeSpan
+	rh.ResumeReason = otherRH.ResumeReason
 	rh.NumKeys += otherRH.NumKeys
 	rh.RangeInfos = append(rh.RangeInfos, otherRH.RangeInfos...)
 	return nil
@@ -338,13 +339,30 @@ func (r *AdminScatterResponse) combine(c combinable) error {
 var _ combinable = &AdminScatterResponse{}
 
 // Header implements the Request interface.
-func (rh Span) Header() Span {
+func (rh RequestHeader) Header() RequestHeader {
 	return rh
 }
 
 // SetHeader implements the Request interface.
-func (rh *Span) SetHeader(other Span) {
+func (rh *RequestHeader) SetHeader(other RequestHeader) {
 	*rh = other
+}
+
+// Span returns the key range that the Request operates over.
+func (rh RequestHeader) Span() Span {
+	return Span{Key: rh.Key, EndKey: rh.EndKey}
+}
+
+// SetSpan addresses the RequestHeader to the specified key span.
+func (rh *RequestHeader) SetSpan(s Span) {
+	rh.Key = s.Key
+	rh.EndKey = s.EndKey
+}
+
+// RequestHeaderFromSpan creates a RequestHeader addressed at the specified key
+// span.
+func RequestHeaderFromSpan(s Span) RequestHeader {
+	return RequestHeader{Key: s.Key, EndKey: s.EndKey}
 }
 
 func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
@@ -366,10 +384,10 @@ func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
 }
 
 // Header implements the Request interface.
-func (*NoopRequest) Header() Span { panic("NoopRequest has no span") }
+func (*NoopRequest) Header() RequestHeader { panic("NoopRequest has no span") }
 
 // SetHeader implements the Request interface.
-func (*NoopRequest) SetHeader(_ Span) { panic("NoopRequest has no span") }
+func (*NoopRequest) SetHeader(_ RequestHeader) { panic("NoopRequest has no span") }
 
 // SetHeader implements the Response interface.
 func (rh *ResponseHeader) SetHeader(other ResponseHeader) {
@@ -820,7 +838,7 @@ func (r *RefreshRangeRequest) ShallowCopy() Request {
 // NewGet returns a Request initialized to get the value at key.
 func NewGet(key Key) Request {
 	return &GetRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 	}
@@ -830,7 +848,7 @@ func NewGet(key Key) Request {
 // key by increment.
 func NewIncrement(key Key, increment int64) Request {
 	return &IncrementRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 		Increment: increment,
@@ -841,7 +859,7 @@ func NewIncrement(key Key, increment int64) Request {
 func NewPut(key Key, value Value) Request {
 	value.InitChecksum(key)
 	return &PutRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 		Value: value,
@@ -853,7 +871,7 @@ func NewPut(key Key, value Value) Request {
 func NewPutInline(key Key, value Value) Request {
 	value.InitChecksum(key)
 	return &PutRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 		Value:  value,
@@ -873,7 +891,7 @@ func NewConditionalPut(key Key, value, expValue Value) Request {
 		expValue.InitChecksum(key)
 	}
 	return &ConditionalPutRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 		Value:    value,
@@ -889,7 +907,7 @@ func NewConditionalPut(key Key, value, expValue Value) Request {
 func NewInitPut(key Key, value Value, failOnTombstones bool) Request {
 	value.InitChecksum(key)
 	return &InitPutRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 		Value:            value,
@@ -900,7 +918,7 @@ func NewInitPut(key Key, value Value, failOnTombstones bool) Request {
 // NewDelete returns a Request initialized to delete the value at key.
 func NewDelete(key Key) Request {
 	return &DeleteRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key: key,
 		},
 	}
@@ -910,7 +928,7 @@ func NewDelete(key Key) Request {
 // the given key range (excluding the endpoint).
 func NewDeleteRange(startKey, endKey Key, returnKeys bool) Request {
 	return &DeleteRangeRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key:    startKey,
 			EndKey: endKey,
 		},
@@ -922,7 +940,7 @@ func NewDeleteRange(startKey, endKey Key, returnKeys bool) Request {
 // with max results.
 func NewScan(key, endKey Key) Request {
 	return &ScanRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
@@ -932,7 +950,7 @@ func NewScan(key, endKey Key) Request {
 // NewCheckConsistency returns a Request initialized to scan from start to end keys.
 func NewCheckConsistency(key, endKey Key, withDiff bool) Request {
 	return &CheckConsistencyRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
@@ -944,7 +962,7 @@ func NewCheckConsistency(key, endKey Key, withDiff bool) Request {
 // start keys with max results.
 func NewReverseScan(key, endKey Key) Request {
 	return &ReverseScanRequest{
-		Span: Span{
+		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},

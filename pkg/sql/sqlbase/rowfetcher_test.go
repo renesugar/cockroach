@@ -55,16 +55,11 @@ func initFetcher(
 			index = &entry.tableDesc.PrimaryIndex
 		}
 
-		colIdxMap := make(map[ColumnID]int)
-		for i, c := range entry.tableDesc.Columns {
-			colIdxMap[c.ID] = i
-		}
-
 		fetcherArgs[i] = RowFetcherTableArgs{
 			Spans:            entry.spans,
 			Desc:             entry.tableDesc,
 			Index:            index,
-			ColIdxMap:        colIdxMap,
+			ColIdxMap:        entry.tableDesc.ColumnIdxMap(),
 			IsSecondaryIndex: isSecondaryIndex,
 			Cols:             entry.tableDesc.Columns,
 			ValNeededForCol:  entry.valNeededForCol,
@@ -453,7 +448,7 @@ func generateIdxSubsets(maxIdx int, subsets [][]int) [][]int {
 // parent2
 //   child1
 //      grandchild1
-//	  grandgrandchild1
+//	      grandgrandchild1
 //   child2
 //   grandgrandchild1@ggc1_unique_idx
 // parent3

@@ -116,7 +116,7 @@ func TestClusterFlow(t *testing.T) {
 
 	req1 := &SetupFlowRequest{
 		Version: Version,
-		Txn:     txnProto,
+		Txn:     &txnProto,
 		Flow: FlowSpec{
 			FlowID: fid,
 			Processors: []ProcessorSpec{{
@@ -137,7 +137,7 @@ func TestClusterFlow(t *testing.T) {
 
 	req2 := &SetupFlowRequest{
 		Version: Version,
-		Txn:     txnProto,
+		Txn:     &txnProto,
 		Flow: FlowSpec{
 			FlowID: fid,
 			Processors: []ProcessorSpec{{
@@ -158,7 +158,7 @@ func TestClusterFlow(t *testing.T) {
 
 	req3 := &SetupFlowRequest{
 		Version: Version,
-		Txn:     txnProto,
+		Txn:     &txnProto,
 		Flow: FlowSpec{
 			FlowID: fid,
 			Processors: []ProcessorSpec{
@@ -398,7 +398,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 
 	req := SetupFlowRequest{
 		Version: Version,
-		Txn:     txnProto,
+		Txn:     &txnProto,
 		Flow: FlowSpec{
 			FlowID: FlowID{UUID: uuid.MakeV4()},
 			// The left-hand Values processor in the diagram above.
@@ -536,7 +536,7 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 							if !ok {
 								return nil
 							}
-							if !strings.HasPrefix(scanReq.Span.Key.String(), "/Table/51/1") {
+							if !strings.HasPrefix(scanReq.Key.String(), "/Table/53/1") {
 								return nil
 							}
 
@@ -652,7 +652,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 					for i := range reqs {
 						reqs[i] = SetupFlowRequest{
 							Version: Version,
-							Txn:     txnProto,
+							Txn:     &txnProto,
 							Flow: FlowSpec{
 								Processors: []ProcessorSpec{{
 									Core: ProcessorCoreUnion{Values: &valSpecs[i]},

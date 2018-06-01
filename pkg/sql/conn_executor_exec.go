@@ -18,20 +18,28 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
+
+var errSavepointNotUsed = pgerror.NewErrorf(
+	pgerror.CodeSavepointExceptionError,
+	"savepoint %s has not been used", tree.RestartSavepointName)
 
 // execStmt executes one statement by dispatching according to the current
 // state. Returns an Event to be passed to the state machine, or nil if no
@@ -69,7 +77,7 @@ func (ex *connExecutor) execStmt(
 		log.VEventf(ctx, 2, "executing: %s in state: %s", stmt, ex.machine.CurState())
 	}
 
-	queryID := ex.generateQueryID()
+	queryID := ex.generateID()
 	stmt.queryID = queryID
 
 	// Dispatch the statement for execution based on the current state.
@@ -109,7 +117,7 @@ func (ex *connExecutor) execStmt(
 func (ex *connExecutor) execStmtInOpenState(
 	ctx context.Context, stmt Statement, pinfo *tree.PlaceholderInfo, res RestrictedCommandResult,
 ) (retEv fsm.Event, retPayload fsm.EventPayload, retErr error) {
-	ex.server.StatementCounters.incrementCount(stmt.AST)
+	ex.incrementStmtCounter(stmt)
 	os := ex.machine.CurState().(stateOpen)
 
 	var timeoutTicker *time.Timer
@@ -218,6 +226,10 @@ func (ex *connExecutor) execStmtInOpenState(
 		if err := tree.ValidateRestartCheckpoint(s.Savepoint); err != nil {
 			return makeErrEvent(err)
 		}
+		if !ex.machine.CurState().(stateOpen).RetryIntent.Get() {
+			return makeErrEvent(errSavepointNotUsed)
+		}
+
 		// ReleaseSavepoint is executed fully here; there's no plan for it.
 		ev, payload := ex.commitSQLTransaction(ctx, stmt.AST)
 		res.ResetStmtType((*tree.CommitTransaction)(nil))
@@ -249,8 +261,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			return makeErrEvent(err)
 		}
 		if !os.RetryIntent.Get() {
-			err := fmt.Errorf("SAVEPOINT %s has not been used", tree.RestartSavepointName)
-			return makeErrEvent(err)
+			return makeErrEvent(errSavepointNotUsed)
 		}
 
 		res.ResetStmtType((*tree.Savepoint)(nil))
@@ -330,6 +341,24 @@ func (ex *connExecutor) execStmtInOpenState(
 			p.avoidCachedDescriptors = true
 			ex.state.mu.txn.SetFixedTimestamp(ctx, *ts)
 		}
+	} else {
+		// If we're in an explicit txn, we allow AOST but only if it matches with
+		// the transaction's timestamp. This is useful for running AOST statements
+		// using the InternalExecutor inside an external transaction; one might want
+		// to do that to force p.avoidCachedDescriptors to be set below.
+		ts, err := isAsOf(stmt.AST, p.EvalContext(), ex.server.cfg.Clock.Now())
+		if err != nil {
+			return makeErrEvent(err)
+		}
+		if ts != nil {
+			if *ts != ex.state.mu.txn.OrigTimestamp() {
+				return makeErrEvent(errors.Errorf("inconsistent \"as of system time\" timestamp. Expected: %s. "+
+					"Generally \"as of system time\" cannot be used inside a transaction.",
+					ex.state.mu.txn.OrigTimestamp()))
+			}
+			p.asOfSystemTime = true
+			p.avoidCachedDescriptors = true
+		}
 	}
 
 	p.semaCtx.Placeholders.Assign(pinfo)
@@ -372,6 +401,29 @@ func (ex *connExecutor) execStmtInOpenState(
 		if err := res.Err(); err != nil {
 			return makeErrEvent(err)
 		}
+
+		txn := ex.state.mu.txn
+		if !os.ImplicitTxn.Get() && txn.IsSerializablePushAndRefreshNotPossible() {
+			rc, canAutoRetry := ex.getRewindTxnCapability()
+			if canAutoRetry {
+				ev := eventRetriableErr{
+					IsCommit:     fsm.FromBool(isCommit(stmt.AST)),
+					CanAutoRetry: fsm.FromBool(canAutoRetry),
+				}
+				txn.Proto().Restart(0 /* userPriority */, 0 /* upgradePriority */, ex.server.cfg.Clock.Now())
+				payload := eventRetriableErrPayload{
+					err: roachpb.NewHandledRetryableTxnError(
+						"serializable transaction timestamp pushed (detected by connExecutor)",
+						txn.ID(),
+						// No updated transaction required; we've already manually updated our
+						// client.Txn.
+						roachpb.Transaction{},
+					),
+					rewCap: rc,
+				}
+				return ev, payload, nil
+			}
+		}
 	}
 
 	// No event was generated.
@@ -384,22 +436,19 @@ func (ex *connExecutor) execStmtInOpenState(
 func (ex *connExecutor) commitSQLTransaction(
 	ctx context.Context, stmt tree.Statement,
 ) (fsm.Event, fsm.EventPayload) {
-	commitType := commit
+	isRelease := false
 	if _, ok := stmt.(*tree.ReleaseSavepoint); ok {
-		commitType = release
+		isRelease = true
 	}
 
 	if err := ex.state.mu.txn.Commit(ctx); err != nil {
 		return ex.makeErrEvent(err, stmt)
 	}
 
-	switch commitType {
-	case commit:
+	if !isRelease {
 		return eventTxnFinish{}, eventTxnFinishPayload{commit: true}
-	case release:
-		return eventTxnReleased{}, nil
 	}
-	panic("unreached")
+	return eventTxnReleased{}, nil
 }
 
 // rollbackSQLTransaction executes a ROLLBACK statement: the KV transaction is
@@ -464,7 +513,7 @@ func (ex *connExecutor) execStmtInParallel(
 	ex.mu.Unlock()
 
 	if err := ex.parallelizeQueue.Add(params, func() error {
-		res := &errOnlyRestrictedCommandResult{}
+		res := &bufferedCommandResult{errOnly: true}
 
 		defer queryDone(ctx, res)
 
@@ -484,9 +533,10 @@ func (ex *connExecutor) execStmtInParallel(
 		err := ex.execWithLocalEngine(ctx, planner, stmt.AST.StatementType(), res)
 
 		planner.statsCollector.PhaseTimes()[plannerEndExecStmt] = timeutil.Now()
-		recordStatementSummary(
+		ex.recordStatementSummary(
 			planner, stmt, false /* distSQLUsed*/, ex.extraTxnState.autoRetryCounter,
-			res.RowsAffected(), err, &ex.server.EngineMetrics)
+			res.RowsAffected(), err, &ex.server.EngineMetrics,
+		)
 		if ex.server.cfg.TestingKnobs.AfterExecute != nil {
 			ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), res.Err())
 		}
@@ -520,12 +570,29 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 ) error {
 
 	planner.statsCollector.PhaseTimes()[plannerStartLogicalPlan] = timeutil.Now()
-	useOptimizer := shouldUseOptimizer(ex.sessionData.OptimizerMode, stmt)
 	var err error
-	if useOptimizer {
+	optMode := ex.sessionData.OptimizerMode
+	if optMode != sessiondata.OptimizerOff {
 		// Experimental path (disabled by default).
-		err = planner.makeOptimizerPlan(ctx, stmt)
-	} else {
+		if err = planner.makeOptimizerPlan(ctx, stmt); err != nil {
+			// Fall back on the heuristic planner if the cost-based optimizer returns
+			// an "unsupported feature" error.
+			pgerr, ok := err.(*pgerror.Error)
+			if ok && pgerr.Code == pgerror.CodeFeatureNotSupportedError {
+				// Always fallback for SET commands even if the optimizer is in Always
+				// mode, or else we can't switch to another mode.
+				if optMode == sessiondata.OptimizerAlways {
+					if _, setVar := stmt.AST.(*tree.SetVar); setVar {
+						optMode = sessiondata.OptimizerOff
+					}
+				} else {
+					optMode = sessiondata.OptimizerOff
+				}
+			}
+		}
+	}
+
+	if optMode == sessiondata.OptimizerOff {
 		err = planner.makePlan(ctx, stmt)
 	}
 
@@ -548,13 +615,23 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	useDistSQL := false
-	// TODO(radu): for now, we restrict the optimizer to local execution.
-	if !useOptimizer {
-		useDistSQL, err = shouldUseDistSQL(
-			ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner)
+	// If we use the optimizer and we are in "local" mode, don't try to
+	// distribute.
+	if optMode != sessiondata.OptimizerLocal {
+		ok, err := planner.prepareForDistSQLSupportCheck(
+			ctx, ex.sessionData.DistSQLMode == sessiondata.DistSQLAlways,
+		)
 		if err != nil {
 			res.SetError(err)
 			return nil
+		}
+		if ok {
+			useDistSQL, err = shouldUseDistSQL(
+				ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.plan)
+			if err != nil {
+				res.SetError(err)
+				return nil
+			}
 		}
 	}
 
@@ -583,7 +660,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	if err != nil {
 		return err
 	}
-	recordStatementSummary(
+	ex.recordStatementSummary(
 		planner, stmt, useDistSQL, ex.extraTxnState.autoRetryCounter,
 		res.RowsAffected(), res.Err(), &ex.server.EngineMetrics,
 	)
@@ -712,7 +789,7 @@ func (ex *connExecutor) execStmtInNoTxnState(
 ) (fsm.Event, fsm.EventPayload) {
 	switch s := stmt.AST.(type) {
 	case *tree.BeginTransaction:
-		ex.server.StatementCounters.incrementCount(stmt.AST)
+		ex.incrementStmtCounter(stmt)
 		iso, err := ex.isolationToProto(s.Modes.Isolation)
 		if err != nil {
 			return ex.makeErrEvent(err, s)
@@ -789,10 +866,9 @@ func (ex *connExecutor) execStmtInAbortedState(
 		}
 
 		if !(inRestartWait || ex.machine.CurState().(stateAborted).RetryIntent.Get()) {
-			err := fmt.Errorf("SAVEPOINT %s has not been used", tree.RestartSavepointName)
 			ev := eventNonRetriableErr{IsCommit: fsm.False}
 			payload := eventNonRetriableErrPayload{
-				err: err,
+				err: errSavepointNotUsed,
 			}
 			return ev, payload
 		}
@@ -844,7 +920,7 @@ func (ex *connExecutor) execStmtInAbortedState(
 func (ex *connExecutor) execStmtInCommitWaitState(
 	stmt Statement, res RestrictedCommandResult,
 ) (fsm.Event, fsm.EventPayload) {
-	ex.server.StatementCounters.incrementCount(stmt.AST)
+	ex.incrementStmtCounter(stmt)
 	switch stmt.AST.(type) {
 	case *tree.CommitTransaction, *tree.RollbackTransaction:
 		// Reply to a rollback with the COMMIT tag, by analogy to what we do when we
@@ -871,6 +947,9 @@ func (ex *connExecutor) runObserverStatement(
 		return ex.runShowTransactionState(ctx, res)
 	case *tree.ShowSyntax:
 		return ex.runShowSyntax(ctx, sqlStmt.Statement, res)
+	case *tree.SetTracing:
+		ex.runSetTracing(ctx, sqlStmt, res)
+		return nil
 	default:
 		res.SetError(pgerror.NewErrorf(pgerror.CodeInternalError,
 			"programming error: unrecognized observer statement type %T", stmt.AST))
@@ -893,7 +972,9 @@ func (ex *connExecutor) runShowSyntax(
 		func(ctx context.Context, field, msg string) error {
 			commErr = res.AddRow(ctx, tree.Datums{tree.NewDString(field), tree.NewDString(msg)})
 			return nil
-		}); err != nil {
+		},
+		ex.server.recordError, /* reportErr */
+	); err != nil {
 		res.SetError(err)
 	}
 	return commErr
@@ -911,13 +992,64 @@ func (ex *connExecutor) runShowTransactionState(
 	return res.AddRow(ctx, tree.Datums{tree.NewDString(state)})
 }
 
+func (ex *connExecutor) runSetTracing(
+	ctx context.Context, n *tree.SetTracing, res RestrictedCommandResult,
+) {
+	if len(n.Values) == 0 {
+		res.SetError(fmt.Errorf("set tracing missing argument"))
+		return
+	}
+
+	modes := make([]string, len(n.Values))
+	for i, v := range n.Values {
+		v = unresolvedNameToStrVal(v)
+		strVal, ok := v.(*tree.StrVal)
+		if !ok {
+			res.SetError(fmt.Errorf("expected string for set tracing argument, not %T", v))
+			return
+		}
+		modes[i] = strVal.RawString()
+	}
+
+	if err := ex.enableTracing(modes); err != nil {
+		res.SetError(err)
+	}
+}
+
+func (ex *connExecutor) enableTracing(modes []string) error {
+	traceKV := false
+	recordingType := tracing.SnowballRecording
+	enableMode := true
+
+	for _, s := range modes {
+		switch strings.ToLower(s) {
+		case "on":
+			enableMode = true
+		case "off":
+			enableMode = false
+		case "kv":
+			traceKV = true
+		case "local":
+			recordingType = tracing.SingleNodeRecording
+		case "cluster":
+			recordingType = tracing.SnowballRecording
+		default:
+			return errors.Errorf("set tracing: unknown mode %q", s)
+		}
+	}
+	if !enableMode {
+		return ex.sessionTracing.StopTracing()
+	}
+	return ex.sessionTracing.StartTracing(recordingType, traceKV)
+}
+
 // addActiveQuery adds a running query to the list of running queries.
 //
 // It returns a cleanup function that needs to be run when the query is no
 // longer executing. NOTE(andrei): As of Feb 2018, "executing" does not imply
 // that the results have been delivered to the client.
 func (ex *connExecutor) addActiveQuery(
-	queryID uint128.Uint128, stmt tree.Statement, cancelFun context.CancelFunc,
+	queryID ClusterWideID, stmt tree.Statement, cancelFun context.CancelFunc,
 ) func() {
 
 	_, hidden := stmt.(tree.HiddenFromShowQueries)
@@ -971,4 +1103,10 @@ func (ex *connExecutor) handleAutoCommit(ctx context.Context, stmt tree.Statemen
 	err := txn.Commit(ctx)
 	log.VEventf(ctx, 2, "AutoCommit. err: %v", err)
 	return err
+}
+
+func (ex *connExecutor) incrementStmtCounter(stmt Statement) {
+	if !ex.stmtCounterDisabled {
+		ex.server.StatementCounters.incrementCount(stmt.AST)
+	}
 }

@@ -24,7 +24,6 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -72,12 +71,9 @@ type copyMachine struct {
 	p planner
 
 	// parsingEvalCtx is an EvalContext used for the very limited needs to strings
-	// parsing. Is it not correcly initialized with timestamps, transactions and
+	// parsing. Is it not correctly initialized with timestamps, transactions and
 	// other things that statements more generally need.
 	parsingEvalCtx *tree.EvalContext
-	// collationEnv is needed only when creating collated strings. Using a common
-	// environment allows for some expensive work to only be done once.
-	collationEnv tree.CollationEnvironment
 }
 
 // newCopyMachine creates a new copyMachine.
@@ -110,11 +106,14 @@ func newCopyMachine(
 	if err != nil {
 		return nil, err
 	}
-	en, err := c.p.makeEditNode(ctx, tn, privilege.INSERT)
+	tableDesc, err := ResolveExistingObject(ctx, &c.p, tn, true /*required*/, requireTableDesc)
 	if err != nil {
 		return nil, err
 	}
-	cols, err := c.p.processColumns(en.tableDesc, n.Columns,
+	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
+		return nil, err
+	}
+	cols, err := c.p.processColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
@@ -360,7 +359,7 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 				return err
 			}
 		}
-		d, err := parser.ParseStringAs(c.resultColumns[i].Typ, s, c.parsingEvalCtx, &c.collationEnv)
+		d, err := tree.ParseStringAs(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
 		if err != nil {
 			return err
 		}

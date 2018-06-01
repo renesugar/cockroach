@@ -17,7 +17,6 @@ package sql
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 )
 
 // Statement contains a statement with optional expected result columns and metadata.
@@ -25,33 +24,9 @@ type Statement struct {
 	AST           tree.Statement
 	ExpectedTypes sqlbase.ResultColumns
 	AnonymizedStr string
-	queryID       uint128.Uint128
+	queryID       ClusterWideID
 }
 
 func (s Statement) String() string {
 	return s.AST.String()
-}
-
-// StatementList is a list of statements.
-type StatementList []Statement
-
-// NewStatementList creates a StatementList from a tree.StatementList.
-func NewStatementList(stmts tree.StatementList) StatementList {
-	sl := make(StatementList, len(stmts))
-	for i, s := range stmts {
-		sl[i] = Statement{AST: s}
-	}
-	return sl
-}
-
-func (l *StatementList) String() string { return tree.AsString(l) }
-
-// Format implements the NodeFormatter interface.
-func (l *StatementList) Format(ctx *tree.FmtCtx) {
-	for i := range *l {
-		if i > 0 {
-			ctx.WriteString("; ")
-		}
-		ctx.FormatNode((*l)[i].AST)
-	}
 }

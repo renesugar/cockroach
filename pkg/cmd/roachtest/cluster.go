@@ -20,14 +20,19 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +44,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	// "postgres" gosql driver
+
 	_ "github.com/lib/pq"
 )
 
@@ -46,12 +52,16 @@ var (
 	local       bool
 	artifacts   string
 	cockroach   string
+	encrypt     bool
 	workload    string
+	roachprod   string
+	buildTag    string
 	clusterName string
 	clusterID   string
 	clusterWipe bool
 	username    = os.Getenv("ROACHPROD_USER")
-	zones       string
+	zonesF      string
+	teamCity    bool
 )
 
 func ifLocal(trueVal, falseVal string) string {
@@ -61,6 +71,14 @@ func ifLocal(trueVal, falseVal string) string {
 	return falseVal
 }
 
+func filepathAbs(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", errors.Wrap(err, "")
+	}
+	return path, nil
+}
+
 func findBinary(binary, defValue string) (string, error) {
 	if binary == "" {
 		binary = defValue
@@ -68,7 +86,7 @@ func findBinary(binary, defValue string) (string, error) {
 
 	// Check to see if binary exists and is a regular file and executable.
 	if fi, err := os.Stat(binary); err == nil && fi.Mode().IsRegular() && (fi.Mode()&0111) != 0 {
-		return filepath.Abs(binary)
+		return filepathAbs(binary)
 	}
 
 	// Find the binary to run and translate it to an absolute path. First, look
@@ -76,46 +94,64 @@ func findBinary(binary, defValue string) (string, error) {
 	path, err := exec.LookPath(binary)
 	if err != nil {
 		if strings.HasPrefix(binary, "/") {
-			return "", err
+			return "", errors.Wrap(err, "")
 		}
 		// We're unable to find the binary in PATH and "binary" is a relative path:
 		// look in the cockroach repo.
 		gopath := os.Getenv("GOPATH")
 		if gopath == "" {
-			return "", err
+			return "", errors.Wrap(err, "")
 		}
 
 		var binSuffix string
-		if !local && clusterName != "local" {
+		if !local {
 			binSuffix = ".docker_amd64"
 		}
 		dirs := []string{
 			"/src/github.com/cockroachdb/cockroach/",
 			"/src/github.com/cockroachdb/cockroach/bin" + binSuffix,
+			filepath.Join(os.ExpandEnv("PWD"), "bin"+binSuffix),
 		}
 		for _, dir := range dirs {
 			path = filepath.Join(gopath, dir, binary)
 			var err2 error
 			path, err2 = exec.LookPath(path)
 			if err2 == nil {
-				return filepath.Abs(path)
+				return filepathAbs(path)
 			}
 		}
-		return "", err
+		return "", errors.Wrap(err, "")
 	}
-	return filepath.Abs(path)
+	return filepathAbs(path)
 }
 
 func initBinaries() {
+	// If we're running against an existing "local" cluster, force the local flag
+	// to true in order to get the "local" test configurations.
+	if clusterName == "local" {
+		local = true
+	}
+
+	cockroachDefault := "cockroach"
+	if !local {
+		cockroachDefault = "cockroach-linux-2.6.32-gnu-amd64"
+	}
 	var err error
-	cockroach, err = findBinary(cockroach, "cockroach")
+	cockroach, err = findBinary(cockroach, cockroachDefault)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintf(os.Stderr, "%+v\n", err)
 		os.Exit(1)
 	}
+
 	workload, err = findBinary(workload, "workload")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintf(os.Stderr, "%+v\n", err)
+		os.Exit(1)
+	}
+
+	roachprod, err = findBinary(roachprod, "roachprod")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%+v\n", err)
 		os.Exit(1)
 	}
 }
@@ -182,6 +218,25 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 	return nil
 }
 
+func execCmdWithBuffer(ctx context.Context, l *logger, args ...string) ([]byte, error) {
+	l.printf("> %s\n", strings.Join(args, " "))
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, errors.Wrapf(err, `%s`, strings.Join(args, ` `))
+	}
+	return out, nil
+}
+
+func makeGCEClusterName(testName, id, username string) string {
+	name := fmt.Sprintf("%s-%s-%s", username, id, testName)
+	name = strings.ToLower(name)
+	name = regexp.MustCompile(`[^-a-z0-9]+`).ReplaceAllString(name, "-")
+	name = regexp.MustCompile(`-+`).ReplaceAllString(name, "-")
+	return name
+}
+
 func makeClusterName(t testI) string {
 	if clusterName != "" {
 		return clusterName
@@ -189,7 +244,6 @@ func makeClusterName(t testI) string {
 	if local {
 		return "local"
 	}
-
 	if username == "" {
 		usr, err := user.Current()
 		if err != nil {
@@ -201,11 +255,7 @@ func makeClusterName(t testI) string {
 	if id == "" {
 		id = fmt.Sprintf("%d", timeutil.Now().Unix())
 	}
-	name := fmt.Sprintf("%s-%s-%s", username, id, t.Name())
-	name = strings.ToLower(name)
-	name = regexp.MustCompile(`[^-a-z0-9]+`).ReplaceAllString(name, "-")
-	name = regexp.MustCompile(`-+`).ReplaceAllString(name, "-")
-	return name
+	return makeGCEClusterName(t.Name(), id, username)
 }
 
 type testI interface {
@@ -243,6 +293,10 @@ func (n nodeListOption) merge(o nodeListOption) nodeListOption {
 		}
 	}
 	return r
+}
+
+func (n nodeListOption) randNode() nodeListOption {
+	return nodeListOption{n[rand.Intn(len(n))]}
 }
 
 func (n nodeListOption) String() string {
@@ -285,14 +339,20 @@ type nodeSpec struct {
 	Count       int
 	CPUs        int
 	MachineType string
+	Zones       string
 	Geo         bool
 }
 
 func (s *nodeSpec) args() []string {
 	var args []string
-	args = append(args, s.MachineType)
+	if s.MachineType != "" {
+		args = append(args, "--gce-machine-type="+s.MachineType)
+	}
 	if s.Geo {
 		args = append(args, "--geo")
+	}
+	if s.Zones != "" {
+		args = append(args, "--gce-zones="+s.Zones)
 	}
 	return args
 }
@@ -305,8 +365,16 @@ type nodeCPUOption int
 
 func (o nodeCPUOption) apply(spec *nodeSpec) {
 	spec.CPUs = int(o)
-	if !local && clusterName != "local" {
-		spec.MachineType = fmt.Sprintf("--gce-machine-type=n1-highcpu-%d", spec.CPUs)
+	if !local {
+		// TODO(peter): This is awkward: below 16 cpus, use n1-standard so that the
+		// machines have a decent amount of RAM. We could use customer machine
+		// configurations, but the rules for the amount of RAM per CPU need to be
+		// determined (you can't request any arbitrary amount of RAM).
+		if spec.CPUs < 16 {
+			spec.MachineType = fmt.Sprintf("n1-standard-%d", spec.CPUs)
+		} else {
+			spec.MachineType = fmt.Sprintf("n1-highcpu-%d", spec.CPUs)
+		}
 	}
 }
 
@@ -324,6 +392,19 @@ func (o nodeGeoOption) apply(spec *nodeSpec) {
 // geo is a node option which requests geo-distributed nodes.
 func geo() nodeGeoOption {
 	return nodeGeoOption{}
+}
+
+type nodeZonesOption string
+
+func (o nodeZonesOption) apply(spec *nodeSpec) {
+	spec.Zones = string(o)
+}
+
+// zones is a node option which requests geo-distributed nodes. Note that this
+// overrides the --zones flag and is useful for tests that require running on
+// specific zones.
+func zones(s string) nodeZonesOption {
+	return nodeZonesOption(s)
 }
 
 // nodes is a helper method for creating a []nodeSpec given a node count and
@@ -395,10 +476,10 @@ func newCluster(ctx context.Context, t testI, nodes []nodeSpec) *cluster {
 	registerCluster(c)
 
 	if c.name != clusterName {
-		sargs := []string{"roachprod", "create", c.name, "-n", fmt.Sprint(c.nodes)}
+		sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.nodes)}
 		sargs = append(sargs, nodes[0].args()...)
-		if zones != "" {
-			sargs = append(sargs, "--gce-zones="+zones)
+		if !local && zonesF != "" && nodes[0].Zones == "" {
+			sargs = append(sargs, "--gce-zones="+zonesF)
 		}
 
 		c.status("creating cluster")
@@ -407,9 +488,48 @@ func newCluster(ctx context.Context, t testI, nodes []nodeSpec) *cluster {
 			return nil
 		}
 	} else {
-		// NB: if the existing cluster is not as large as the desired cluster, the
-		// test will fail when trying to perform various operations such as putting
-		// binaries or starting the cockroach nodes.
+		// Perform validation on the existing cluster.
+		c.status("checking that existing cluster matches spec")
+		sargs := []string{roachprod, "list", c.name, "--json"}
+		out, err := execCmdWithBuffer(ctx, l, sargs...)
+		if err != nil {
+			t.Fatal(err)
+			return nil
+		}
+
+		// jsonOutput matches the structure of the output from `roachprod list`
+		// when in json mode.
+		type jsonOutput struct {
+			Clusters map[string]struct {
+				VMs []struct {
+					MachineType string `json:"machine_type"`
+				} `json:"vms"`
+			} `json:"clusters"`
+		}
+		var details jsonOutput
+		if err := json.Unmarshal(out, &details); err != nil {
+			t.Fatal(err)
+			return nil
+		}
+
+		cDetails, ok := details.Clusters[c.name]
+		if !ok {
+			t.Fatalf("cluster %q not found", c.name)
+			return nil
+		}
+		if len(cDetails.VMs) < c.nodes {
+			t.Fatalf("cluster has %d nodes, test requires at least %d", len(cDetails.VMs), c.nodes)
+			return nil
+		}
+		if typ := nodes[0].MachineType; typ != "" {
+			for i, vm := range cDetails.VMs {
+				if vm.MachineType != typ {
+					t.Fatalf("node %d has machine type %s, test requires %s", i, vm.MachineType, typ)
+					return nil
+				}
+			}
+		}
+
 		c.status("stopping cluster")
 		c.Stop(ctx, c.All())
 		if clusterWipe {
@@ -420,6 +540,22 @@ func newCluster(ctx context.Context, t testI, nodes []nodeSpec) *cluster {
 	}
 	c.status("running test")
 	return c
+}
+
+// clone creates a new cluster object that refers to the same cluster as the
+// receiver, but is associated with the specified test.
+func (c *cluster) clone(t *test) *cluster {
+	l, err := rootLogger(t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &cluster{
+		name:   c.name,
+		nodes:  c.nodes,
+		status: t.Status,
+		t:      t,
+		l:      l,
+	}
 }
 
 // All returns a node list containing all of the nodes in the cluster.
@@ -444,14 +580,20 @@ func (c *cluster) Node(i int) nodeListOption {
 	return c.Range(i, i)
 }
 
+func (c *cluster) FetchLogs(ctx context.Context) {
+	// Don't hang forever if we can't fetch the logs.
+	execCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	c.status("retrieving logs")
+	_ = execCmd(execCtx, c.l, roachprod, "get", c.name, "logs",
+		filepath.Join(artifacts, teamCityNameEscape(c.t.Name()), "logs"))
+}
+
 func (c *cluster) Destroy(ctx context.Context) {
 	if c == nil {
 		return
 	}
-
-	c.status("retrieving logs")
-	_ = execCmd(ctx, c.l, "roachprod", "get", c.name, "logs",
-		filepath.Join(artifacts, c.t.Name(), "logs"))
 
 	// Only destroy the cluster if it exists in the cluster registry. The cluster
 	// may not exist if the test was interrupted and the teardown machinery is
@@ -470,19 +612,31 @@ func (c *cluster) Destroy(ctx context.Context) {
 func (c *cluster) destroy(ctx context.Context) {
 	defer close(c.destroyed)
 
-	if c.name != clusterName {
-		c.status("destroying cluster")
-		if err := execCmd(ctx, c.l, "roachprod", "destroy", c.name); err != nil {
-			c.l.errorf("%s", err)
-		}
-	} else if clusterWipe {
-		c.status("wiping cluster")
-		if err := execCmd(ctx, c.l, "roachprod", "wipe", c.name); err != nil {
-			c.l.errorf("%s", err)
+	if clusterWipe {
+		if c.name != clusterName {
+			c.status("destroying cluster")
+			if err := execCmd(ctx, c.l, roachprod, "destroy", c.name); err != nil {
+				c.l.errorf("%s", err)
+			}
+		} else {
+			c.status("wiping cluster")
+			if err := execCmd(ctx, c.l, roachprod, "wipe", c.name); err != nil {
+				c.l.errorf("%s", err)
+			}
 		}
 	} else {
 		c.l.printf("skipping cluster wipe\n")
 	}
+}
+
+// Run a command with output redirected to the logs instead of to os.Stdout
+// (which doesn't go anywhere I've been able to find) Don't use this if you're
+// going to call cmd.CombinedOutput or cmd.Output.
+func (c *cluster) LoggedCommand(ctx context.Context, arg0 string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, arg0, args...)
+	cmd.Stdout = c.l.stdout
+	cmd.Stderr = c.l.stderr
+	return cmd
 }
 
 // Put a local file to all of the machines in a cluster.
@@ -495,10 +649,28 @@ func (c *cluster) Put(ctx context.Context, src, dest string, opts ...option) {
 		c.t.Fatal("interrupted")
 	}
 	c.status("uploading binary")
-	err := execCmd(ctx, c.l, "roachprod", "put", c.makeNodes(opts...), src, dest)
+	err := execCmd(ctx, c.l, roachprod, "put", c.makeNodes(opts...), src, dest)
 	if err != nil {
 		c.t.Fatal(err)
 	}
+}
+
+// GitClone clones a git repo from src into dest and checks out
+// origin's version of the given branch. The src, dest, and branch
+// arguments must not contain shell special characters.
+func (c *cluster) GitClone(ctx context.Context, src, dest, branch string, node nodeListOption) {
+	c.Run(ctx, node, "bash", "-e", "-c", fmt.Sprintf(`'
+if ! test -d %s; then
+  git clone -b %s --depth 1 %s %s
+else
+  cd %s
+  git fetch origin
+  git checkout origin/%s
+fi
+'`, dest,
+		branch, src, dest,
+		dest,
+		branch))
 }
 
 // startArgs specifies extra arguments that are passed to `roachprod` during `c.Start`.
@@ -534,15 +706,28 @@ func (c *cluster) Start(ctx context.Context, opts ...option) {
 		c.t.Fatal("interrupted")
 	}
 	c.status("starting cluster")
+	defer c.status()
 	args := []string{
-		"roachprod",
+		roachprod,
 		"start",
 	}
 	args = append(args, roachprodArgs(opts)...)
 	args = append(args, c.makeNodes(opts...))
+	if encrypt && !argExists(args, "--encrypt") {
+		args = append(args, "--encrypt")
+	}
 	if err := execCmd(ctx, c.l, args...); err != nil {
 		c.t.Fatal(err)
 	}
+}
+
+func argExists(args []string, target string) bool {
+	for _, arg := range args {
+		if arg == target || strings.HasPrefix(arg, target+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 // Stop cockroach nodes running on a subset of the cluster. See cluster.Start()
@@ -556,7 +741,8 @@ func (c *cluster) Stop(ctx context.Context, opts ...option) {
 		c.t.Fatal("interrupted")
 	}
 	c.status("stopping cluster")
-	err := execCmd(ctx, c.l, "roachprod", "stop", c.makeNodes(opts...))
+	defer c.status()
+	err := execCmd(ctx, c.l, roachprod, "stop", c.makeNodes(opts...))
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -573,27 +759,46 @@ func (c *cluster) Wipe(ctx context.Context, opts ...option) {
 		c.t.Fatal("interrupted")
 	}
 	c.status("wiping cluster")
-	err := execCmd(ctx, c.l, "roachprod", "wipe", c.makeNodes(opts...))
+	defer c.status()
+	err := execCmd(ctx, c.l, roachprod, "wipe", c.makeNodes(opts...))
 	if err != nil {
 		c.t.Fatal(err)
 	}
 }
 
-// Run a command on the specified node
-func (c *cluster) Run(ctx context.Context, node int, args ...string) {
+// Run a command on the specified node.
+func (c *cluster) Run(ctx context.Context, node nodeListOption, args ...string) {
 	err := c.RunL(ctx, c.l, node, args...)
 	if err != nil {
 		c.t.Fatal(err)
 	}
 }
 
+// Install a package in a node
+func (c *cluster) Install(ctx context.Context, node nodeListOption, args ...string) {
+	err := execCmd(ctx, c.l,
+		append([]string{roachprod, "install", c.makeNodes(node), "--"}, args...)...)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+}
+
 // RunE runs a command on the specified node, returning an error.
-func (c *cluster) RunE(ctx context.Context, node int, args ...string) error {
+func (c *cluster) RunE(ctx context.Context, node nodeListOption, args ...string) error {
 	return c.RunL(ctx, c.l, node, args...)
 }
 
 // RunL runs a command on the specified node, returning an error.
-func (c *cluster) RunL(ctx context.Context, l *logger, node int, args ...string) error {
+func (c *cluster) RunL(ctx context.Context, l *logger, node nodeListOption, args ...string) error {
+	if err := c.preRunChecks(); err != nil {
+		return err
+	}
+	return execCmd(ctx, l,
+		append([]string{roachprod, "run", c.makeNodes(node), "--"}, args...)...)
+}
+
+// preRunChecks runs checks to see if it makes sense to run a command.
+func (c *cluster) preRunChecks() error {
 	if c.t.Failed() {
 		// If the test has failed, don't try to limp along.
 		return errors.New("test already failed")
@@ -601,21 +806,127 @@ func (c *cluster) RunL(ctx context.Context, l *logger, node int, args ...string)
 	if atomic.LoadInt32(&interrupted) == 1 {
 		return errors.New("interrupted")
 	}
-	return execCmd(ctx, l,
-		append([]string{"roachprod", "ssh", c.makeNodes(c.Node(node)), "--"}, args...)...)
+
+	return nil
 }
 
-// Conn returns a SQL connection to the specified node.
-func (c *cluster) Conn(ctx context.Context, node int) *gosql.DB {
-	cmd := exec.CommandContext(
-		ctx, `roachprod`, `pgurl`, `--external`, c.makeNodes(c.Node(node)),
-	)
-	output, err := cmd.CombinedOutput()
+// RunWithBuffer runs a command on the specified node, returning the resulting combined stderr
+// and stdout or an error.
+func (c *cluster) RunWithBuffer(
+	ctx context.Context, l *logger, node nodeListOption, args ...string,
+) ([]byte, error) {
+	if err := c.preRunChecks(); err != nil {
+		return nil, err
+	}
+	return execCmdWithBuffer(ctx, l,
+		append([]string{roachprod, "run", c.makeNodes(node), "--"}, args...)...)
+}
+
+// RemountNoBarrier remounts the cluster's local SSDs with the nobarrier option.
+func (c *cluster) RemountNoBarrier(ctx context.Context) {
+	c.Run(ctx, c.All(),
+		"sudo", "umount", "/mnt/data1", ";",
+		"sudo", "mount", "-o", "discard,defaults,nobarrier",
+		"/dev/disk/by-id/google-local-ssd-0", "/mnt/data1")
+}
+
+// pgURL returns the Postgres endpoint for the specified node. It accepts a flag
+// specifying whether the URL should include the node's internal or external IP
+// address. In general, inter-cluster communication and should use internal IPs
+// and communication from a test driver to nodes in a cluster should use
+// external IPs.
+func (c *cluster) pgURL(ctx context.Context, node nodeListOption, external bool) []string {
+	args := []string{`pgurl`}
+	if external {
+		args = append(args, `--external`)
+	}
+	args = append(args, c.makeNodes(node))
+	cmd := exec.CommandContext(ctx, roachprod, args...)
+	output, err := cmd.Output()
 	if err != nil {
 		fmt.Println(strings.Join(cmd.Args, ` `))
 		c.t.Fatal(err)
 	}
-	url := strings.Trim(string(output), "' \n")
+	urls := strings.Split(strings.TrimSpace(string(output)), " ")
+	for i := range urls {
+		urls[i] = strings.Trim(urls[i], "'")
+	}
+	return urls
+}
+
+// InternalPGUrl returns the internal Postgres endpoint for the specified nodes.
+func (c *cluster) InternalPGUrl(ctx context.Context, node nodeListOption) []string {
+	return c.pgURL(ctx, node, false /* external */)
+}
+
+// Silence unused warning.
+var _ = (&cluster{}).InternalPGUrl
+
+// ExternalPGUrl returns the external Postgres endpoint for the specified nodes.
+func (c *cluster) ExternalPGUrl(ctx context.Context, node nodeListOption) []string {
+	return c.pgURL(ctx, node, true /* external */)
+}
+
+func urlToAddr(c *cluster, pgURL string) string {
+	u, err := url.Parse(pgURL)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return u.Host
+}
+
+func addrToIP(c *cluster, addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return host
+}
+
+// InternalAddr returns the internal address in the form host:port for the
+// specified nodes.
+func (c *cluster) InternalAddr(ctx context.Context, node nodeListOption) []string {
+	var addrs []string
+	for _, u := range c.pgURL(ctx, node, false /* external */) {
+		addrs = append(addrs, urlToAddr(c, u))
+	}
+	return addrs
+}
+
+// InternalIP returns the internal IP addresses for the specified nodes.
+func (c *cluster) InternalIP(ctx context.Context, node nodeListOption) []string {
+	var ips []string
+	for _, addr := range c.InternalAddr(ctx, node) {
+		ips = append(ips, addrToIP(c, addr))
+	}
+	return ips
+}
+
+// ExternalAddr returns the external address in the form host:port for the
+// specified node.
+func (c *cluster) ExternalAddr(ctx context.Context, node nodeListOption) []string {
+	var addrs []string
+	for _, u := range c.pgURL(ctx, node, true /* external */) {
+		addrs = append(addrs, urlToAddr(c, u))
+	}
+	return addrs
+}
+
+// ExternalIP returns the external IP addresses for the specified node.
+func (c *cluster) ExternalIP(ctx context.Context, node nodeListOption) []string {
+	var ips []string
+	for _, addr := range c.ExternalAddr(ctx, node) {
+		ips = append(ips, addrToIP(c, addr))
+	}
+	return ips
+}
+
+// Silence unused warning.
+var _ = (&cluster{}).ExternalIP
+
+// Conn returns a SQL connection to the specified node.
+func (c *cluster) Conn(ctx context.Context, node int) *gosql.DB {
+	url := c.ExternalPGUrl(ctx, c.Node(node))[0]
 	db, err := gosql.Open("postgres", url)
 	if err != nil {
 		c.t.Fatal(err)
@@ -637,13 +948,35 @@ func (c *cluster) isLocal() bool {
 	return c.name == "local"
 }
 
+func getDiskUsageInByte(ctx context.Context, c *cluster, nodeIdx int) (int, error) {
+	out, err := c.RunWithBuffer(ctx, c.l, c.Node(nodeIdx), fmt.Sprint("du -sk {store-dir} | grep -oE '^[0-9]+'"))
+	if err != nil {
+		return 0, err
+	}
+
+	str := string(out)
+	// We need this check because sometimes the first line of the roachprod output is a warning
+	// about adding an ip to a list of known hosts.
+	if strings.Contains(str, "Warning") {
+		str = strings.Split(str, "\n")[1]
+	}
+
+	size, err := strconv.Atoi(strings.TrimSpace(str))
+	if err != nil {
+		return 0, err
+	}
+
+	return size * 1024, nil
+}
+
 type monitor struct {
-	t      testI
-	l      *logger
-	nodes  string
-	ctx    context.Context
-	cancel func()
-	g      *errgroup.Group
+	t         testI
+	l         *logger
+	nodes     string
+	ctx       context.Context
+	cancel    func()
+	g         *errgroup.Group
+	expDeaths int32 // atomically
 }
 
 func newMonitor(ctx context.Context, c *cluster, opts ...option) *monitor {
@@ -657,8 +990,24 @@ func newMonitor(ctx context.Context, c *cluster, opts ...option) *monitor {
 	return m
 }
 
+// ExpectDeath lets the monitor know that a node is about to be killed, and that
+// this should be ignored.
+func (m *monitor) ExpectDeath() {
+	m.ExpectDeaths(1)
+}
+
+// ExpectDeaths lets the monitor know that a specific number of nodes are about
+// to be killed, and that they should be ignored.
+func (m *monitor) ExpectDeaths(count int32) {
+	atomic.AddInt32(&m.expDeaths, count)
+}
+
 func (m *monitor) Go(fn func(context.Context) error) {
 	m.g.Go(func() error {
+		if impl, ok := m.t.(*test); ok {
+			// Automatically clear the worker status message when the goroutine exits.
+			defer impl.Status()
+		}
 		return fn(m.ctx)
 	})
 }
@@ -669,7 +1018,7 @@ func (m *monitor) Wait() {
 		return
 	}
 
-	err := m.wait("roachprod", "monitor", m.nodes)
+	err := m.wait(roachprod, "monitor", m.nodes)
 	if err != nil {
 		m.t.Fatal(err)
 	}
@@ -768,7 +1117,7 @@ func (m *monitor) wait(args ...string) error {
 			var id int
 			var s string
 			if n, _ := fmt.Sscanf(msg, "%d: %s", &id, &s); n == 2 {
-				if strings.Contains(s, "dead") {
+				if strings.Contains(s, "dead") && atomic.AddInt32(&m.expDeaths, -1) < 0 {
 					setErr(fmt.Errorf("unexpected node event: %s", msg))
 					return
 				}

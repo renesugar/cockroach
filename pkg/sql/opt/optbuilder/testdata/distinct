@@ -1,7 +1,7 @@
 # tests adapted from logictest -- aggregate and distinct
 
 exec-ddl
-CREATE TABLE t.xyz (
+CREATE TABLE xyz (
   x INT PRIMARY KEY,
   y INT,
   z FLOAT,
@@ -27,49 +27,36 @@ TABLE xyz
       └── x int not null
 
 build
-SELECT y, z FROM t.xyz
+SELECT y, z FROM xyz
 ----
 project
  ├── columns: y:2(int) z:3(float)
- ├── scan xyz
- │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- └── projections [outer=(2,3)]
-      ├── variable: xyz.y [type=int, outer=(2)]
-      └── variable: xyz.z [type=float, outer=(3)]
+ └── scan xyz
+      └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
-SELECT DISTINCT y, z FROM t.xyz
+SELECT DISTINCT y, z FROM xyz
 ----
 group-by
  ├── columns: y:2(int) z:3(float)
- ├── grouping columns: xyz.y:2(int) xyz.z:3(float)
- ├── project
- │    ├── columns: xyz.y:2(int) xyz.z:3(float)
- │    ├── scan xyz
- │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    └── projections [outer=(2,3)]
- │         ├── variable: xyz.y [type=int, outer=(2)]
- │         └── variable: xyz.z [type=float, outer=(3)]
- └── aggregations
+ ├── grouping columns: y:2(int) z:3(float)
+ └── project
+      ├── columns: y:2(int) z:3(float)
+      └── scan xyz
+           └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
-SELECT y FROM (SELECT DISTINCT y, z FROM t.xyz)
+SELECT y FROM (SELECT DISTINCT y, z FROM xyz)
 ----
 project
  ├── columns: y:2(int)
- ├── group-by
- │    ├── columns: xyz.y:2(int) xyz.z:3(float)
- │    ├── grouping columns: xyz.y:2(int) xyz.z:3(float)
- │    ├── project
- │    │    ├── columns: xyz.y:2(int) xyz.z:3(float)
- │    │    ├── scan xyz
- │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    └── projections [outer=(2,3)]
- │    │         ├── variable: xyz.y [type=int, outer=(2)]
- │    │         └── variable: xyz.z [type=float, outer=(3)]
- │    └── aggregations
- └── projections [outer=(2)]
-      └── variable: xyz.y [type=int, outer=(2)]
+ └── group-by
+      ├── columns: y:2(int) z:3(float)
+      ├── grouping columns: y:2(int) z:3(float)
+      └── project
+           ├── columns: y:2(int) z:3(float)
+           └── scan xyz
+                └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
 SELECT DISTINCT y, z FROM xyz ORDER BY z
@@ -78,11 +65,12 @@ sort
  ├── columns: y:2(int) z:3(float)
  ├── ordering: +3
  └── group-by
-      ├── columns: xyz.y:2(int) xyz.z:3(float)
-      ├── grouping columns: xyz.y:2(int) xyz.z:3(float)
-      ├── scan xyz
-      │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
-      └── aggregations
+      ├── columns: y:2(int) z:3(float)
+      ├── grouping columns: y:2(int) z:3(float)
+      └── project
+           ├── columns: y:2(int) z:3(float)
+           └── scan xyz
+                └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
 SELECT DISTINCT y, z FROM xyz ORDER BY y
@@ -91,11 +79,12 @@ sort
  ├── columns: y:2(int) z:3(float)
  ├── ordering: +2
  └── group-by
-      ├── columns: xyz.y:2(int) xyz.z:3(float)
-      ├── grouping columns: xyz.y:2(int) xyz.z:3(float)
-      ├── scan xyz
-      │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
-      └── aggregations
+      ├── columns: y:2(int) z:3(float)
+      ├── grouping columns: y:2(int) z:3(float)
+      └── project
+           ├── columns: y:2(int) z:3(float)
+           └── scan xyz
+                └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
 SELECT DISTINCT y, z FROM xyz ORDER BY y, z
@@ -104,213 +93,229 @@ sort
  ├── columns: y:2(int) z:3(float)
  ├── ordering: +2,+3
  └── group-by
-      ├── columns: xyz.y:2(int) xyz.z:3(float)
-      ├── grouping columns: xyz.y:2(int) xyz.z:3(float)
-      ├── scan xyz
-      │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
-      └── aggregations
+      ├── columns: y:2(int) z:3(float)
+      ├── grouping columns: y:2(int) z:3(float)
+      └── project
+           ├── columns: y:2(int) z:3(float)
+           └── scan xyz
+                └── columns: x:1(int!null) y:2(int) z:3(float)
 
-# TODO(rytaft): This is a bug. This query is valid.
 build
-SELECT DISTINCT y + z FROM xyz ORDER by (y + z)
+SELECT DISTINCT y + x FROM xyz ORDER by (y + x)
 ----
-error: unsupported binary operator: <int> + <float>
+sort
+ ├── columns: "y + x":4(int)
+ ├── ordering: +4
+ └── group-by
+      ├── columns: "y + x":4(int)
+      ├── grouping columns: "y + x":4(int)
+      └── project
+           ├── columns: "y + x":4(int)
+           ├── scan xyz
+           │    └── columns: x:1(int!null) y:2(int) z:3(float)
+           └── projections
+                └── plus [type=int]
+                     ├── variable: xyz.y [type=int]
+                     └── variable: xyz.x [type=int]
 
-# TODO(rytaft): This is a bug. This query is valid.
+build
+SELECT DISTINCT y + x FROM xyz ORDER BY y + x
+----
+sort
+ ├── columns: "y + x":4(int)
+ ├── ordering: +4
+ └── group-by
+      ├── columns: "y + x":4(int)
+      ├── grouping columns: "y + x":4(int)
+      └── project
+           ├── columns: "y + x":4(int)
+           ├── scan xyz
+           │    └── columns: x:1(int!null) y:2(int) z:3(float)
+           └── projections
+                └── plus [type=int]
+                     ├── variable: xyz.y [type=int]
+                     └── variable: xyz.x [type=int]
+
 build
 SELECT DISTINCT y + z FROM xyz ORDER BY y + z
 ----
-error: unsupported binary operator: <int> + <float>
+error (22023): unsupported binary operator: <int> + <float>
 
 # TODO(rytaft): This query causes an error in Postgres, but it is supported by
 # CockroachDB with the semantics:
 #   SELECT y AS w FROM t GROUP BY y ORDER BY min(z);
 # We may decide to support this later, but for now this should cause an error.
-# TODO(rytaft): Improve this error message to be more descriptive. E.g., the
-# Postgres error message is "for SELECT DISTINCT, ORDER BY expressions must
-# appear in select list".
 build
 SELECT DISTINCT y AS w FROM xyz ORDER by z
 ----
-error: column name "z" not found
+error (42P10): for SELECT DISTINCT, ORDER BY expressions must appear in select list
 
-# TODO(rytaft): This is a bug. This query is valid.
 build
 SELECT DISTINCT y AS w FROM xyz ORDER by y
 ----
-error: column name "y" not found
+sort
+ ├── columns: w:2(int)
+ ├── ordering: +2
+ └── group-by
+      ├── columns: y:2(int)
+      ├── grouping columns: y:2(int)
+      └── project
+           ├── columns: y:2(int)
+           └── scan xyz
+                └── columns: x:1(int!null) y:2(int) z:3(float)
 
 build
-SELECT DISTINCT (y,z) FROM t.xyz
+SELECT DISTINCT (y,z) FROM xyz
 ----
 group-by
- ├── columns: column4:4(tuple{int, float})
- ├── grouping columns: column4:4(tuple{int, float})
- ├── project
- │    ├── columns: column4:4(tuple{int, float})
- │    ├── scan xyz
- │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    └── projections [outer=(2,3)]
- │         └── tuple [type=tuple{int, float}, outer=(2,3)]
- │              ├── variable: xyz.y [type=int, outer=(2)]
- │              └── variable: xyz.z [type=float, outer=(3)]
- └── aggregations
+ ├── columns: "(y, z)":4(tuple{int, float})
+ ├── grouping columns: "(y, z)":4(tuple{int, float})
+ └── project
+      ├── columns: "(y, z)":4(tuple{int, float})
+      ├── scan xyz
+      │    └── columns: x:1(int!null) y:2(int) z:3(float)
+      └── projections
+           └── tuple [type=tuple{int, float}]
+                ├── variable: xyz.y [type=int]
+                └── variable: xyz.z [type=float]
 
 build
-SELECT COUNT(*) FROM (SELECT DISTINCT y FROM t.xyz)
+SELECT COUNT(*) FROM (SELECT DISTINCT y FROM xyz)
 ----
 group-by
- ├── columns: column4:4(int)
+ ├── columns: count:4(int)
  ├── project
- │    ├── group-by
- │    │    ├── columns: xyz.y:2(int)
- │    │    ├── grouping columns: xyz.y:2(int)
- │    │    ├── project
- │    │    │    ├── columns: xyz.y:2(int)
- │    │    │    ├── scan xyz
- │    │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    │    └── projections [outer=(2)]
- │    │    │         └── variable: xyz.y [type=int, outer=(2)]
- │    │    └── aggregations
- │    └── projections
+ │    └── group-by
+ │         ├── columns: y:2(int)
+ │         ├── grouping columns: y:2(int)
+ │         └── project
+ │              ├── columns: y:2(int)
+ │              └── scan xyz
+ │                   └── columns: x:1(int!null) y:2(int) z:3(float)
  └── aggregations
-      └── function: count_rows [type=int]
+      └── count-rows [type=int]
 
 build
-SELECT DISTINCT x FROM t.xyz WHERE x > 0
+SELECT DISTINCT x FROM xyz WHERE x > 0
 ----
 group-by
  ├── columns: x:1(int!null)
- ├── grouping columns: xyz.x:1(int!null)
- ├── project
- │    ├── columns: xyz.x:1(int!null)
- │    ├── select
- │    │    ├── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    ├── scan xyz
- │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    └── gt [type=bool, outer=(1)]
- │    │         ├── variable: xyz.x [type=int, outer=(1)]
- │    │         └── const: 0 [type=int]
- │    └── projections [outer=(1)]
- │         └── variable: xyz.x [type=int, outer=(1)]
- └── aggregations
+ ├── grouping columns: x:1(int!null)
+ └── project
+      ├── columns: x:1(int!null)
+      └── select
+           ├── columns: x:1(int!null) y:2(int) z:3(float)
+           ├── scan xyz
+           │    └── columns: x:1(int!null) y:2(int) z:3(float)
+           └── filters [type=bool]
+                └── gt [type=bool]
+                     ├── variable: xyz.x [type=int]
+                     └── const: 0 [type=int]
 
 build
-SELECT DISTINCT z FROM t.xyz WHERE x > 0
+SELECT DISTINCT z FROM xyz WHERE x > 0
 ----
 group-by
  ├── columns: z:3(float)
- ├── grouping columns: xyz.z:3(float)
- ├── project
- │    ├── columns: xyz.z:3(float)
- │    ├── select
- │    │    ├── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    ├── scan xyz
- │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    └── gt [type=bool, outer=(1)]
- │    │         ├── variable: xyz.x [type=int, outer=(1)]
- │    │         └── const: 0 [type=int]
- │    └── projections [outer=(3)]
- │         └── variable: xyz.z [type=float, outer=(3)]
- └── aggregations
+ ├── grouping columns: z:3(float)
+ └── project
+      ├── columns: z:3(float)
+      └── select
+           ├── columns: x:1(int!null) y:2(int) z:3(float)
+           ├── scan xyz
+           │    └── columns: x:1(int!null) y:2(int) z:3(float)
+           └── filters [type=bool]
+                └── gt [type=bool]
+                     ├── variable: xyz.x [type=int]
+                     └── const: 0 [type=int]
 
 build
 SELECT DISTINCT MAX(x) FROM xyz GROUP BY x
 ----
 group-by
- ├── columns: column4:4(int)
- ├── grouping columns: column4:4(int)
- ├── project
- │    ├── columns: column4:4(int)
- │    ├── group-by
- │    │    ├── columns: xyz.x:1(int!null) column4:4(int)
- │    │    ├── grouping columns: xyz.x:1(int!null)
- │    │    ├── project
- │    │    │    ├── columns: xyz.x:1(int!null) xyz.x:1(int!null)
- │    │    │    ├── scan xyz
- │    │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    │    └── projections [outer=(1)]
- │    │    │         ├── variable: xyz.x [type=int, outer=(1)]
- │    │    │         └── variable: xyz.x [type=int, outer=(1)]
- │    │    └── aggregations [outer=(1)]
- │    │         └── function: max [type=int, outer=(1)]
- │    │              └── variable: xyz.x [type=int, outer=(1)]
- │    └── projections [outer=(4)]
- │         └── variable: column4 [type=int, outer=(4)]
- └── aggregations
+ ├── columns: max:4(int)
+ ├── grouping columns: max:4(int)
+ └── project
+      ├── columns: max:4(int)
+      └── group-by
+           ├── columns: x:1(int!null) max:4(int)
+           ├── grouping columns: x:1(int!null)
+           ├── project
+           │    ├── columns: x:1(int!null)
+           │    └── scan xyz
+           │         └── columns: x:1(int!null) y:2(int) z:3(float)
+           └── aggregations
+                └── max [type=int]
+                     └── variable: xyz.x [type=int]
 
 build
 SELECT DISTINCT x+y FROM xyz
 ----
 group-by
- ├── columns: column4:4(int)
- ├── grouping columns: column4:4(int)
- ├── project
- │    ├── columns: column4:4(int)
- │    ├── scan xyz
- │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    └── projections [outer=(1,2)]
- │         └── plus [type=int, outer=(1,2)]
- │              ├── variable: xyz.x [type=int, outer=(1)]
- │              └── variable: xyz.y [type=int, outer=(2)]
- └── aggregations
+ ├── columns: "x + y":4(int)
+ ├── grouping columns: "x + y":4(int)
+ └── project
+      ├── columns: "x + y":4(int)
+      ├── scan xyz
+      │    └── columns: x:1(int!null) y:2(int) z:3(float)
+      └── projections
+           └── plus [type=int]
+                ├── variable: xyz.x [type=int]
+                └── variable: xyz.y [type=int]
 
 build
 SELECT DISTINCT 3 FROM xyz
 ----
 group-by
- ├── columns: column4:4(int)
- ├── grouping columns: column4:4(int)
- ├── project
- │    ├── columns: column4:4(int)
- │    ├── scan xyz
- │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    └── projections
- │         └── const: 3 [type=int]
- └── aggregations
+ ├── columns: "3":4(int!null)
+ ├── grouping columns: "3":4(int!null)
+ └── project
+      ├── columns: "3":4(int!null)
+      ├── scan xyz
+      │    └── columns: x:1(int!null) y:2(int) z:3(float)
+      └── projections
+           └── const: 3 [type=int]
 
 build
 SELECT DISTINCT 3
 ----
 group-by
- ├── columns: column1:1(int)
- ├── grouping columns: column1:1(int)
- ├── project
- │    ├── columns: column1:1(int)
- │    ├── values
- │    │    └── tuple [type=tuple{}]
- │    └── projections
- │         └── const: 3 [type=int]
- └── aggregations
+ ├── columns: "3":1(int!null)
+ ├── grouping columns: "3":1(int!null)
+ └── project
+      ├── columns: "3":1(int!null)
+      ├── values
+      │    └── tuple [type=tuple{}]
+      └── projections
+           └── const: 3 [type=int]
 
 build
 SELECT DISTINCT MAX(z), x+y, 3 FROM xyz GROUP BY x, y HAVING y > 4
 ----
 group-by
- ├── columns: column4:4(float) column5:5(int) column6:6(int)
- ├── grouping columns: column4:4(float) column5:5(int) column6:6(int)
- ├── project
- │    ├── columns: column4:4(float) column5:5(int) column6:6(int)
- │    ├── select
- │    │    ├── columns: xyz.x:1(int!null) xyz.y:2(int) column4:4(float)
- │    │    ├── group-by
- │    │    │    ├── columns: xyz.x:1(int!null) xyz.y:2(int) column4:4(float)
- │    │    │    ├── grouping columns: xyz.x:1(int!null) xyz.y:2(int)
- │    │    │    ├── scan xyz
- │    │    │    │    └── columns: xyz.x:1(int!null) xyz.y:2(int) xyz.z:3(float)
- │    │    │    └── aggregations [outer=(3)]
- │    │    │         └── function: max [type=float, outer=(3)]
- │    │    │              └── variable: xyz.z [type=float, outer=(3)]
- │    │    └── gt [type=bool, outer=(2)]
- │    │         ├── variable: xyz.y [type=int, outer=(2)]
- │    │         └── const: 4 [type=int]
- │    └── projections [outer=(1,2,4)]
- │         ├── variable: column4 [type=float, outer=(4)]
- │         ├── plus [type=int, outer=(1,2)]
- │         │    ├── variable: xyz.x [type=int, outer=(1)]
- │         │    └── variable: xyz.y [type=int, outer=(2)]
- │         └── const: 3 [type=int]
- └── aggregations
+ ├── columns: max:4(float) "x + y":5(int) "3":6(int!null)
+ ├── grouping columns: max:4(float) "x + y":5(int) "3":6(int!null)
+ └── project
+      ├── columns: "x + y":5(int) "3":6(int!null) max:4(float)
+      ├── select
+      │    ├── columns: x:1(int!null) y:2(int!null) max:4(float)
+      │    ├── group-by
+      │    │    ├── columns: x:1(int!null) y:2(int) max:4(float)
+      │    │    ├── grouping columns: x:1(int!null) y:2(int)
+      │    │    ├── scan xyz
+      │    │    │    └── columns: x:1(int!null) y:2(int) z:3(float)
+      │    │    └── aggregations
+      │    │         └── max [type=float]
+      │    │              └── variable: xyz.z [type=float]
+      │    └── filters [type=bool]
+      │         └── gt [type=bool]
+      │              ├── variable: xyz.y [type=int]
+      │              └── const: 4 [type=int]
+      └── projections
+           ├── plus [type=int]
+           │    ├── variable: xyz.x [type=int]
+           │    └── variable: xyz.y [type=int]
+           └── const: 3 [type=int]
 
 exec-ddl
 CREATE TABLE abcd (
@@ -341,11 +346,19 @@ build
 SELECT DISTINCT 1, d, b FROM abcd ORDER BY d, b
 ----
 sort
- ├── columns: column5:5(int) d:4(int!null) b:2(int!null)
+ ├── columns: "1":5(int!null) d:4(int!null) b:2(int!null)
  ├── ordering: +4,+2
  └── group-by
-      ├── columns: abcd.b:2(int!null) abcd.d:4(int!null) column5:5(int)
-      ├── grouping columns: abcd.b:2(int!null) abcd.d:4(int!null) column5:5(int)
-      ├── scan abcd
-      │    └── columns: abcd.a:1(int!null) abcd.b:2(int!null) abcd.c:3(int!null) abcd.d:4(int!null)
-      └── aggregations
+      ├── columns: b:2(int!null) d:4(int!null) "1":5(int!null)
+      ├── grouping columns: b:2(int!null) d:4(int!null) "1":5(int!null)
+      └── project
+           ├── columns: "1":5(int!null) b:2(int!null) d:4(int!null)
+           ├── scan abcd
+           │    └── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(int!null)
+           └── projections
+                └── const: 1 [type=int]
+
+build
+SELECT DISTINCT ON (b, c) a, b, d FROM abcd ORDER BY b, c
+----
+error (0A000): DISTINCT ON is not supported

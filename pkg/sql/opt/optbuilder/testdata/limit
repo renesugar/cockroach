@@ -20,14 +20,11 @@ limit
  ├── columns: k:1(int!null) v:2(int)
  ├── ordering: +1
  ├── project
- │    ├── columns: t.k:1(int!null) t.v:2(int)
+ │    ├── columns: k:1(int!null) v:2(int)
  │    ├── ordering: +1
- │    ├── scan t
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    └── ordering: +1
- │    └── projections [outer=(1,2)]
- │         ├── variable: t.k [type=int, outer=(1)]
- │         └── variable: t.v [type=int, outer=(2)]
+ │    └── scan t
+ │         ├── columns: k:1(int!null) v:2(int) w:3(int)
+ │         └── ordering: +1
  └── const: 5 [type=int]
 
 build
@@ -36,17 +33,13 @@ SELECT k, v FROM t ORDER BY v FETCH FIRST 5 ROWS ONLY
 limit
  ├── columns: k:1(int!null) v:2(int)
  ├── ordering: +2
- ├── project
- │    ├── columns: t.k:1(int!null) t.v:2(int)
+ ├── sort
+ │    ├── columns: k:1(int!null) v:2(int)
  │    ├── ordering: +2
- │    ├── sort
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    ├── ordering: +2
- │    │    └── scan t
- │    │         └── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    └── projections [outer=(1,2)]
- │         ├── variable: t.k [type=int, outer=(1)]
- │         └── variable: t.v [type=int, outer=(2)]
+ │    └── project
+ │         ├── columns: k:1(int!null) v:2(int)
+ │         └── scan t
+ │              └── columns: k:1(int!null) v:2(int) w:3(int)
  └── const: 5 [type=int]
 
 build
@@ -55,12 +48,9 @@ SELECT k, v FROM t LIMIT (1+2)
 limit
  ├── columns: k:1(int!null) v:2(int)
  ├── project
- │    ├── columns: t.k:1(int!null) t.v:2(int)
- │    ├── scan t
- │    │    └── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    └── projections [outer=(1,2)]
- │         ├── variable: t.k [type=int, outer=(1)]
- │         └── variable: t.v [type=int, outer=(2)]
+ │    ├── columns: k:1(int!null) v:2(int)
+ │    └── scan t
+ │         └── columns: k:1(int!null) v:2(int) w:3(int)
  └── const: 3 [type=int]
 
 build
@@ -70,13 +60,11 @@ limit
  ├── columns: k:1(int!null)
  ├── ordering: +1
  ├── project
- │    ├── columns: t.k:1(int!null)
+ │    ├── columns: k:1(int!null)
  │    ├── ordering: +1
- │    ├── scan t
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    └── ordering: +1
- │    └── projections [outer=(1)]
- │         └── variable: t.k [type=int, outer=(1)]
+ │    └── scan t
+ │         ├── columns: k:1(int!null) v:2(int) w:3(int)
+ │         └── ordering: +1
  └── const: 1 [type=int]
 
 build
@@ -86,16 +74,14 @@ limit
  ├── columns: k:1(int!null)
  ├── ordering: +1
  ├── offset
- │    ├── columns: t.k:1(int!null)
+ │    ├── columns: k:1(int!null)
  │    ├── ordering: +1
  │    ├── project
- │    │    ├── columns: t.k:1(int!null)
+ │    │    ├── columns: k:1(int!null)
  │    │    ├── ordering: +1
- │    │    ├── scan t
- │    │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    │    └── ordering: +1
- │    │    └── projections [outer=(1)]
- │    │         └── variable: t.k [type=int, outer=(1)]
+ │    │    └── scan t
+ │    │         ├── columns: k:1(int!null) v:2(int) w:3(int)
+ │    │         └── ordering: +1
  │    └── const: 3 [type=int]
  └── const: 1 [type=int]
 
@@ -106,14 +92,11 @@ offset
  ├── columns: k:1(int!null) v:2(int)
  ├── ordering: +1
  ├── project
- │    ├── columns: t.k:1(int!null) t.v:2(int)
+ │    ├── columns: k:1(int!null) v:2(int)
  │    ├── ordering: +1
- │    ├── scan t
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    └── ordering: +1
- │    └── projections [outer=(1,2)]
- │         ├── variable: t.k [type=int, outer=(1)]
- │         └── variable: t.v [type=int, outer=(2)]
+ │    └── scan t
+ │         ├── columns: k:1(int!null) v:2(int) w:3(int)
+ │         └── ordering: +1
  └── const: 5 [type=int]
 
 build
@@ -123,48 +106,42 @@ limit
  ├── columns: k:1(int!null)
  ├── ordering: +1
  ├── project
- │    ├── columns: t.k:1(int!null)
+ │    ├── columns: k:1(int!null)
  │    ├── ordering: +1
- │    ├── scan t
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    └── ordering: +1
- │    └── projections [outer=(1)]
- │         └── variable: t.k [type=int, outer=(1)]
+ │    └── scan t
+ │         ├── columns: k:1(int!null) v:2(int) w:3(int)
+ │         └── ordering: +1
  └── const: 2 [type=int]
 
 build
 SELECT k FROM T LIMIT k
 ----
-error: column name "k" not found
+error (42703): column "k" does not exist
 
 build
 SELECT k FROM T LIMIT v
 ----
-error: column name "v" not found
+error (42703): column "v" does not exist
 
 build
 SELECT SUM(w) FROM t GROUP BY k, v ORDER BY v DESC LIMIT 10
 ----
 limit
- ├── columns: column4:4(decimal)
+ ├── columns: sum:4(decimal)
  ├── ordering: -2
- ├── project
- │    ├── columns: column4:4(decimal) t.v:2(int)
+ ├── sort
+ │    ├── columns: v:2(int) sum:4(decimal)
  │    ├── ordering: -2
- │    ├── sort
- │    │    ├── columns: t.k:1(int!null) t.v:2(int) column4:4(decimal)
- │    │    ├── ordering: -2
- │    │    └── group-by
- │    │         ├── columns: t.k:1(int!null) t.v:2(int) column4:4(decimal)
- │    │         ├── grouping columns: t.k:1(int!null) t.v:2(int)
- │    │         ├── scan t
- │    │         │    └── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │         └── aggregations [outer=(3)]
- │    │              └── function: sum [type=decimal, outer=(3)]
- │    │                   └── variable: t.w [type=int, outer=(3)]
- │    └── projections [outer=(2,4)]
- │         ├── variable: column4 [type=decimal, outer=(4)]
- │         └── variable: t.v [type=int, outer=(2)]
+ │    └── project
+ │         ├── columns: v:2(int) sum:4(decimal)
+ │         └── group-by
+ │              ├── columns: k:1(int!null) v:2(int) sum:4(decimal)
+ │              ├── grouping columns: k:1(int!null) v:2(int)
+ │              ├── scan t
+ │              │    └── columns: k:1(int!null) v:2(int) w:3(int)
+ │              └── aggregations
+ │                   └── sum [type=decimal]
+ │                        └── variable: t.w [type=int]
  └── const: 10 [type=int]
 
 build
@@ -174,14 +151,15 @@ limit
  ├── columns: v:2(int)
  ├── ordering: +2
  ├── sort
- │    ├── columns: t.v:2(int)
+ │    ├── columns: v:2(int)
  │    ├── ordering: +2
  │    └── group-by
- │         ├── columns: t.v:2(int)
- │         ├── grouping columns: t.v:2(int)
- │         ├── scan t
- │         │    └── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │         └── aggregations
+ │         ├── columns: v:2(int)
+ │         ├── grouping columns: v:2(int)
+ │         └── project
+ │              ├── columns: v:2(int)
+ │              └── scan t
+ │                   └── columns: k:1(int!null) v:2(int) w:3(int)
  └── const: 10 [type=int]
 
 build
@@ -279,19 +257,50 @@ SELECT k FROM (SELECT k, v FROM t ORDER BY v LIMIT 10)
 ----
 project
  ├── columns: k:1(int!null)
- ├── limit
- │    ├── columns: t.k:1(int!null) t.v:2(int)
- │    ├── project
- │    │    ├── columns: t.k:1(int!null) t.v:2(int)
- │    │    ├── ordering: +2
- │    │    ├── sort
- │    │    │    ├── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    │    ├── ordering: +2
- │    │    │    └── scan t
- │    │    │         └── columns: t.k:1(int!null) t.v:2(int) t.w:3(int)
- │    │    └── projections [outer=(1,2)]
- │    │         ├── variable: t.k [type=int, outer=(1)]
- │    │         └── variable: t.v [type=int, outer=(2)]
- │    └── const: 10 [type=int]
- └── projections [outer=(1)]
-      └── variable: t.k [type=int, outer=(1)]
+ └── limit
+      ├── columns: k:1(int!null) v:2(int)
+      ├── sort
+      │    ├── columns: k:1(int!null) v:2(int)
+      │    ├── ordering: +2
+      │    └── project
+      │         ├── columns: k:1(int!null) v:2(int)
+      │         └── scan t
+      │              └── columns: k:1(int!null) v:2(int) w:3(int)
+      └── const: 10 [type=int]
+
+# This kind of query can be used to work around memory usage limits. We need to
+# choose the "hard" limit of 100 over the "soft" limit of 25 (with the hard
+# limit we will only store 100 rows in the sort node). See #19677.
+build
+SELECT DISTINCT w FROM (SELECT w FROM t ORDER BY w LIMIT 100) ORDER BY w LIMIT 25
+----
+limit
+ ├── columns: w:3(int)
+ ├── ordering: +3
+ ├── sort
+ │    ├── columns: w:3(int)
+ │    ├── ordering: +3
+ │    └── group-by
+ │         ├── columns: w:3(int)
+ │         ├── grouping columns: w:3(int)
+ │         └── limit
+ │              ├── columns: w:3(int)
+ │              ├── sort
+ │              │    ├── columns: w:3(int)
+ │              │    ├── ordering: +3
+ │              │    └── project
+ │              │         ├── columns: w:3(int)
+ │              │         └── scan t
+ │              │              └── columns: k:1(int!null) v:2(int) w:3(int)
+ │              └── const: 100 [type=int]
+ └── const: 25 [type=int]
+
+build
+SELECT * FROM t LIMIT @1
+----
+error (42703): column reference @1 not allowed in this context
+
+build
+SELECT * FROM t OFFSET @1
+----
+error (42703): column reference @1 not allowed in this context

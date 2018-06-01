@@ -6,7 +6,7 @@ import { InjectedRouter, RouterState } from "react-router";
 import { createSelector } from "reselect";
 
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
-import { hoverStateSelector, HoverState, hoverOn, hoverOff } from "src/redux/hover";
+import { hoverStateSelector, HoverState, hoverOn as hoverOnAction, hoverOff as hoverOffAction } from "src/redux/hover";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
@@ -24,8 +24,8 @@ import messagesDashboard from "./messages";
 interface NodeGraphsOwnProps {
   refreshNodes: typeof refreshNodes;
   refreshLiveness: typeof refreshLiveness;
-  hoverOn: typeof hoverOn;
-  hoverOff: typeof hoverOff;
+  hoverOn: typeof hoverOnAction;
+  hoverOff: typeof hoverOffAction;
   nodesQueryValid: boolean;
   livenessQueryValid: boolean;
   nodesSummary: NodesSummary;
@@ -64,10 +64,6 @@ class NodeGraphs extends React.Component<NodeGraphsProps, {}> {
       }));
     },
   );
-
-  static title() {
-    return "Raft Messages";
-  }
 
   refresh(props = this.props) {
     if (!props.nodesQueryValid) {
@@ -180,7 +176,7 @@ function mapStateToProps(state: AdminUIState) {
 const actions = {
   refreshNodes,
   refreshLiveness,
-  hoverOn,
-  hoverOff,
+  hoverOn: hoverOnAction,
+  hoverOff: hoverOffAction,
 };
 export default connect(mapStateToProps, actions)(NodeGraphs);

@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -83,7 +82,7 @@ const (
 
 var diagnosticReportFrequency = settings.RegisterNonNegativeDurationSetting(
 	"diagnostics.reporting.interval",
-	"interval at which diagnostics data should be reported",
+	"interval at which diagnostics data should be reported (should be shorter than diagnostics.forced_stat_reset.interval)",
 	time.Hour,
 )
 
@@ -100,8 +99,9 @@ type versionInfo struct {
 
 // PeriodicallyCheckForUpdates starts a background worker that periodically
 // phones home to check for updates and report usage.
-func (s *Server) PeriodicallyCheckForUpdates() {
-	s.stopper.RunWorker(context.TODO(), func(ctx context.Context) {
+func (s *Server) PeriodicallyCheckForUpdates(ctx context.Context) {
+	s.stopper.RunWorker(ctx, func(ctx context.Context) {
+		defer log.RecoverAndReportNonfatalPanic(ctx, &s.st.SV)
 		startup := timeutil.Now()
 		nextUpdateCheck := startup
 		nextDiagnosticReport := startup
@@ -112,7 +112,7 @@ func (s *Server) PeriodicallyCheckForUpdates() {
 			now := timeutil.Now()
 			runningTime := now.Sub(startup)
 
-			nextUpdateCheck = s.maybeCheckForUpdates(now, nextUpdateCheck, runningTime)
+			nextUpdateCheck = s.maybeCheckForUpdates(ctx, now, nextUpdateCheck, runningTime)
 			nextDiagnosticReport = s.maybeReportDiagnostics(ctx, now, nextDiagnosticReport, runningTime)
 
 			sooner := nextUpdateCheck
@@ -134,7 +134,7 @@ func (s *Server) PeriodicallyCheckForUpdates() {
 // maybeCheckForUpdates determines if it is time to check for updates and does
 // so if it is, before returning the time at which the next check be done.
 func (s *Server) maybeCheckForUpdates(
-	now, scheduled time.Time, runningTime time.Duration,
+	ctx context.Context, now, scheduled time.Time, runningTime time.Duration,
 ) time.Time {
 	if scheduled.After(now) {
 		return scheduled
@@ -148,7 +148,7 @@ func (s *Server) maybeCheckForUpdates(
 
 	// checkForUpdates handles its own errors, but it returns a bool indicating if
 	// it succeeded, so we can schedule a re-attempt if it did not.
-	if succeeded := s.checkForUpdates(runningTime); !succeeded {
+	if succeeded := s.checkForUpdates(ctx, runningTime); !succeeded {
 		return now.Add(updateCheckRetryFrequency)
 	}
 
@@ -189,11 +189,11 @@ func addInfoToURL(ctx context.Context, url *url.URL, s *Server, runningTime time
 // and logs messages if it finds them, as well as if it encounters any errors.
 // The returned boolean indicates if the check succeeded (and thus does not need
 // to be re-attempted by the scheduler after a retry-interval).
-func (s *Server) checkForUpdates(runningTime time.Duration) bool {
+func (s *Server) checkForUpdates(ctx context.Context, runningTime time.Duration) bool {
 	if updatesURL == nil {
 		return true // don't bother with asking for retry -- we'll never succeed.
 	}
-	ctx, span := s.AnnotateCtxWithSpan(context.Background(), "checkForUpdates")
+	ctx, span := s.AnnotateCtxWithSpan(ctx, "checkForUpdates")
 	defer span.Finish()
 
 	addInfoToURL(ctx, updatesURL, s, runningTime)
@@ -247,30 +247,17 @@ func (s *Server) maybeReportDiagnostics(
 	// Consider something like rand.Float() > resetFreq/reportFreq here to sample
 	// stat reset periods for reporting.
 	if log.DiagnosticsReportingEnabled.Get(&s.st.SV) {
-		s.reportDiagnostics(running)
+		s.reportDiagnostics(ctx, running)
 	}
-	if !s.cfg.UseLegacyConnHandling {
-		s.pgServer.SQLServer.ResetStatementStats(ctx)
-		s.pgServer.SQLServer.ResetErrorCounts()
-	} else {
-		s.sqlExecutor.ResetStatementStats(ctx)
-		s.sqlExecutor.ResetErrorCounts()
-	}
+	s.pgServer.SQLServer.ResetStatementStats(ctx)
+	s.pgServer.SQLServer.ResetErrorCounts()
 
 	return scheduled.Add(diagnosticReportFrequency.Get(&s.st.SV))
 }
 
-// safeToReportSettings are the names of settings which we want reported with
-// their values, regardless of their type -- usually only numeric/duration/bool
-// settings are reported to avoid including potentially sensitive info that may
-// appear in strings or byte/proto/statemachine settings.
-var safeToReportSettings = map[string]struct{}{
-	cluster.KeyVersionSetting: {},
-}
-
 func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.DiagnosticReport {
 	info := diagnosticspb.DiagnosticReport{}
-	n := s.node.recorder.GetStatusSummary(ctx)
+	n := s.node.recorder.GenerateNodeStatus(ctx)
 	info.Node = diagnosticspb.NodeInfo{NodeID: s.node.Descriptor.NodeID}
 
 	secret := sql.ClusterSecret.Get(&s.cfg.Settings.SV)
@@ -307,41 +294,22 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
 	// flattened for quick reads, but we'd rather only report the non-defaults.
-	if datums, _, err := (&sql.InternalExecutor{ExecCfg: s.execCfg}).QueryRows(
-		ctx, "read-setting", "SELECT name FROM system.settings",
+	if datums, _, err := s.internalExecutor.Query(
+		ctx, "read-setting", nil /* txn */, "SELECT name FROM system.settings",
 	); err != nil {
-		log.Warning(ctx, err)
+		log.Warningf(ctx, "failed to read settings: %s", err)
 	} else {
 		info.AlteredSettings = make(map[string]string, len(datums))
 		for _, row := range datums {
 			name := string(tree.MustBeDString(row[0]))
-			if setting, ok := settings.Lookup(name); ok {
-				// For whitelisted settings always report it.
-				if _, ok := safeToReportSettings[name]; ok {
-					info.AlteredSettings[name] = setting.String(&s.st.SV)
-				} else {
-					// for settings with types that can't be sensitive, report values.
-					switch setting.(type) {
-					case *settings.IntSetting,
-						*settings.FloatSetting,
-						*settings.ByteSizeSetting,
-						*settings.DurationSetting,
-						*settings.BoolSetting,
-						*settings.EnumSetting:
-						info.AlteredSettings[name] = setting.String(&s.st.SV)
-					default:
-						info.AlteredSettings[name] = "<non-default>"
-					}
-				}
-			} else {
-				info.AlteredSettings[name] = "<unknown>"
-			}
+			info.AlteredSettings[name] = settings.SanitizedValue(name, &s.st.SV)
 		}
 	}
 
-	if datums, _, err := (&sql.InternalExecutor{ExecCfg: s.execCfg}).QueryRows(
+	if datums, _, err := s.internalExecutor.Query(
 		ctx,
 		"read-zone-configs",
+		nil, /* txn */
 		"SELECT id, config FROM system.zones",
 	); err != nil {
 		log.Warning(ctx, err)
@@ -349,11 +317,14 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		info.ZoneConfigs = make(map[int64]config.ZoneConfig)
 		for _, row := range datums {
 			id := int64(tree.MustBeDInt(row[0]))
-			configProto := []byte(*(row[1].(*tree.DBytes)))
 			var zone config.ZoneConfig
-			if err := protoutil.Unmarshal(configProto, &zone); err != nil {
-				log.Warningf(ctx, "unable to parse zone config %d: %v", id, err)
+			if bytes, ok := row[1].(*tree.DBytes); !ok {
 				continue
+			} else {
+				if err := protoutil.Unmarshal([]byte(*bytes), &zone); err != nil {
+					log.Warningf(ctx, "unable to parse zone config %d: %v", id, err)
+					continue
+				}
 			}
 			var anonymizedZone config.ZoneConfig
 			anonymizeZoneConfig(&anonymizedZone, zone, secret)
@@ -361,13 +332,8 @@ func (s *Server) getReportingInfo(ctx context.Context) *diagnosticspb.Diagnostic
 		}
 	}
 
-	if !s.cfg.UseLegacyConnHandling {
-		info.SqlStats = s.pgServer.SQLServer.GetScrubbedStmtStats()
-		s.pgServer.SQLServer.FillErrorCounts(info.ErrorCounts, info.UnimplementedErrors)
-	} else {
-		info.SqlStats = s.sqlExecutor.GetScrubbedStmtStats()
-		s.sqlExecutor.FillErrorCounts(info.ErrorCounts, info.UnimplementedErrors)
-	}
+	info.SqlStats = s.pgServer.SQLServer.GetScrubbedStmtStats()
+	s.pgServer.SQLServer.FillErrorCounts(info.ErrorCounts, info.UnimplementedErrors)
 	return &info
 }
 
@@ -411,11 +377,11 @@ func anonymizeZoneConfig(dst *config.ZoneConfig, src config.ZoneConfig, secret s
 	}
 }
 
-func (s *Server) reportDiagnostics(runningTime time.Duration) {
+func (s *Server) reportDiagnostics(ctx context.Context, runningTime time.Duration) {
 	if reportingURL == nil {
 		return
 	}
-	ctx, span := s.AnnotateCtxWithSpan(context.Background(), "usageReport")
+	ctx, span := s.AnnotateCtxWithSpan(ctx, "usageReport")
 	defer span.Finish()
 
 	b, err := protoutil.Marshal(s.getReportingInfo(ctx))

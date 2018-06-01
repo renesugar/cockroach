@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -89,9 +90,9 @@ func TestSideloadingSideloadedStorage(t *testing.T) {
 	})
 	t.Run("Disk", func(t *testing.T) {
 		maker := func(
-			s *cluster.Settings, rangeID roachpb.RangeID, rep roachpb.ReplicaID, name string,
+			s *cluster.Settings, rangeID roachpb.RangeID, rep roachpb.ReplicaID, name string, eng engine.Engine,
 		) (sideloadStorage, error) {
-			return newDiskSideloadStorage(s, rangeID, rep, name, rate.NewLimiter(rate.Inf, math.MaxInt64))
+			return newDiskSideloadStorage(s, rangeID, rep, name, rate.NewLimiter(rate.Inf, math.MaxInt64), eng)
 		}
 		testSideloadingSideloadedStorage(t, maker)
 	})
@@ -99,7 +100,7 @@ func TestSideloadingSideloadedStorage(t *testing.T) {
 
 func testSideloadingSideloadedStorage(
 	t *testing.T,
-	maker func(*cluster.Settings, roachpb.RangeID, roachpb.ReplicaID, string) (sideloadStorage, error),
+	maker func(*cluster.Settings, roachpb.RangeID, roachpb.ReplicaID, string, engine.Engine) (sideloadStorage, error),
 ) {
 	dir, cleanup := testutils.TempDir(t)
 	defer cleanup()
@@ -107,7 +108,12 @@ func testSideloadingSideloadedStorage(
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 
-	ss, err := maker(st, 1, 2, dir)
+	cleanup, cache, eng := newRocksDB(t)
+	defer cleanup()
+	defer cache.Release()
+	defer eng.Close()
+
+	ss, err := maker(st, 1, 2, dir, eng)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +139,7 @@ func testSideloadingSideloadedStorage(
 		return []byte("content-" + strconv.Itoa(int(i)))
 	}
 
-	if err := ss.PutIfNotExists(ctx, 1, highTerm, file(1)); err != nil {
+	if err := ss.Put(ctx, 1, highTerm, file(1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,15 +151,15 @@ func testSideloadingSideloadedStorage(
 		t.Fatalf("got %q, wanted %q", c, exp)
 	}
 
-	// Should be a no-op because the slot is occupied.
-	if err := ss.PutIfNotExists(ctx, 1, highTerm, file(12345)); err != nil {
+	// Overwrites the occupied slot.
+	if err := ss.Put(ctx, 1, highTerm, file(12345)); err != nil {
 		t.Fatal(err)
 	}
 
-	// ... consequently the old entry is still there.
+	// ... consequently the old entry is gone.
 	if c, err := ss.Get(ctx, 1, highTerm); err != nil {
 		t.Fatal(err)
-	} else if exp := file(1); !bytes.Equal(c, exp) {
+	} else if exp := file(12345); !bytes.Equal(c, exp) {
 		t.Fatalf("got %q, wanted %q", c, exp)
 	}
 
@@ -203,12 +209,12 @@ func testSideloadingSideloadedStorage(
 		assertCreated(false)
 	}
 
-	// Write some payloads at various indexes. Note that this tests PutIfNotExists
+	// Write some payloads at various indexes. Note that this tests Put
 	// on a recently Clear()ed storage. Randomize order for fun.
 	payloads := []uint64{3, 5, 7, 9, 10}
 	for n := range rand.Perm(len(payloads)) {
 		i := payloads[n]
-		if err := ss.PutIfNotExists(ctx, i, highTerm, file(i*highTerm)); err != nil {
+		if err := ss.Put(ctx, i, highTerm, file(i*highTerm)); err != nil {
 			t.Fatalf("%d: %s", i, err)
 		}
 	}
@@ -218,13 +224,13 @@ func testSideloadingSideloadedStorage(
 	// Write some more payloads, overlapping, at the past term.
 	pastPayloads := append([]uint64{81}, payloads...)
 	for _, i := range pastPayloads {
-		if err := ss.PutIfNotExists(ctx, i, lowTerm, file(i*lowTerm)); err != nil {
+		if err := ss.Put(ctx, i, lowTerm, file(i*lowTerm)); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// Verify a sideloaded storage for another ReplicaID doesn't see the files.
-	if otherSS, err := maker(st, 1, 999 /* ReplicaID */, dir); err != nil {
+	if otherSS, err := maker(st, 1, 999 /* ReplicaID */, dir, eng); err != nil {
 		t.Fatal(err)
 	} else if _, err = otherSS.Get(ctx, payloads[0], highTerm); err != errSideloadedFileNotFound {
 		t.Fatal("expected not found")
@@ -234,7 +240,7 @@ func testSideloadingSideloadedStorage(
 	// one), which shouldn't change anything about its state.
 	if !isInMem {
 		var err error
-		ss, err = maker(st, 1, 2, dir)
+		ss, err = maker(st, 1, 2, dir, eng)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -317,7 +323,7 @@ func testSideloadingSideloadedStorage(
 		payloads := []uint64{3, 5, 7, 9, 10}
 		for n := range rand.Perm(len(payloads)) {
 			i := payloads[n]
-			if err := ss.PutIfNotExists(ctx, i, highTerm, file(i*highTerm)); err != nil {
+			if err := ss.Put(ctx, i, highTerm, file(i*highTerm)); err != nil {
 				t.Fatalf("%d: %s", i, err)
 			}
 		}
@@ -378,7 +384,7 @@ func TestRaftSSTableSideloadingInline(t *testing.T) {
 	}
 
 	putOnDisk := func(ec *raftEntryCache, ss sideloadStorage) {
-		if err := ss.PutIfNotExists(context.Background(), 5, 6, sstFat.Data); err != nil {
+		if err := ss.Put(context.Background(), 5, 6, sstFat.Data); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -708,6 +714,19 @@ func (mr *mockSender) Recv() (*SnapshotResponse, error) {
 	return &SnapshotResponse{Status: status}, nil
 }
 
+func newRocksDB(t *testing.T) (func(), engine.RocksDBCache, *engine.RocksDB) {
+	dir, cleanup := testutils.TempDir(t)
+	cache := engine.NewRocksDBCache(1 << 20)
+	eng, err := engine.NewRocksDB(engine.RocksDBConfig{
+		Dir:       dir,
+		MustExist: false,
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cleanup, cache, eng
+}
+
 // This test verifies that when a snapshot is sent, sideloaded proposals are
 // inlined.
 func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
@@ -718,6 +737,13 @@ func TestRaftSSTableSideloadingSnapshot(t *testing.T) {
 	tc := testContext{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
+
+	cleanup, cache, eng := newRocksDB(t)
+	tc.engine = eng
+	defer cleanup()
+	defer cache.Release()
+	defer eng.Close()
+
 	tc.Start(t, stopper)
 
 	var ba roachpb.BatchRequest
@@ -968,6 +994,13 @@ func TestRaftSSTableSideloadingUpdatedReplicaID(t *testing.T) {
 	tc := testContext{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
+
+	cleanup, cache, eng := newRocksDB(t)
+	tc.engine = eng
+	defer cleanup()
+	defer cache.Release()
+	defer eng.Close()
+
 	tc.Start(t, stopper)
 	repl := tc.repl
 	ctx := context.Background()
@@ -981,7 +1014,7 @@ func TestRaftSSTableSideloadingUpdatedReplicaID(t *testing.T) {
 
 	repl.raftMu.Lock()
 	oldDir := repl.raftMu.sideloaded.Dir()
-	err := repl.raftMu.sideloaded.PutIfNotExists(ctx, index, term, val)
+	err := repl.raftMu.sideloaded.Put(ctx, index, term, val)
 	repl.raftMu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -1004,6 +1037,7 @@ func TestRaftSSTableSideloadingUpdatedReplicaID(t *testing.T) {
 	_, err = repl.raftMu.sideloaded.Get(ctx, index, term)
 	repl.raftMu.Unlock()
 
+	log.Infof(ctx, "olddir is %s, newdir is %s", oldDir, newDir)
 	if err != nil {
 		t.Fatal(err)
 	}

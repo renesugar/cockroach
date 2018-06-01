@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -31,6 +32,10 @@ import (
 func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (planNode, error) {
 	if n.Name == "" || n.NewName == "" {
 		return nil, errEmptyDatabaseName
+	}
+
+	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
+		return nil, pgerror.NewDangerousStatementErrorf("RENAME DATABASE on current database")
 	}
 
 	if err := p.RequireSuperUser(ctx, "ALTER DATABASE ... RENAME"); err != nil {
@@ -74,7 +79,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 	lookupFlags.required = false
 	for i := range tbNames {
 		tbDesc, _, err := phyAccessor.GetObjectDesc(&tbNames[i],
-			ObjectLookupFlags{CommonLookupFlags: lookupFlags, allowAdding: true})
+			ObjectLookupFlags{CommonLookupFlags: lookupFlags})
 		if err != nil {
 			return nil, err
 		}

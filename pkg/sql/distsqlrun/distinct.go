@@ -15,19 +15,19 @@
 package distsqlrun
 
 import (
+	"context"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stringarena"
+	"github.com/pkg/errors"
 )
 
 type distinct struct {
 	processorBase
 
-	evalCtx      *tree.EvalContext
 	input        RowSource
 	types        []sqlbase.ColumnType
 	lastGroupKey sqlbase.EncDatumRow
@@ -40,36 +40,108 @@ type distinct struct {
 	scratch      []byte
 }
 
+// sortedDistinct is a specialized distinct that can be used when all of the
+// distinct columns are also ordered.
+type sortedDistinct struct {
+	distinct
+}
+
 var _ Processor = &distinct{}
 var _ RowSource = &distinct{}
 
+const distinctProcName = "distinct"
+
+var _ Processor = &sortedDistinct{}
+var _ RowSource = &sortedDistinct{}
+
+const sortedDistinctProcName = "sorted distinct"
+
 func newDistinct(
-	flowCtx *FlowCtx, spec *DistinctSpec, input RowSource, post *PostProcessSpec, output RowReceiver,
-) (*distinct, error) {
-	d := &distinct{
-		input:       input,
-		orderedCols: spec.OrderedColumns,
-		memAcc:      flowCtx.EvalCtx.Mon.MakeBoundAccount(),
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *DistinctSpec,
+	input RowSource,
+	post *PostProcessSpec,
+	output RowReceiver,
+) (Processor, error) {
+	if len(spec.DistinctColumns) == 0 {
+		return nil, errors.New("programming error: 0 distinct columns specified for distinct processor")
 	}
 
+	var distinctCols, orderedCols util.FastIntSet
+	allSorted := true
+
+	for _, col := range spec.OrderedColumns {
+		orderedCols.Add(int(col))
+	}
 	for _, col := range spec.DistinctColumns {
-		d.distinctCols.Add(int(col))
+		if !orderedCols.Contains(int(col)) {
+			allSorted = false
+		}
+		distinctCols.Add(int(col))
 	}
 
-	d.types = input.OutputTypes()
-	if err := d.init(post, d.types, flowCtx, nil /* evalCtx */, output); err != nil {
+	d := &distinct{
+		input:        input,
+		orderedCols:  spec.OrderedColumns,
+		distinctCols: distinctCols,
+		memAcc:       flowCtx.EvalCtx.Mon.MakeBoundAccount(),
+		types:        input.OutputTypes(),
+	}
+
+	if err := d.init(
+		post, d.types, flowCtx, processorID, output,
+		procStateOpts{
+			inputsToDrain: []RowSource{d.input},
+			trailingMetaCallback: func() []ProducerMetadata {
+				d.close()
+				return nil
+			},
+		}); err != nil {
 		return nil, err
+	}
+
+	if allSorted {
+		// We can use the faster sortedDistinct processor.
+		return &sortedDistinct{
+			distinct: *d,
+		}, nil
 	}
 
 	return d, nil
 }
 
+// Start is part of the RowSource interface.
+func (d *distinct) Start(ctx context.Context) context.Context {
+	d.input.Start(ctx)
+	return d.startInternal(ctx, distinctProcName)
+}
+
 // Run is part of the processor interface.
-func (d *distinct) Run(wg *sync.WaitGroup) {
+func (d *distinct) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if d.out.output == nil {
 		panic("distinct output not initialized for emitting rows")
 	}
-	Run(d.flowCtx.Ctx, d, d.out.output)
+	ctx = d.Start(ctx)
+	Run(ctx, d, d.out.output)
+	if wg != nil {
+		wg.Done()
+	}
+}
+
+// Start is part of the RowSource interface.
+func (d *sortedDistinct) Start(ctx context.Context) context.Context {
+	d.input.Start(ctx)
+	return d.startInternal(ctx, sortedDistinctProcName)
+}
+
+// Run is part of the processor interface.
+func (d *sortedDistinct) Run(ctx context.Context, wg *sync.WaitGroup) {
+	if d.out.output == nil {
+		panic("distinct output not initialized for emitting rows")
+	}
+	ctx = d.Start(ctx)
+	Run(ctx, d, d.out.output)
 	if wg != nil {
 		wg.Done()
 	}
@@ -118,51 +190,21 @@ func (d *distinct) encode(appendTo []byte, row sqlbase.EncDatumRow) ([]byte, err
 }
 
 func (d *distinct) close() {
-	if !d.closed {
-		// Need to close the mem accounting while the context is still valid.
-		d.memAcc.Close(d.ctx)
-	}
-	if d.internalClose() {
-		d.input.ConsumerClosed()
-	}
-}
-
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (d *distinct) producerMeta(err error) *ProducerMetadata {
-	var meta *ProducerMetadata
-	if !d.closed {
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-		} else if trace := getTraceData(d.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		// We need to close as soon as we send producer metadata as we're done
-		// sending rows. The consumer is allowed to not call ConsumerDone().
-		d.close()
-	}
-	return meta
+	// Need to close the mem accounting while the context is still valid.
+	d.memAcc.Close(d.ctx)
+	d.internalClose()
 }
 
 // Next is part of the RowSource interface.
 func (d *distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if d.maybeStart("distinct", "Distinct") {
-		d.evalCtx = d.flowCtx.NewEvalCtx()
-	}
-
-	if d.closed {
-		return nil, d.producerMeta(nil /* err */)
-	}
-
-	for {
+	for d.state == stateRunning {
 		row, meta := d.input.Next()
-		if d.closed || meta != nil {
+		if meta != nil {
 			return nil, meta
 		}
 		if row == nil {
-			return nil, d.producerMeta(nil /* err */)
+			d.moveToDraining(nil /* err */)
+			break
 		}
 
 		// If we are processing DISTINCT(x, y) and the input stream is ordered
@@ -171,7 +213,8 @@ func (d *distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		// the row is the key we use in our 'seen' set.
 		encoding, err := d.encode(d.scratch, row)
 		if err != nil {
-			return nil, d.producerMeta(err)
+			d.moveToDraining(err)
+			break
 		}
 		d.scratch = encoding[:0]
 
@@ -179,13 +222,20 @@ func (d *distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 		// group key thus avoiding the need to store encodings of all rows.
 		matched, err := d.matchLastGroupKey(row)
 		if err != nil {
-			return nil, d.producerMeta(err)
+			d.moveToDraining(err)
+			break
 		}
 
 		if !matched {
+			// Since the sorted distinct columns have changed, we know that all the
+			// distinct keys in the 'seen' set will never be seen again. This allows
+			// us to keep the current arena block and overwrite strings previously
+			// allocated on it, which implies that UnsafeReset() is safe to call here.
 			d.lastGroupKey = row
-			d.memAcc.Clear(d.ctx)
-			d.arena = stringarena.Make(&d.memAcc)
+			if err := d.arena.UnsafeReset(d.ctx); err != nil {
+				d.moveToDraining(err)
+				break
+			}
 			d.seen = make(map[string]struct{})
 		}
 
@@ -195,27 +245,49 @@ func (d *distinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 			}
 			s, err := d.arena.AllocBytes(d.ctx, encoding)
 			if err != nil {
-				return nil, d.producerMeta(err)
+				d.moveToDraining(err)
+				break
 			}
 			d.seen[s] = struct{}{}
 		}
 
-		outRow, status, err := d.out.ProcessRow(d.ctx, row)
-		if err != nil {
-			return nil, d.producerMeta(err)
+		if outRow := d.processRowHelper(row); outRow != nil {
+			return outRow, nil
 		}
-		switch status {
-		case NeedMoreRows:
-			if outRow == nil && err == nil {
-				continue
-			}
-		case DrainRequested:
-			d.input.ConsumerDone()
+	}
+	return nil, d.drainHelper()
+}
+
+// Next is part of the RowSource interface.
+//
+// sortedDistinct is simpler than distinct. All it has to do is keep track
+// of the last row it saw, emitting if the new row is different.
+func (d *sortedDistinct) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
+	for d.state == stateRunning {
+		row, meta := d.input.Next()
+		if meta != nil {
+			return nil, meta
+		}
+		if row == nil {
+			d.moveToDraining(nil /* err */)
+			break
+		}
+		matched, err := d.matchLastGroupKey(row)
+		if err != nil {
+			d.moveToDraining(err)
+			break
+		}
+		if matched {
 			continue
 		}
 
-		return outRow, nil
+		d.lastGroupKey = row
+
+		if outRow := d.processRowHelper(row); outRow != nil {
+			return outRow, nil
+		}
 	}
+	return nil, d.drainHelper()
 }
 
 // ConsumerDone is part of the RowSource interface.

@@ -1,4 +1,5 @@
 import React from "react";
+import { Helmet } from "react-helmet";
 import { Link } from "react-router";
 import _ from "lodash";
 import { connect } from "react-redux";
@@ -33,13 +34,7 @@ export interface SimplifiedEvent {
   content: React.ReactNode;
 }
 
-// Specialization of generic SortedTable component:
-//   https://github.com/Microsoft/TypeScript/issues/3960
-//
-// The variable name must start with a capital letter or JSX will not recognize
-// it as a component.
-// tslint:disable-next-line:variable-name
-const EventSortedTable = SortedTable as new () => SortedTable<SimplifiedEvent>;
+class EventSortedTable extends SortedTable<SimplifiedEvent> {}
 
 export interface EventRowProps {
   event: Event$Properties;
@@ -130,15 +125,11 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
     const simplifiedEvents = _.map(events, getEventInfo);
 
     return <div>
-      {
-        // TODO(mrtracy): This currently always links back to the main cluster
-        // page, when it should link back to the dashboard previously visible.
-      }
-      <section className="section parent-link">
-        <Link to="/">&lt; Back to Cluster</Link>
-      </section>
+      <Helmet>
+        <title>Events</title>
+      </Helmet>
       <section className="section section--heading">
-        <h2>Events</h2>
+        <h1>Events</h1>
       </section>
       <section className="section l-columns">
         <div className="l-columns__left events-table">

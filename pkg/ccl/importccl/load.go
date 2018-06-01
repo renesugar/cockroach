@@ -286,6 +286,10 @@ func insertStmtToKVs(
 	}
 
 	b := inserter(f)
+	computedIVarContainer := sqlbase.RowIndexedVarContainer{
+		Mapping: ri.InsertColIDtoRowIndex,
+		Cols:    tableDesc.Columns,
+	}
 	for _, tuple := range values.Tuples {
 		row := make([]tree.Datum, len(tuple.Exprs))
 		for i, expr := range tuple.Exprs {
@@ -309,7 +313,7 @@ func insertStmtToKVs(
 		var computedCols []sqlbase.ColumnDescriptor
 
 		row, err := sql.GenerateInsertRow(
-			defaultExprs, computeExprs, ri.InsertColIDtoRowIndex, cols, computedCols, evalCtx, tableDesc, row,
+			defaultExprs, computeExprs, cols, computedCols, evalCtx, tableDesc, row, &computedIVarContainer,
 		)
 		if err != nil {
 			return errors.Wrapf(err, "process insert %q", row)
@@ -326,6 +330,10 @@ func insertStmtToKVs(
 type inserter func(roachpb.KeyValue)
 
 func (i inserter) CPut(key, value, expValue interface{}) {
+	panic("unimplemented")
+}
+
+func (i inserter) Del(key ...interface{}) {
 	panic("unimplemented")
 }
 

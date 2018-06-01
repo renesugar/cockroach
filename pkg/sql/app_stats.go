@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 )
 
@@ -171,8 +173,9 @@ type sqlStats struct {
 	st *cluster.Settings
 	syncutil.Mutex
 
-	// apps is the container for all the per-application statistics
-	// objects.
+	// lastReset is the time at which the app containers were reset.
+	lastReset time.Time
+	// apps is the container for all the per-application statistics objects.
 	apps map[string]*appStats
 }
 
@@ -223,6 +226,7 @@ func (s *sqlStats) resetStats(ctx context.Context) {
 		a.stmts = make(map[stmtKey]*stmtStats, len(a.stmts)/2)
 		a.Unlock()
 	}
+	s.lastReset = timeutil.Now()
 	s.Unlock()
 }
 
@@ -276,13 +280,6 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 		})
 	f.FormatNode(stmt)
 	return f.CloseAndGetString(), true
-}
-
-// GetScrubbedStmtStats returns the statement statistics by app, with the
-// queries scrubbed of their identifiers. Any statements which cannot be
-// scrubbed will be omitted from the returned map.
-func (e *Executor) GetScrubbedStmtStats() []roachpb.CollectedStatementStatistics {
-	return e.sqlStats.getScrubbedStmtStats(e.cfg.VirtualSchemas)
 }
 
 func (s *sqlStats) getScrubbedStmtStats(
@@ -342,30 +339,4 @@ func HashForReporting(secret, appName string) string {
 		panic(errors.Wrap(err, `"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
 	return hex.EncodeToString(hash.Sum(nil)[:4])
-}
-
-// ResetStatementStats resets the executor's collected statement statistics.
-func (e *Executor) ResetStatementStats(ctx context.Context) {
-	e.sqlStats.resetStats(ctx)
-}
-
-// FillErrorCounts fills the passed map with the executor's current
-// counts of how often individual unimplemented features have been encountered.
-func (e *Executor) FillErrorCounts(codes, unimplemented map[string]int64) {
-	e.errorCounts.Lock()
-	for k, v := range e.errorCounts.codes {
-		codes[k] = v
-	}
-	for k, v := range e.errorCounts.unimplemented {
-		unimplemented[k] = v
-	}
-	e.errorCounts.Unlock()
-}
-
-// ResetErrorCounts resets counts of errors returned.
-func (e *Executor) ResetErrorCounts() {
-	e.errorCounts.Lock()
-	e.errorCounts.codes = make(map[string]int64, len(e.errorCounts.codes))
-	e.errorCounts.unimplemented = make(map[string]int64, len(e.errorCounts.unimplemented))
-	e.errorCounts.Unlock()
 }

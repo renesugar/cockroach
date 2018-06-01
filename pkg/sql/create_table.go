@@ -55,7 +55,7 @@ func (p *planner) CreateTable(ctx context.Context, n *tree.CreateTable) (planNod
 	}
 
 	var dbDesc *DatabaseDescriptor
-	p.runWithOptions(resolveFlags{skipCache: true, allowAdding: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		dbDesc, err = ResolveTargetObject(ctx, p, tn)
 	})
 	if err != nil {
@@ -152,10 +152,32 @@ func (n *createTableNode) startExec(params runParams) error {
 	// We need to validate again after adding the FKs.
 	// Only validate the table because backreferences aren't created yet.
 	// Everything is validated below.
-	if err := desc.ValidateTable(); err != nil {
+	if err := desc.ValidateTable(params.EvalContext().Settings); err != nil {
 		return err
 	}
 
+	if desc.Adding() {
+		// if this table and all its references are created in the same
+		// transaction it can be made PUBLIC.
+		refs, err := desc.FindAllReferences()
+		if err != nil {
+			return err
+		}
+		var foundExternalReference bool
+		for id := range refs {
+			if !params.p.Tables().isCreatedTable(id) {
+				foundExternalReference = true
+				break
+			}
+		}
+		if !foundExternalReference {
+			desc.State = sqlbase.TableDescriptor_PUBLIC
+			// No need to increment the version.
+			desc.UpVersion = false
+		}
+	}
+
+	// Descriptor written to store here.
 	if err := params.p.createDescriptorWithID(params.ctx, key, id, &desc); err != nil {
 		return err
 	}
@@ -169,6 +191,8 @@ func (n *createTableNode) startExec(params runParams) error {
 		params.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
 	}
 
+	params.p.Tables().addCreatedTable(id)
+
 	for _, index := range desc.AllNonDropIndexes() {
 		if len(index.Interleave.Ancestors) > 0 {
 			if err := params.p.finalizeInterleave(params.ctx, &desc, index); err != nil {
@@ -177,7 +201,7 @@ func (n *createTableNode) startExec(params runParams) error {
 		}
 	}
 
-	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn, params.EvalContext().Settings); err != nil {
 		return err
 	}
 
@@ -607,6 +631,26 @@ func resolveFK(
 	} else {
 		target.PrimaryIndex.ReferencedBy = append(target.PrimaryIndex.ReferencedBy, backref)
 	}
+
+	// Multiple FKs from the same column would potentially result in ambiguous or
+	// unexpected behavior with conflicting CASCADE/RESTRICT/etc behaviors.
+	colsInFKs := make(map[sqlbase.ColumnID]struct{})
+	for _, idx := range tbl.Indexes {
+		if idx.ForeignKey.IsSet() {
+			numCols := len(idx.ColumnIDs)
+			if idx.ForeignKey.SharedPrefixLen > 0 {
+				numCols = int(idx.ForeignKey.SharedPrefixLen)
+			}
+			for i := 0; i < numCols; i++ {
+				if _, ok := colsInFKs[idx.ColumnIDs[i]]; ok {
+					return pgerror.NewErrorf(pgerror.CodeInvalidForeignKeyError,
+						"column %q cannot be used by multiple foreign key constraints", idx.ColumnNames[i])
+				}
+				colsInFKs[idx.ColumnIDs[i]] = struct{}{}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -666,7 +710,7 @@ func (p *planner) saveNonmutationAndNotify(ctx context.Context, td *sqlbase.Tabl
 	if err := td.SetUpVersion(); err != nil {
 		return err
 	}
-	if err := td.ValidateTable(); err != nil {
+	if err := td.ValidateTable(p.EvalContext().Settings); err != nil {
 		return err
 	}
 	if err := p.writeTableDesc(ctx, td); err != nil {
@@ -1226,25 +1270,6 @@ func MakeTableDesc(
 		}
 	}
 
-	// Multiple FKs from the same column would potentially result in ambiguous or
-	// unexpected behavior with conflicting CASCADE/RESTRICT/etc behaviors.
-	colsInFKs := make(map[sqlbase.ColumnID]struct{})
-	for _, idx := range desc.Indexes {
-		if idx.ForeignKey.IsSet() {
-			numCols := len(idx.ColumnIDs)
-			if idx.ForeignKey.SharedPrefixLen > 0 {
-				numCols = int(idx.ForeignKey.SharedPrefixLen)
-			}
-			for i := 0; i < numCols; i++ {
-				if _, ok := colsInFKs[idx.ColumnIDs[i]]; ok {
-					return desc, fmt.Errorf(
-						"column %q cannot be used by multiple foreign key constraints", idx.ColumnNames[i])
-				}
-				colsInFKs[idx.ColumnIDs[i]] = struct{}{}
-			}
-		}
-	}
-
 	// AllocateIDs mutates its receiver. `return desc, desc.AllocateIDs()`
 	// happens to work in gc, but does not work in gccgo.
 	//
@@ -1266,7 +1291,7 @@ func (p *planner) makeTableDesc(
 	// it needs to pull in descriptors from FK depended-on tables
 	// and interleaved parents using their current state in KV.
 	// See the comment at the start of MakeTableDesc() and resolveFK().
-	p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		ret, err = MakeTableDesc(
 			ctx,
 			p.txn,

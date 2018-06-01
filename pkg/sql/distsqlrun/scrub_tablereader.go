@@ -16,6 +16,7 @@ package distsqlrun
 
 import (
 	"bytes"
+	"context"
 
 	"sync"
 
@@ -55,13 +56,26 @@ type scrubTableReader struct {
 	indexIdx int
 }
 
+var _ Processor = &scrubTableReader{}
+var _ RowSource = &scrubTableReader{}
+
+var scrubTableReaderProcName = "scrub"
+
 // newScrubTableReader creates a scrubTableReader.
 func newScrubTableReader(
-	flowCtx *FlowCtx, spec *TableReaderSpec, post *PostProcessSpec, output RowReceiver,
+	flowCtx *FlowCtx,
+	processorID int32,
+	spec *TableReaderSpec,
+	post *PostProcessSpec,
+	output RowReceiver,
 ) (*scrubTableReader, error) {
 	if flowCtx.nodeID == 0 {
 		return nil, errors.Errorf("attempting to create a tableReader with uninitialized NodeID")
 	}
+	if flowCtx.txn == nil {
+		return nil, errors.Errorf("scrubTableReader outside of txn")
+	}
+
 	tr := &scrubTableReader{
 		indexIdx: int(spec.IndexIdx),
 	}
@@ -69,7 +83,21 @@ func newScrubTableReader(
 	tr.tableDesc = spec.Table
 	tr.limitHint = limitHint(spec.LimitHint, post)
 
-	if err := tr.init(post, ScrubTypes, flowCtx, nil /* evalCtx */, output); err != nil {
+	if err := tr.init(
+		post,
+		ScrubTypes,
+		flowCtx,
+		processorID,
+		output,
+		procStateOpts{
+			// We don't pass tr.input as an inputToDrain; tr.input is just an adapter
+			// on top of a RowFetcher; draining doesn't apply to it. Moreover, Andrei
+			// doesn't trust that the adapter will do the right thing on a Next() call
+			// after it had previously returned an error.
+			inputsToDrain:        nil,
+			trailingMetaCallback: tr.generateTrailingMeta,
+		},
+	); err != nil {
 		return nil, err
 	}
 
@@ -84,24 +112,18 @@ func newScrubTableReader(
 			tr.fetcherResultToColIdx = append(tr.fetcherResultToColIdx, i)
 		}
 	} else {
-		colIDToIdx := make(map[sqlbase.ColumnID]int, len(spec.Table.Columns))
-		for i := range spec.Table.Columns {
-			colIDToIdx[spec.Table.Columns[i].ID] = i
-
-		}
-		for _, id := range spec.Table.Indexes[spec.IndexIdx-1].ColumnIDs {
-			neededColumns.Add(colIDToIdx[id])
-		}
-		for _, id := range spec.Table.Indexes[spec.IndexIdx-1].ExtraColumnIDs {
-			neededColumns.Add(colIDToIdx[id])
-		}
-		for _, id := range spec.Table.Indexes[spec.IndexIdx-1].StoreColumnIDs {
-			neededColumns.Add(colIDToIdx[id])
+		colIdxMap := spec.Table.ColumnIdxMap()
+		err := spec.Table.Indexes[spec.IndexIdx-1].RunOverAllColumns(func(id sqlbase.ColumnID) error {
+			neededColumns.Add(colIdxMap[id])
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	if _, _, err := initRowFetcher(
-		&tr.fetcher, &tr.tableDesc, int(spec.IndexIdx), spec.Reverse,
+		&tr.fetcher, &tr.tableDesc, int(spec.IndexIdx), tr.tableDesc.ColumnIdxMap(), spec.Reverse,
 		neededColumns, true /* isCheck */, &tr.alloc,
 	); err != nil {
 		return nil, err
@@ -186,39 +208,37 @@ func (tr *scrubTableReader) prettyPrimaryKeyValues(
 }
 
 // Run is part of the processor interface.
-func (tr *scrubTableReader) Run(wg *sync.WaitGroup) {
+func (tr *scrubTableReader) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if tr.out.output == nil {
 		panic("scrubTableReader output not initialized for emitting rows")
 	}
-	Run(tr.flowCtx.Ctx, tr, tr.out.output)
+	ctx = tr.Start(ctx)
+	Run(ctx, tr, tr.out.output)
 	if wg != nil {
 		wg.Done()
 	}
 }
 
+// Start is part of the RowSource interface.
+func (tr *scrubTableReader) Start(ctx context.Context) context.Context {
+	ctx = tr.startInternal(ctx, scrubTableReaderProcName)
+
+	log.VEventf(ctx, 1, "starting")
+
+	// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
+	if err := tr.fetcher.StartScan(
+		ctx, tr.flowCtx.txn, tr.spans,
+		true /* limit batches */, tr.limitHint, false, /* traceKV */
+	); err != nil {
+		tr.moveToDraining(err)
+	}
+
+	return ctx
+}
+
 // Next is part of the RowSource interface.
 func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if tr.maybeStart("scrub table reader", "ScrubTableReader") {
-		if tr.flowCtx.txn == nil {
-			log.Fatalf(tr.ctx, "scrubTableReader outside of txn")
-		}
-		log.VEventf(tr.ctx, 1, "starting")
-
-		// TODO(radu,andrei,knz): set the traceKV flag when requested by the session.
-		if err := tr.fetcher.StartScan(
-			tr.ctx, tr.flowCtx.txn, tr.spans,
-			true /* limit batches */, tr.limitHint, false, /* traceKV */
-		); err != nil {
-			log.Errorf(tr.ctx, "scan error: %s", err)
-			return nil, tr.producerMeta(err)
-		}
-	}
-
-	if tr.closed || tr.consumerStatus != NeedMoreRows {
-		return nil, tr.producerMeta(nil /* err */)
-	}
-
-	for {
+	for tr.state == stateRunning {
 		var row sqlbase.EncDatumRow
 		var err error
 		// If we are running a scrub physical check, we use a specialized
@@ -245,18 +265,13 @@ func (tr *scrubTableReader) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
 			continue
 		}
 		if row == nil || err != nil {
-			// This was the last-row or an error was encountered, annotate the
-			// metadata with misplanned ranges and trace data.
-			return nil, tr.producerMeta(scrub.UnwrapScrubError(err))
+			tr.moveToDraining(scrub.UnwrapScrubError(err))
+			break
 		}
 
-		outRow, status, err := tr.out.ProcessRow(tr.ctx, row)
-		if outRow != nil {
+		if outRow := tr.processRowHelper(row); outRow != nil {
 			return outRow, nil
 		}
-		if outRow == nil && err == nil && status == NeedMoreRows {
-			continue
-		}
-		return nil, tr.producerMeta(err)
 	}
+	return nil, tr.drainHelper()
 }

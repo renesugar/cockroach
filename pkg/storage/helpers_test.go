@@ -152,6 +152,12 @@ func (s *Store) ReplicateQueuePurgatoryLength() int {
 	return s.replicateQueue.PurgatoryLength()
 }
 
+// SplitQueuePurgatoryLength returns the number of replicas in split
+// queue purgatory.
+func (s *Store) SplitQueuePurgatoryLength() int {
+	return s.splitQueue.PurgatoryLength()
+}
+
 // SetRaftLogQueueActive enables or disables the raft log queue.
 func (s *Store) SetRaftLogQueueActive(active bool) {
 	s.setRaftLogQueueActive(active)
@@ -382,7 +388,7 @@ const (
 func (r *Replica) PutBogusSideloadedData() {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	if err := r.raftMu.sideloaded.PutIfNotExists(context.Background(), sideloadBogusIndex, sideloadBogusTerm, []byte("bogus")); err != nil {
+	if err := r.raftMu.sideloaded.Put(context.Background(), sideloadBogusIndex, sideloadBogusTerm, []byte("bogus")); err != nil {
 		panic(err)
 	}
 }

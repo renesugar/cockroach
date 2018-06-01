@@ -15,13 +15,12 @@
 package distsqlrun
 
 import (
+	"context"
 	"errors"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // mergeJoiner performs merge join, it has two input row sources with the same
@@ -31,7 +30,6 @@ import (
 type mergeJoiner struct {
 	joinerBase
 
-	evalCtx       *tree.EvalContext
 	cancelChecker *sqlbase.CancelChecker
 
 	leftSource, rightSource RowSource
@@ -47,8 +45,11 @@ type mergeJoiner struct {
 var _ Processor = &mergeJoiner{}
 var _ RowSource = &mergeJoiner{}
 
+const mergeJoinerProcName = "merge joiner"
+
 func newMergeJoiner(
 	flowCtx *FlowCtx,
+	processorID int32,
 	spec *MergeJoinerSpec,
 	leftSource RowSource,
 	rightSource RowSource,
@@ -70,13 +71,17 @@ func newMergeJoiner(
 		rightSource: rightSource,
 	}
 
-	err := m.joinerBase.init(flowCtx,
-		leftSource.OutputTypes(), rightSource.OutputTypes(),
-		spec.Type, spec.OnExpr, leftEqCols, rightEqCols, 0, post, output)
-	if err != nil {
+	if err := m.joinerBase.init(
+		flowCtx, processorID, leftSource.OutputTypes(), rightSource.OutputTypes(),
+		spec.Type, spec.OnExpr, leftEqCols, rightEqCols, 0, post, output,
+		procStateOpts{
+			inputsToDrain: []RowSource{leftSource, rightSource},
+		},
+	); err != nil {
 		return nil, err
 	}
 
+	var err error
 	m.streamMerger, err = makeStreamMerger(
 		leftSource,
 		convertToColumnOrdering(spec.LeftOrdering),
@@ -91,82 +96,46 @@ func newMergeJoiner(
 	return m, nil
 }
 
-// Run is part of the processor interface.
-func (m *mergeJoiner) Run(wg *sync.WaitGroup) {
+// Run is part of the Processor interface.
+func (m *mergeJoiner) Run(ctx context.Context, wg *sync.WaitGroup) {
 	if m.out.output == nil {
 		panic("mergeJoiner output not initialized for emitting rows")
 	}
-	Run(m.flowCtx.Ctx, m, m.out.output)
+	ctx = m.Start(ctx)
+	Run(ctx, m, m.out.output)
 	if wg != nil {
 		wg.Done()
 	}
 }
 
-func (m *mergeJoiner) close() {
-	if !m.closed {
-		log.VEventf(m.ctx, 2, "exiting merge joiner run")
-	}
-	if m.internalClose() {
-		m.leftSource.ConsumerClosed()
-		m.rightSource.ConsumerClosed()
-	}
+// Start is part of the RowSource interface.
+func (m *mergeJoiner) Start(ctx context.Context) context.Context {
+	m.streamMerger.start(ctx)
+	ctx = m.startInternal(ctx, mergeJoinerProcName)
+	m.cancelChecker = sqlbase.NewCancelChecker(ctx)
+	return ctx
 }
 
-// producerMeta constructs the ProducerMetadata after consumption of rows has
-// terminated, either due to being indicated by the consumer, or because the
-// processor ran out of rows or encountered an error. It is ok for err to be
-// nil indicating that we're done producing rows even though no error occurred.
-func (m *mergeJoiner) producerMeta(err error) *ProducerMetadata {
-	var meta *ProducerMetadata
-	if !m.closed {
-		if err != nil {
-			meta = &ProducerMetadata{Err: err}
-		} else if trace := getTraceData(m.ctx); trace != nil {
-			meta = &ProducerMetadata{TraceData: trace}
-		}
-		// We need to close as soon as we send producer metadata as we're done
-		// sending rows. The consumer is allowed to not call ConsumerDone().
-		m.close()
-	}
-	return meta
-}
-
+// Next is part of the Processor interface.
 func (m *mergeJoiner) Next() (sqlbase.EncDatumRow, *ProducerMetadata) {
-	if m.maybeStart("merge joiner", "MergeJoiner") {
-		m.evalCtx = m.flowCtx.NewEvalCtx()
-		m.cancelChecker = sqlbase.NewCancelChecker(m.ctx)
-		log.VEventf(m.ctx, 2, "starting merge joiner run")
-	}
-
-	if m.closed {
-		return nil, m.producerMeta(nil /* err */)
-	}
-
-	for {
+	for m.state == stateRunning {
 		row, meta := m.nextRow()
-		if m.closed || meta != nil {
+		if meta != nil {
+			if meta.Err != nil {
+				m.moveToDraining(nil /* err */)
+			}
 			return nil, meta
 		}
 		if row == nil {
-			return nil, m.producerMeta(nil /* err */)
+			m.moveToDraining(nil /* err */)
+			break
 		}
 
-		outRow, status, err := m.out.ProcessRow(m.ctx, row)
-		if err != nil {
-			return nil, m.producerMeta(err)
+		if outRow := m.processRowHelper(row); outRow != nil {
+			return outRow, nil
 		}
-		switch status {
-		case NeedMoreRows:
-			if outRow == nil && err == nil {
-				continue
-			}
-		case DrainRequested:
-			m.leftSource.ConsumerDone()
-			m.rightSource.ConsumerDone()
-			continue
-		}
-		return outRow, nil
 	}
+	return nil, m.drainHelper()
 }
 
 func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
@@ -268,12 +237,11 @@ func (m *mergeJoiner) nextRow() (sqlbase.EncDatumRow, *ProducerMetadata) {
 
 // ConsumerDone is part of the RowSource interface.
 func (m *mergeJoiner) ConsumerDone() {
-	m.leftSource.ConsumerDone()
-	m.rightSource.ConsumerDone()
+	m.moveToDraining(nil /* err */)
 }
 
 // ConsumerClosed is part of the RowSource interface.
 func (m *mergeJoiner) ConsumerClosed() {
 	// The consumer is done, Next() will not be called again.
-	m.close()
+	m.internalClose()
 }

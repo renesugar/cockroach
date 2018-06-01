@@ -1,0 +1,221 @@
+exec-ddl
+CREATE TABLE a (x INT PRIMARY KEY, y INT)
+----
+TABLE a
+ ├── x int not null
+ ├── y int
+ └── INDEX primary
+      └── x int not null
+
+exec-ddl
+CREATE TABLE b (x INT, z INT NOT NULL)
+----
+TABLE b
+ ├── x int
+ ├── z int not null
+ ├── rowid int not null (hidden)
+ └── INDEX primary
+      └── rowid int not null (hidden)
+
+exec-ddl
+ALTER TABLE a INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 5000,
+    "distinct_count": 5000
+  },
+  {
+    "columns": ["y"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 4000,
+    "distinct_count": 400
+  }
+]'
+----
+
+exec-ddl
+ALTER TABLE b INJECT STATISTICS '[
+  {
+    "columns": ["x"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 5000
+  },
+  {
+    "columns": ["z"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 100
+  },
+  {
+    "columns": ["rowid"],
+    "created_at": "2018-01-01 1:30:00.00000+00:00",
+    "row_count": 10000,
+    "distinct_count": 10000
+  }
+]'
+----
+
+# Distinct values calculation with constraints.
+build
+SELECT * FROM b WHERE x = 1 AND z = 2 AND rowid >= 5 AND rowid <= 8
+----
+project
+ ├── columns: x:1(int!null) z:2(int!null)
+ ├── stats: [rows=1]
+ └── select
+      ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
+      ├── stats: [rows=1, distinct(1)=1, distinct(2)=1, distinct(3)=1]
+      ├── keys: (3)
+      ├── scan b
+      │    ├── columns: x:1(int) z:2(int!null) rowid:3(int!null)
+      │    ├── stats: [rows=10000, distinct(1)=5000, distinct(2)=100, distinct(3)=10000]
+      │    └── keys: (3)
+      └── filters [type=bool, outer=(1-3), constraints=(/1: [/1 - /1]; /2: [/2 - /2]; /3: [/5 - /8]; tight)]
+           └── and [type=bool, outer=(1-3), constraints=(/1: [/1 - /1]; /2: [/2 - /2]; /3: [/5 - /8]; tight)]
+                ├── and [type=bool, outer=(1-3), constraints=(/1: [/1 - /1]; /2: [/2 - /2]; /3: [/5 - ]; tight)]
+                │    ├── and [type=bool, outer=(1,2), constraints=(/1: [/1 - /1]; /2: [/2 - /2]; tight)]
+                │    │    ├── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight)]
+                │    │    │    ├── variable: b.x [type=int, outer=(1)]
+                │    │    │    └── const: 1 [type=int]
+                │    │    └── eq [type=bool, outer=(2), constraints=(/2: [/2 - /2]; tight)]
+                │    │         ├── variable: b.z [type=int, outer=(2)]
+                │    │         └── const: 2 [type=int]
+                │    └── ge [type=bool, outer=(3), constraints=(/3: [/5 - ]; tight)]
+                │         ├── variable: b.rowid [type=int, outer=(3)]
+                │         └── const: 5 [type=int]
+                └── le [type=bool, outer=(3), constraints=(/3: (/NULL - /8]; tight)]
+                     ├── variable: b.rowid [type=int, outer=(3)]
+                     └── const: 8 [type=int]
+
+# Can't determine stats from filter.
+build
+SELECT * FROM a WHERE x + y < 10
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── stats: [rows=1333]
+ ├── keys: (1)
+ ├── scan a
+ │    ├── columns: x:1(int!null) y:2(int)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1)
+ └── filters [type=bool, outer=(1,2)]
+      └── lt [type=bool, outer=(1,2)]
+           ├── plus [type=int, outer=(1,2)]
+           │    ├── variable: a.x [type=int, outer=(1)]
+           │    └── variable: a.y [type=int, outer=(2)]
+           └── const: 10 [type=int]
+
+# Remaining filter.
+build
+SELECT * FROM a WHERE y = 5 AND x + y < 10
+----
+select
+ ├── columns: x:1(int!null) y:2(int!null)
+ ├── stats: [rows=10, distinct(2)=1]
+ ├── keys: (1)
+ ├── scan a
+ │    ├── columns: x:1(int!null) y:2(int)
+ │    ├── stats: [rows=4000, distinct(2)=400]
+ │    └── keys: (1)
+ └── filters [type=bool, outer=(1,2), constraints=(/2: [/5 - /5])]
+      └── and [type=bool, outer=(1,2), constraints=(/2: [/5 - /5])]
+           ├── eq [type=bool, outer=(2), constraints=(/2: [/5 - /5]; tight)]
+           │    ├── variable: a.y [type=int, outer=(2)]
+           │    └── const: 5 [type=int]
+           └── lt [type=bool, outer=(1,2)]
+                ├── plus [type=int, outer=(1,2)]
+                │    ├── variable: a.x [type=int, outer=(1)]
+                │    └── variable: a.y [type=int, outer=(2)]
+                └── const: 10 [type=int]
+
+# Contradiction.
+build
+SELECT * FROM a WHERE x > 5 AND x < 0
+----
+select
+ ├── columns: x:1(int!null) y:2(int)
+ ├── stats: [rows=0]
+ ├── keys: (1)
+ ├── scan a
+ │    ├── columns: x:1(int!null) y:2(int)
+ │    ├── stats: [rows=4000]
+ │    └── keys: (1)
+ └── filters [type=bool, outer=(1), constraints=(contradiction; tight)]
+      └── and [type=bool, outer=(1), constraints=(contradiction; tight)]
+           ├── gt [type=bool, outer=(1), constraints=(/1: [/6 - ]; tight)]
+           │    ├── variable: a.x [type=int, outer=(1)]
+           │    └── const: 5 [type=int]
+           └── lt [type=bool, outer=(1), constraints=(/1: (/NULL - /-1]; tight)]
+                ├── variable: a.x [type=int, outer=(1)]
+                └── const: 0 [type=int]
+
+build
+SELECT sum(x) FROM b WHERE x > 1000 AND x <= 2000 GROUP BY z
+----
+project
+ ├── columns: sum:4(decimal)
+ ├── stats: [rows=99]
+ └── group-by
+      ├── columns: z:2(int!null) sum:4(decimal)
+      ├── grouping columns: z:2(int!null)
+      ├── stats: [rows=99, distinct(2)=99]
+      ├── keys: (2)
+      ├── project
+      │    ├── columns: x:1(int!null) z:2(int!null)
+      │    ├── stats: [rows=2000, distinct(2)=99]
+      │    └── select
+      │         ├── columns: x:1(int!null) z:2(int!null) rowid:3(int!null)
+      │         ├── stats: [rows=2000, distinct(1)=1000, distinct(2)=99]
+      │         ├── keys: (3)
+      │         ├── scan b
+      │         │    ├── columns: x:1(int) z:2(int!null) rowid:3(int!null)
+      │         │    ├── stats: [rows=10000, distinct(1)=5000, distinct(2)=100]
+      │         │    └── keys: (3)
+      │         └── filters [type=bool, outer=(1), constraints=(/1: [/1001 - /2000]; tight)]
+      │              └── and [type=bool, outer=(1), constraints=(/1: [/1001 - /2000]; tight)]
+      │                   ├── gt [type=bool, outer=(1), constraints=(/1: [/1001 - ]; tight)]
+      │                   │    ├── variable: b.x [type=int, outer=(1)]
+      │                   │    └── const: 1000 [type=int]
+      │                   └── le [type=bool, outer=(1), constraints=(/1: (/NULL - /2000]; tight)]
+      │                        ├── variable: b.x [type=int, outer=(1)]
+      │                        └── const: 2000 [type=int]
+      └── aggregations [outer=(1)]
+           └── sum [type=decimal, outer=(1)]
+                └── variable: b.x [type=int, outer=(1)]
+
+# Regression: statistics builder panics when end key is NULL when it's trying
+# to compute start/end int boundaries.
+exec-ddl
+CREATE TABLE idx (x INT PRIMARY KEY, y INT, z INT, INDEX yz (y DESC, z))
+----
+TABLE idx
+ ├── x int not null
+ ├── y int
+ ├── z int
+ ├── INDEX primary
+ │    └── x int not null
+ └── INDEX yz
+      ├── y int desc
+      ├── z int
+      └── x int not null
+
+opt
+SELECT y FROM idx WHERE y < 5 AND z < 10
+----
+project
+ ├── columns: y:2(int!null)
+ ├── stats: [rows=111]
+ └── select
+      ├── columns: y:2(int!null) z:3(int!null)
+      ├── stats: [rows=111]
+      ├── scan idx@yz
+      │    ├── columns: y:2(int) z:3(int)
+      │    ├── constraint: /-2/3/1: (/4/NULL - /NULL)
+      │    └── stats: [rows=333]
+      └── filters [type=bool, outer=(3), constraints=(/3: (/NULL - /9]; tight)]
+           └── lt [type=bool, outer=(3), constraints=(/3: (/NULL - /9]; tight)]
+                ├── variable: idx.z [type=int, outer=(3)]
+                └── const: 10 [type=int]

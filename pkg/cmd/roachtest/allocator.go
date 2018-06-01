@@ -26,7 +26,7 @@ import (
 	"github.com/pkg/errors"
 )
 
-func init() {
+func registerAllocator(r *registry) {
 	runAllocator := func(ctx context.Context, t *test, c *cluster, start int, maxStdDev float64) {
 		const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup`
 		c.Put(ctx, cockroach, "./cockroach")
@@ -51,7 +51,7 @@ func init() {
 		// Start the remaining nodes to kick off upreplication/rebalancing.
 		c.Start(ctx, c.Range(start+1, c.nodes), args)
 
-		c.Run(ctx, 1, `./workload init kv --drop`)
+		c.Run(ctx, c.Node(1), `./workload init kv --drop`)
 		for node := 1; node <= c.nodes; node++ {
 			node := node
 			// TODO(dan): Ideally, the test would fail if this queryload failed,
@@ -63,7 +63,7 @@ func init() {
 					t.Fatal(err)
 				}
 				defer l.close()
-				_ = execCmd(ctx, c.l, "roachprod", "ssh", c.makeNodes(c.Node(node)), "--", cmd)
+				_ = execCmd(ctx, c.l, roachprod, "ssh", c.makeNodes(c.Node(node)), "--", cmd)
 			}()
 		}
 
@@ -75,16 +75,18 @@ func init() {
 		m.Wait()
 	}
 
-	tests.Add(testSpec{
-		Name:  `upreplicate/1to3`,
-		Nodes: nodes(3),
+	r.Add(testSpec{
+		Name:   `upreplicate/1to3`,
+		Nodes:  nodes(3),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runAllocator(ctx, t, c, 1, 10.0)
 		},
 	})
-	tests.Add(testSpec{
-		Name:  `rebalance/3to5`,
-		Nodes: nodes(5),
+	r.Add(testSpec{
+		Name:   `rebalance/3to5`,
+		Nodes:  nodes(5),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runAllocator(ctx, t, c, 3, 42.0)
 		},
@@ -106,11 +108,7 @@ func printRebalanceStats(l *logger, db *gosql.DB) error {
 		).Scan(&rebalanceIntervalStr); err != nil {
 			return err
 		}
-		rebalanceInterval, err := time.ParseDuration(rebalanceIntervalStr)
-		if err != nil {
-			return err
-		}
-		l.printf("cluster took %s to rebalance\n", rebalanceInterval)
+		l.printf("cluster took %s to rebalance\n", rebalanceIntervalStr)
 	}
 
 	// Output # of range events that occurred. All other things being equal,
@@ -155,7 +153,7 @@ func printRebalanceStats(l *logger, db *gosql.DB) error {
 }
 
 type replicationStats struct {
-	ElapsedSinceLastEvent time.Duration
+	SecondsSinceLastEvent int64
 	EventType             string
 	RangeID               int64
 	StoreID               int64
@@ -163,8 +161,8 @@ type replicationStats struct {
 }
 
 func (s replicationStats) String() string {
-	return fmt.Sprintf("last range event: %s for range %d/store %d (%s ago)",
-		s.EventType, s.RangeID, s.StoreID, s.ElapsedSinceLastEvent)
+	return fmt.Sprintf("last range event: %s for range %d/store %d (%ds ago)",
+		s.EventType, s.RangeID, s.StoreID, s.SecondsSinceLastEvent)
 }
 
 // allocatorStats returns the duration of stability (i.e. no replication
@@ -183,10 +181,8 @@ func allocatorStats(db *gosql.DB) (s replicationStats, err error) {
 		`split`, `add`, `remove`,
 	}
 
-	q := `SELECT NOW()-timestamp, "rangeID", "storeID", "eventType" FROM system.rangelog ` +
-		`WHERE "eventType" IN ($1, $2, $3) ORDER BY timestamp DESC LIMIT 1`
-
-	var elapsedStr string
+	q := `SELECT extract_duration(seconds FROM now()-timestamp), "rangeID", "storeID", "eventType"` +
+		`FROM system.rangelog WHERE "eventType" IN ($1, $2, $3) ORDER BY timestamp DESC LIMIT 1`
 
 	row := db.QueryRow(q, eventTypes...)
 	if row == nil {
@@ -194,11 +190,7 @@ func allocatorStats(db *gosql.DB) (s replicationStats, err error) {
 		// will always have some range events.
 		return replicationStats{}, errors.New("couldn't find any range events")
 	}
-	if err := row.Scan(&elapsedStr, &s.RangeID, &s.StoreID, &s.EventType); err != nil {
-		return replicationStats{}, err
-	}
-	s.ElapsedSinceLastEvent, err = time.ParseDuration(elapsedStr)
-	if err != nil {
+	if err := row.Scan(&s.SecondsSinceLastEvent, &s.RangeID, &s.StoreID, &s.EventType); err != nil {
 		return replicationStats{}, err
 	}
 
@@ -221,7 +213,7 @@ func allocatorStats(db *gosql.DB) (s replicationStats, err error) {
 func waitForRebalance(ctx context.Context, l *logger, db *gosql.DB, maxStdDev float64) error {
 	// const statsInterval = 20 * time.Second
 	const statsInterval = 2 * time.Second
-	const stableInterval = 3 * time.Minute
+	const stableSeconds = 3 * 60
 
 	var statsTimer timeutil.Timer
 	defer statsTimer.Stop()
@@ -238,13 +230,13 @@ func waitForRebalance(ctx context.Context, l *logger, db *gosql.DB, maxStdDev fl
 			}
 
 			l.printf("%v\n", stats)
-			if stableInterval <= stats.ElapsedSinceLastEvent {
+			if stableSeconds <= stats.SecondsSinceLastEvent {
 				l.printf("replica count stddev = %f, max allowed stddev = %f\n", stats.ReplicaCountStdDev, maxStdDev)
 				if stats.ReplicaCountStdDev > maxStdDev {
 					_ = printRebalanceStats(l, db)
 					return errors.Errorf(
-						"%s elapsed without changes, but replica count standard "+
-							"deviation is %.2f (>%.2f)", stats.ElapsedSinceLastEvent,
+						"%ds elapsed without changes, but replica count standard "+
+							"deviation is %.2f (>%.2f)", stats.SecondsSinceLastEvent,
 						stats.ReplicaCountStdDev, maxStdDev)
 				}
 				return printRebalanceStats(l, db)

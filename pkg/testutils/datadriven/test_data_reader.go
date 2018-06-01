@@ -87,7 +87,7 @@ func (r *testDataReader) Next(t *testing.T) bool {
 		for _, arg := range fields[1:] {
 			key := arg
 			var vals []string
-			if pos := strings.Index(key, "="); pos >= 0 {
+			if pos := strings.IndexByte(key, '='); pos >= 0 {
 				key = arg[:pos]
 				val := arg[pos+1:]
 
@@ -185,7 +185,7 @@ func (r *testDataReader) emit(s string) {
 	}
 }
 
-var splitDirectivesRE = regexp.MustCompile(`^ *[a-zA-Z0-9_,-\.]+(|=[a-zA-Z0-9_@]+|=\([^)]*\))( |$)`)
+var splitDirectivesRE = regexp.MustCompile(`^ *[a-zA-Z0-9_,-\.]+(|=[-a-zA-Z0-9_@]+|=\([^)]*\))( |$)`)
 
 // splits a directive line into tokens, where each token is
 // either:

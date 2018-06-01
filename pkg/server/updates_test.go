@@ -63,7 +63,7 @@ func TestCheckVersion(t *testing.T) {
 	defer stubURL(&updatesURL, r.url)()
 
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	s.(*TestServer).checkForUpdates(time.Minute)
+	s.(*TestServer).checkForUpdates(ctx, time.Minute)
 	r.Close()
 	s.Stopper().Stop(ctx)
 
@@ -96,13 +96,14 @@ func TestCheckVersion(t *testing.T) {
 		// ensure nil, which happens when an empty env override URL is used, does not
 		// cause a crash. We've deferred a cleanup of the original pointer above.
 		updatesURL = nil
-		s.(*TestServer).checkForUpdates(time.Minute)
+		s.(*TestServer).checkForUpdates(ctx, time.Minute)
 	})
 }
 
 func TestReportUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	const elemName = "somestring"
 	ctx := context.TODO()
 
 	r := makeMockRecorder(t)
@@ -111,15 +112,18 @@ func TestReportUsage(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 
+	storeSpec := base.DefaultTestStoreSpec
+	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{elemName}}
 	params := base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{
-			base.DefaultTestStoreSpec,
+			storeSpec,
 			base.DefaultTestStoreSpec,
 		},
 		Settings: st,
 		Locality: roachpb.Locality{
 			Tiers: []roachpb.Tier{
 				{Key: "region", Value: "east"},
+				{Key: "zone", Value: elemName},
 				{Key: "state", Value: "ny"},
 				{Key: "city", Value: "nyc"},
 			},
@@ -132,13 +136,10 @@ func TestReportUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ts.sqlExecutor.ResetStatementStats(ctx)
-
-	const elemName = "somestring"
 	if _, err := db.Exec(fmt.Sprintf(`CREATE DATABASE %s`, elemName)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`SET CLUSTER SETTING server.time_until_store_dead = '20s'`); err != nil {
+	if _, err := db.Exec(`SET CLUSTER SETTING server.time_until_store_dead = '90s'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.send_crash_reports = false`); err != nil {
@@ -160,6 +161,9 @@ func TestReportUsage(t *testing.T) {
 		); err != nil {
 			t.Fatalf("error applying zone config %q to %q: %v", cmd.config, cmd.resource, err)
 		}
+	}
+	if _, err := db.Exec(`INSERT INTO system.zones (id, config) VALUES (10000, null)`); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := db.Exec(
@@ -264,8 +268,8 @@ func TestReportUsage(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		expectedUsageReports++
 
-		node := ts.node.recorder.GetStatusSummary(ctx)
-		ts.reportDiagnostics(0)
+		node := ts.node.recorder.GenerateNodeStatus(ctx)
+		ts.reportDiagnostics(ctx, 0)
 
 		keyCounts := make(map[roachpb.StoreID]int64)
 		rangeCounts := make(map[roachpb.StoreID]int64)
@@ -410,13 +414,13 @@ func TestReportUsage(t *testing.T) {
 		t.Fatalf("expected %d changed settings, got %d: %v", expected, actual, r.last.AlteredSettings)
 	}
 	for key, expected := range map[string]string{
-		"cluster.organization":                     "<non-default>",
+		"cluster.organization":                     "<redacted>",
 		"diagnostics.reporting.enabled":            "true",
 		"diagnostics.reporting.send_crash_reports": "false",
-		"server.time_until_store_dead":             "20s",
+		"server.time_until_store_dead":             "1m30s",
 		"trace.debug.enable":                       "false",
-		"version":                                  "2.0-1",
-		"cluster.secret":                           "<non-default>",
+		"version":                                  "2.0-5",
+		"cluster.secret":                           "<redacted>",
 	} {
 		if got, ok := r.last.AlteredSettings[key]; !ok {
 			t.Fatalf("expected report of altered setting %q", key)
@@ -496,7 +500,7 @@ func TestReportUsage(t *testing.T) {
 		}
 	}
 
-	if expected, actual := 15, len(r.last.SqlStats); expected != actual {
+	if expected, actual := 16, len(r.last.SqlStats); expected != actual {
 		t.Fatalf("expected %d queries in stats report, got %d :\n %v", expected, actual, r.last.SqlStats)
 	}
 
@@ -516,6 +520,7 @@ func TestReportUsage(t *testing.T) {
 			`CREATE TABLE _ (_ INT PRIMARY KEY, _ INT, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 			`INSERT INTO _ VALUES (length($1::STRING))`,
 			`INSERT INTO _ VALUES (_)`,
+			`INSERT INTO _(_, _) VALUES (_, _)`,
 			`SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
 			`SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
 			`SELECT _ / $1`,

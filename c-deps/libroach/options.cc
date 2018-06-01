@@ -40,20 +40,12 @@ class DBPrefixExtractor : public rocksdb::SliceTransform {
   virtual rocksdb::Slice Transform(const rocksdb::Slice& src) const { return KeyPrefix(src); }
 
   virtual bool InDomain(const rocksdb::Slice& src) const { return true; }
-
-  virtual bool InRange(const rocksdb::Slice& dst) const { return Transform(dst) == dst; }
 };
 
 class DBLogger : public rocksdb::Logger {
  public:
-  DBLogger(bool enabled) : enabled_(enabled) {}
+  DBLogger() {}
   virtual void Logv(const char* format, va_list ap) {
-    // TODO(pmattis): Benchmark calling Go exported methods from C++
-    // to determine if this is too slow.
-    if (!enabled_) {
-      return;
-    }
-
     // First try with a small fixed size buffer.
     char space[1024];
 
@@ -96,9 +88,6 @@ class DBLogger : public rocksdb::Logger {
       delete[] buf;
     }
   }
-
- private:
-  const bool enabled_;
 };
 
 class TimeBoundTblPropCollector : public rocksdb::TablePropertiesCollector {
@@ -164,7 +153,7 @@ rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   options.max_subcompactions = std::max(db_opts.num_cpu / 2, 1);
   options.comparator = &kComparator;
   options.create_if_missing = !db_opts.must_exist;
-  options.info_log.reset(new DBLogger(db_opts.logging_enabled));
+  options.info_log.reset(new DBLogger());
   options.merge_operator.reset(NewMergeOperator());
   options.prefix_extractor.reset(new DBPrefixExtractor);
   options.statistics = rocksdb::CreateDBStatistics();
@@ -263,6 +252,12 @@ rocksdb::Options DBMakeOptions(DBOptions db_opts) {
   // of sstables.
   options.target_file_size_base = 4 << 20;  // 4 MB
   options.target_file_size_multiplier = 2;
+
+  // Because we open a long running rocksdb instance, we do not want the
+  // manifest file to grow unbounded. Assuming each manifest entry is about 1
+  // KB, this allows for 128 K entries. This could account for several hours to
+  // few months of runtime without rolling based on the workload.
+  options.max_manifest_file_size = 128 << 20;  // 128 MB
 
   rocksdb::BlockBasedTableOptions table_options;
   if (db_opts.cache != nullptr) {

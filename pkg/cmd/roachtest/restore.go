@@ -19,20 +19,21 @@ import (
 	"context"
 )
 
-func init() {
-	tests.Add(testSpec{
-		Name:  `restore2TB`,
-		Nodes: nodes(10),
+func registerRestore(r *registry) {
+	r.Add(testSpec{
+		Name:   `restore2TB`,
+		Nodes:  nodes(10),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			c.Put(ctx, cockroach, "./cockroach")
 			c.Start(ctx)
 			m := newMonitor(ctx, c)
 			m.Go(func(ctx context.Context) error {
-				c.Run(ctx, 1, `./cockroach sql --insecure -e "CREATE DATABASE restore2tb"`)
-				c.status(`running 2tb restore`)
+				t.Status(`running restore`)
+				c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "CREATE DATABASE restore2tb"`)
 				// TODO(dan): It'd be nice if we could keep track over time of how
 				// long this next line took.
-				c.Run(ctx, 1, `./cockroach sql --insecure -e "
+				c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
 				RESTORE csv.bank FROM
 				'gs://cockroach-fixtures/workload/bank/version=1.0.0,payload-bytes=10240,ranges=0,rows=65104166,seed=1/bank'
 				WITH into_db = 'restore2tb'"`)

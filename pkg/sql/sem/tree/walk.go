@@ -148,6 +148,17 @@ func (expr *CollateExpr) Walk(v Visitor) Expr {
 	return expr
 }
 
+// Walk implements the Expr interface.
+func (expr *ColumnAccessExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.Expr)
+	if changed {
+		exprCopy := *expr
+		exprCopy.Expr = e
+		return &exprCopy
+	}
+	return expr
+}
+
 // CopyNode makes a copy of this Expr without recursing in any child Exprs.
 func (expr *CoalesceExpr) CopyNode() *CoalesceExpr {
 	exprCopy := *expr
@@ -260,6 +271,29 @@ func (expr *IfExpr) Walk(v Visitor) Expr {
 		exprCopy := *expr
 		exprCopy.Cond = c
 		exprCopy.True = t
+		exprCopy.Else = e
+		return &exprCopy
+	}
+	return expr
+}
+
+// Walk implements the Expr interface.
+func (expr *IfErrExpr) Walk(v Visitor) Expr {
+	c, changedC := WalkExpr(v, expr.Cond)
+	t := expr.ErrCode
+	changedEC := false
+	if t != nil {
+		t, changedEC = WalkExpr(v, expr.ErrCode)
+	}
+	e := expr.Else
+	changedE := false
+	if e != nil {
+		e, changedE = WalkExpr(v, expr.Else)
+	}
+	if changedC || changedEC || changedE {
+		exprCopy := *expr
+		exprCopy.Cond = c
+		exprCopy.ErrCode = t
 		exprCopy.Else = e
 		return &exprCopy
 	}
@@ -520,6 +554,9 @@ func (expr *DDate) Walk(_ Visitor) Expr { return expr }
 func (expr *DTime) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
+func (expr *DTimeTZ) Walk(_ Visitor) Expr { return expr }
+
+// Walk implements the Expr interface.
 func (expr *DFloat) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
@@ -767,6 +804,54 @@ func (stmt *CreateTable) WalkStmt(v Visitor) Statement {
 		}
 	}
 	return ret
+}
+
+// CopyNode makes a copy of this Statement without recursing in any child Statements.
+func (stmt *CancelQueries) CopyNode() *CancelQueries {
+	stmtCopy := *stmt
+	return &stmtCopy
+}
+
+// WalkStmt is part of the WalkableStmt interface.
+func (stmt *CancelQueries) WalkStmt(v Visitor) Statement {
+	sel, changed := WalkStmt(v, stmt.Queries)
+	if changed {
+		stmt = stmt.CopyNode()
+		stmt.Queries = sel.(*Select)
+	}
+	return stmt
+}
+
+// CopyNode makes a copy of this Statement without recursing in any child Statements.
+func (stmt *CancelSessions) CopyNode() *CancelSessions {
+	stmtCopy := *stmt
+	return &stmtCopy
+}
+
+// WalkStmt is part of the WalkableStmt interface.
+func (stmt *CancelSessions) WalkStmt(v Visitor) Statement {
+	sel, changed := WalkStmt(v, stmt.Sessions)
+	if changed {
+		stmt = stmt.CopyNode()
+		stmt.Sessions = sel.(*Select)
+	}
+	return stmt
+}
+
+// CopyNode makes a copy of this Statement without recursing in any child Statements.
+func (stmt *ControlJobs) CopyNode() *ControlJobs {
+	stmtCopy := *stmt
+	return &stmtCopy
+}
+
+// WalkStmt is part of the WalkableStmt interface.
+func (stmt *ControlJobs) WalkStmt(v Visitor) Statement {
+	sel, changed := WalkStmt(v, stmt.Jobs)
+	if changed {
+		stmt = stmt.CopyNode()
+		stmt.Jobs = sel.(*Select)
+	}
+	return stmt
 }
 
 // CopyNode makes a copy of this Statement without recursing in any child Statements.
@@ -1052,6 +1137,28 @@ func (stmt *SetVar) WalkStmt(v Visitor) Statement {
 }
 
 // CopyNode makes a copy of this Statement without recursing in any child Statements.
+func (stmt *SetTracing) CopyNode() *SetTracing {
+	stmtCopy := *stmt
+	stmtCopy.Values = append(Exprs(nil), stmt.Values...)
+	return &stmtCopy
+}
+
+// WalkStmt is part of the WalkableStmt interface.
+func (stmt *SetTracing) WalkStmt(v Visitor) Statement {
+	ret := stmt
+	for i, expr := range stmt.Values {
+		e, changed := WalkExpr(v, expr)
+		if changed {
+			if ret == stmt {
+				ret = stmt.CopyNode()
+			}
+			ret.Values[i] = e
+		}
+	}
+	return ret
+}
+
+// CopyNode makes a copy of this Statement without recursing in any child Statements.
 func (stmt *SetClusterSetting) CopyNode() *SetClusterSetting {
 	stmtCopy := *stmt
 	return &stmtCopy
@@ -1147,6 +1254,9 @@ var _ WalkableStmt = &SetClusterSetting{}
 var _ WalkableStmt = &SetVar{}
 var _ WalkableStmt = &Update{}
 var _ WalkableStmt = &ValuesClause{}
+var _ WalkableStmt = &CancelQueries{}
+var _ WalkableStmt = &CancelSessions{}
+var _ WalkableStmt = &ControlJobs{}
 
 // WalkStmt walks the entire parsed stmt calling WalkExpr on each
 // expression, and replacing each expression with the one returned

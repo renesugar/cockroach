@@ -16,10 +16,12 @@ package optbuilder
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -52,7 +54,22 @@ type Builder struct {
 	// interfacing with the old planning code.
 	AllowUnsupportedExpr bool
 
-	factory opt.Factory
+	// AllowImpureFuncs is a control knob: if set, when building a scalar, the
+	// builder will not panic when it encounters an impure function. While the
+	// cost-based optimizer does not currently handle impure functions, the
+	// heuristic planner can handle them (and uses the builder code for index
+	// constraints).
+	AllowImpureFuncs bool
+
+	// FmtFlags controls the way column names are formatted in test output. For
+	// example, if set to FmtAlwaysQualifyTableNames, the builder fully qualifies
+	// the table name in all column labels before adding them to the metadata.
+	// This flag allows us to test that name resolution works correctly, and
+	// avoids cluttering test output with schema and catalog names in the general
+	// case.
+	FmtFlags tree.FmtFlags
+
+	factory *norm.Factory
 	stmt    tree.Statement
 
 	ctx     context.Context
@@ -61,7 +78,7 @@ type Builder struct {
 	catalog opt.Catalog
 
 	// Skip index 0 in order to reserve it to indicate the "unknown" column.
-	colMap []columnProps
+	colMap []scopeColumn
 }
 
 // New creates a new Builder structure initialized with the given
@@ -71,13 +88,13 @@ func New(
 	semaCtx *tree.SemaContext,
 	evalCtx *tree.EvalContext,
 	catalog opt.Catalog,
-	factory opt.Factory,
+	factory *norm.Factory,
 	stmt tree.Statement,
 ) *Builder {
 	return &Builder{
 		factory: factory,
 		stmt:    stmt,
-		colMap:  make([]columnProps, 1),
+		colMap:  make([]scopeColumn, 1),
 		ctx:     ctx,
 		semaCtx: semaCtx,
 		evalCtx: evalCtx,
@@ -94,7 +111,7 @@ func New(
 // (e.g., row and column ordering) that are required of the root memo group.
 // If any subroutines panic with a builderError as part of the build process,
 // the panic is caught here and returned as an error.
-func (b *Builder) Build() (root opt.GroupID, required *opt.PhysicalProps, err error) {
+func (b *Builder) Build() (root memo.GroupID, required *props.Physical, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate builder errors without adding
@@ -102,17 +119,17 @@ func (b *Builder) Build() (root opt.GroupID, required *opt.PhysicalProps, err er
 			// only possible because the code does not update shared state and does
 			// not manipulate locks.
 			if bldErr, ok := r.(builderError); ok {
-				err = bldErr
+				err = bldErr.error
 			} else {
 				panic(r)
 			}
 		}
 	}()
 
-	out, outScope := b.buildStmt(b.stmt, &scope{builder: b})
-	root = out
-	required = b.buildPhysicalProps(outScope)
-	return root, required, nil
+	outScope := b.buildStmt(b.stmt, &scope{builder: b})
+	root = outScope.group
+	outScope.setPresentation()
+	return root, &outScope.physicalProps, nil
 }
 
 // builderError is used for semantic errors that occur during the build process
@@ -122,40 +139,30 @@ type builderError struct {
 	error
 }
 
-// errorf formats according to a format specifier and returns the
-// string as a builderError.
-func errorf(format string, a ...interface{}) builderError {
-	err := fmt.Errorf(format, a...)
-	return builderError{err}
-}
-
-// buildPhysicalProps construct a set of required physical properties from the
-// given scope.
-func (b *Builder) buildPhysicalProps(scope *scope) *opt.PhysicalProps {
-	if scope.presentation == nil {
-		scope.presentation = makePresentation(scope.cols)
-	}
-	return &opt.PhysicalProps{Presentation: scope.presentation, Ordering: scope.ordering}
+// unimplementedf formats according to a format specifier and returns a Postgres
+// error with the pgerror.CodeFeatureNotSupportedError code, wrapped in a
+// builderError.
+func unimplementedf(format string, a ...interface{}) builderError {
+	return builderError{pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, format, a...)}
 }
 
 // buildStmt builds a set of memo groups that represent the given SQL
 // statement.
 //
-// NOTE: The following description of the inScope parameter and return values
-//       applies for all buildXXX() functions in this directory.
+// NOTE: The following descriptions of the inScope parameter and outScope
+//       return value apply for all buildXXX() functions in this directory.
+//       Note that some buildXXX() functions pass outScope as a parameter
+//       rather than a return value so its scopeColumns can be built up
+//       incrementally across several function calls.
 //
 // inScope   This parameter contains the name bindings that are visible for this
 //           statement/expression (e.g., passed in from an enclosing statement).
 //
-// out       This return value corresponds to the top-level memo group ID for
-//           this statement/expression.
-//
 // outScope  This return value contains the newly bound variables that will be
 //           visible to enclosing statements, as well as a pointer to any
-//           "parent" scope that is still visible.
-func (b *Builder) buildStmt(
-	stmt tree.Statement, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
+//           "parent" scope that is still visible. The top-level memo group ID
+//           for the built statement/expression is returned in outScope.group.
+func (b *Builder) buildStmt(stmt tree.Statement, inScope *scope) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
 	case *tree.ParenSelect:
@@ -164,7 +171,13 @@ func (b *Builder) buildStmt(
 	case *tree.Select:
 		return b.buildSelect(stmt, inScope)
 
+	case *tree.Explain:
+		return b.buildExplain(stmt, inScope)
+
+	case *tree.ShowTrace:
+		return b.buildShowTrace(stmt, inScope)
+
 	default:
-		panic(errorf("unexpected statement: %T", stmt))
+		panic(unimplementedf("unsupported statement: %T", stmt))
 	}
 }

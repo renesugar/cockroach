@@ -17,7 +17,8 @@ package optbuilder
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
@@ -27,9 +28,7 @@ import (
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
-func (b *Builder) buildValuesClause(
-	values *tree.ValuesClause, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
+func (b *Builder) buildValuesClause(values *tree.ValuesClause, inScope *scope) (outScope *scope) {
 	var numCols int
 	if len(values.Tuples) > 0 {
 		numCols = len(values.Tuples[0].Exprs)
@@ -39,20 +38,22 @@ func (b *Builder) buildValuesClause(
 	for i := range colTypes {
 		colTypes[i] = types.Unknown
 	}
-	rows := make([]opt.GroupID, 0, len(values.Tuples))
+	rows := make([]memo.GroupID, 0, len(values.Tuples))
 
 	// elems is used to store tuple values, and can be allocated once and reused
 	// repeatedly, since InternList will copy values to memo storage.
-	elems := make([]opt.GroupID, numCols)
+	elems := make([]memo.GroupID, numCols)
 
 	for _, tuple := range values.Tuples {
 		if numCols != len(tuple.Exprs) {
-			panic(errorf(
+			panic(builderError{pgerror.NewErrorf(
+				pgerror.CodeSyntaxError,
 				"VALUES lists must all be the same length, expected %d columns, found %d",
-				numCols, len(tuple.Exprs)))
+				numCols, len(tuple.Exprs))})
 		}
 
 		for i, expr := range tuple.Exprs {
+			b.assertNoAggregationOrWindowing(expr, "VALUES")
 			texpr := inScope.resolveType(expr, types.Any)
 			typ := texpr.ResolvedType()
 			elems[i] = b.buildScalar(texpr, inScope)
@@ -61,7 +62,8 @@ func (b *Builder) buildValuesClause(
 			if colTypes[i] == types.Unknown {
 				colTypes[i] = typ
 			} else if typ != types.Unknown && !typ.Equivalent(colTypes[i]) {
-				panic(errorf("VALUES list type mismatch, %s for %s", typ, colTypes[i]))
+				panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+					"VALUES types %s and %s cannot be matched", typ, colTypes[i])})
 			}
 		}
 
@@ -72,10 +74,12 @@ func (b *Builder) buildValuesClause(
 	for i := 0; i < numCols; i++ {
 		// The column names for VALUES are column1, column2, etc.
 		label := fmt.Sprintf("column%d", i+1)
-		b.synthesizeColumn(outScope, label, colTypes[i], nil)
+		b.synthesizeColumn(outScope, label, colTypes[i], nil, 0 /* group */)
 	}
 
 	colList := colsToColList(outScope.cols)
-	out = b.factory.ConstructValues(b.factory.InternList(rows), b.factory.InternPrivate(&colList))
-	return out, outScope
+	outScope.group = b.factory.ConstructValues(
+		b.factory.InternList(rows), b.factory.InternColList(colList),
+	)
+	return outScope
 }

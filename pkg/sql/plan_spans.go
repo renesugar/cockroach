@@ -43,24 +43,30 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 		return n.spans, nil, nil
 
 	case *updateNode:
-		return editNodeSpans(params, &n.run.editNodeRun)
+		return editNodeSpans(params, n.source, &n.run.tu)
 	case *insertNode:
-		if v, ok := n.run.editNodeRun.rows.(*valuesNode); ok {
+		if v, ok := n.source.(*valuesNode); ok {
 			// subqueries, even within valuesNodes, can be arbitrarily complex,
 			// so we can't run the valuesNode ahead of time if they are present.
 			if v.isConst {
 				return insertNodeWithValuesSpans(params, n, v)
 			}
 		}
-		return editNodeSpans(params, &n.run.editNodeRun)
+		return editNodeSpans(params, n.source, &n.run.ti)
 	case *upsertNode:
-		return editNodeSpans(params, &n.run.editNodeRun)
+		return editNodeSpans(params, n.source, n.run.tw)
 	case *deleteNode:
-		return editNodeSpans(params, &n.run.editNodeRun)
+		return editNodeSpans(params, n.source, &n.run.td)
+	case *rowCountNode:
+		return collectSpans(params, n.source)
+	case *serializeNode:
+		return collectSpans(params, n.source)
 
 	case *delayedNode:
 		return collectSpans(params, n.plan)
 	case *distinctNode:
+		return collectSpans(params, n.plan)
+	case *distSQLWrapper:
 		return collectSpans(params, n.plan)
 	case *explainDistSQLNode:
 		return collectSpans(params, n.plan)
@@ -70,6 +76,8 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 		return collectSpans(params, n.plan)
 	case *limitNode:
 		return collectSpans(params, n.plan)
+	case *spoolNode:
+		return collectSpans(params, n.source)
 	case *sortNode:
 		return collectSpans(params, n.plan)
 	case *groupNode:
@@ -103,12 +111,14 @@ func collectSpans(params runParams, plan planNode) (reads, writes roachpb.Spans,
 //
 // Where possible, we should try to specialize this analysis like we do with
 // insertNodeWithValuesSpans.
-func editNodeSpans(params runParams, r *editNodeRun) (reads, writes roachpb.Spans, err error) {
-	readerReads, readerWrites, err := collectSpans(params, r.rows)
+func editNodeSpans(
+	params runParams, source planNode, tw tableWriter,
+) (reads, writes roachpb.Spans, err error) {
+	readerReads, readerWrites, err := collectSpans(params, source)
 	if err != nil {
 		return nil, nil, err
 	}
-	writerReads, writerWrites := tableWriterSpans(params, r.tw)
+	writerReads, writerWrites := tableWriterSpans(params, tw)
 
 	return append(readerReads, writerReads...), append(readerWrites, writerWrites...), nil
 }
@@ -156,12 +166,12 @@ func insertNodeWithValuesSpans(
 		// is a valuesNode. This is important, because it means that the result
 		// of all DEFAULT expressions will be retained from span collection to
 		// plan execution.
-		if a, e := len(values), len(n.insertCols); a < e {
+		if a, e := len(values), len(n.run.insertCols); a < e {
 			log.Fatalf(params.ctx, "missing columns for row; want %d, got %d", e, a)
 		}
 
 		// Determine the table spans that the current values tuple will mutate.
-		ti := n.run.editNodeRun.tw.(*tableInserter)
+		ti := &n.run.ti
 		primaryKey, secondaryKeys, err := ti.ri.EncodeIndexesForRow(values)
 		if err != nil {
 			return err

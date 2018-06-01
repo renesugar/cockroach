@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: default opt
 
 statement ok
 CREATE DATABASE a
@@ -17,6 +17,8 @@ SHOW DATABASES
 ----
 Database
 a
+defaultdb
+postgres
 system
 test
 
@@ -85,6 +87,8 @@ b4
 b5
 b6
 c
+defaultdb
+postgres
 system
 test
 
@@ -132,6 +136,8 @@ SHOW DATABASES
 Database
 a
 c
+defaultdb
+postgres
 system
 test
 

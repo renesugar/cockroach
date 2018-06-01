@@ -16,42 +16,54 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 // buildDistinct builds a set of memo groups that represent a DISTINCT
-// expression.
-//
-// in        contains the memo group ID of the input expression.
-// distinct  is true if this is a DISTINCT expression. If distinct is false,
-//           we just return `in, inScope`.
-// byCols    is the set of columns in the DISTINCT expression. Since
-//           DISTINCT is equivalent to GROUP BY without any aggregations,
-//           byCols are essentially the grouping columns.
+// expression if distinct is true. If distinct is false, we just return
+// `inScope`. If distinctOn is not empty, then this is a DISTINCT ON expression
+// that performs the distinct operation on a subset of columns.
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildDistinct(
-	in opt.GroupID, distinct bool, byCols []columnProps, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
+	distinct bool, distinctOn tree.DistinctOn, inScope *scope,
+) (outScope *scope) {
 	if !distinct {
-		return in, inScope
+		return inScope
 	}
 
-	// After DISTINCT, FROM columns are no longer visible. As a side effect,
-	// ORDER BY cannot reference columns outside of the SELECT list. This
-	// will cause an error for queries like:
-	//   SELECT DISTINCT a FROM t ORDER BY b
-	// TODO(rytaft): This is not valid syntax in Postgres, but it works in
-	// CockroachDB, so we may need to support it eventually.
+	if len(distinctOn) > 0 {
+		panic(unimplementedf("DISTINCT ON is not supported"))
+	}
+
 	outScope = inScope.replace()
+	outScope.physicalProps = inScope.physicalProps
 
 	// Distinct is equivalent to group by without any aggregations.
 	var groupCols opt.ColSet
-	for i := range byCols {
-		groupCols.Add(int(byCols[i].index))
-		outScope.cols = append(outScope.cols, byCols[i])
+	for i := range inScope.cols {
+		if !inScope.cols[i].hidden {
+			groupCols.Add(int(inScope.cols[i].id))
+			outScope.cols = append(outScope.cols, inScope.cols[i])
+		}
 	}
 
-	aggList := b.constructList(opt.AggregationsOp, nil, nil)
-	return b.factory.ConstructGroupBy(in, aggList, b.factory.InternPrivate(&groupCols)), outScope
+	// Check that the ordering can be provided by the projected columns.
+	// This will cause an error for queries like:
+	//   SELECT DISTINCT a FROM t ORDER BY b
+	// TODO(rytaft): This is not valid syntax in Postgres, but it works in
+	// CockroachDB, so we may need to support it eventually.
+	for _, col := range outScope.physicalProps.Ordering {
+		if !outScope.hasColumn(col.ID()) {
+			panic(builderError{pgerror.NewErrorf(
+				pgerror.CodeInvalidColumnReferenceError,
+				"for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+			)})
+		}
+	}
+
+	outScope.group = b.constructGroupBy(inScope.group, groupCols, nil /* cols */)
+	return outScope
 }

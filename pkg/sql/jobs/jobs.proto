@@ -17,8 +17,8 @@ package cockroach.sql.jobs;
 option go_package = "jobs";
 
 import "gogoproto/gogo.proto";
-import "roachpb/csv.proto";
 import "roachpb/data.proto";
+import "roachpb/io-formats.proto";
 import "sql/sqlbase/structured.proto";
 import "util/hlc/timestamp.proto";
 
@@ -59,13 +59,15 @@ message RestoreDetails {
   ];
   repeated string uris = 3 [(gogoproto.customname) = "URIs"];
   repeated sqlbase.TableDescriptor table_descs = 5;
+  string override_db = 6 [(gogoproto.customname) = "OverrideDB"];
 }
 
 message ImportDetails {
   message Table {
     sqlbase.TableDescriptor desc = 1;
     repeated string uris = 2 [(gogoproto.customname) = "URIs"];
-    roachpb.CSVOptions options = 3;
+    roachpb.IOFileFormat format = 18 [(gogoproto.nullable) = false];
+    roachpb.CSVOptions legacy_csv_options = 3;
     string backup_path = 4;
     repeated float sampling_progress = 5;
     repeated float read_progress = 6;
@@ -74,22 +76,26 @@ message ImportDetails {
       (gogoproto.customname) = "ParentID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sqlbase.ID"
     ];
-    int32 comma = 9;
-    int32 comment = 10;
+    int32 legacy_comma = 9;
+    int32 legacy_comment = 10;
     message Nullif {
       string nullif = 1;
     }
     // nullif needs to differentiate between not present and the empty string.
-    Nullif nullif = 11;
+    Nullif legacy_nullif = 11;
     int64 sst_size = 12 [(gogoproto.customname) = "SSTSize"];
     int64 walltime = 13;
-    bool local = 14;
+    reserved 14;
     // samples is populated with the sampling phase's results. These must be
     // used if a job is resumed to guarantee that AddSSTable will not attempt
     // to add ranges with an old split point within them.
     repeated bytes samples = 15;
     // Skip the first N lines of the input (e.g. to ignore column headers)
-    uint32 skip = 16;
+    uint32 legacy_skip = 16;
+    // The spans of split keys which have had their SSTable's generated.
+    // This allows us to skip the shuffle stage for already-completed
+    // spans when resuming an import job.
+    repeated roachpb.Span span_progress = 17 [(gogoproto.nullable) = false];
   }
   repeated Table tables = 1 [(gogoproto.nullable) = false];
 }
@@ -107,7 +113,13 @@ message SchemaChangeDetails {
   // be processed. The index represents the index of a mutation in a
   // mutation list containing mutations for the same mutationID.
   repeated ResumeSpanList resume_span_list = 2 [(gogoproto.nullable) = false];
+}
 
+message ChangefeedDetails {
+  util.hlc.Timestamp highwater = 1 [(gogoproto.nullable) = false];
+  repeated sqlbase.TableDescriptor table_descs = 2 [(gogoproto.nullable) = false];
+  string sink_uri = 3 [(gogoproto.customname) = "SinkURI"];
+  map<string, string> opts = 4;
 }
 
 message Payload {
@@ -132,6 +144,7 @@ message Payload {
     RestoreDetails restore = 11;
     SchemaChangeDetails schemaChange = 12;
     ImportDetails import = 13;
+    ChangefeedDetails changefeed = 14;
   }
 }
 
@@ -144,4 +157,5 @@ enum Type {
   RESTORE = 2 [(gogoproto.enumvalue_customname) = "TypeRestore"];
   SCHEMA_CHANGE = 3 [(gogoproto.enumvalue_customname) = "TypeSchemaChange"];
   IMPORT = 4 [(gogoproto.enumvalue_customname) = "TypeImport"];
+  CHANGEFEED = 5 [(gogoproto.enumvalue_customname) = "TypeChangefeed"];
 }

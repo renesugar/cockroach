@@ -25,10 +25,11 @@ import (
 	"github.com/pkg/errors"
 )
 
-func init() {
-	tests.Add(testSpec{
-		Name:  `schemachange`,
-		Nodes: nodes(5),
+func registerSchemaChange(r *registry) {
+	r.Add(testSpec{
+		Name:   `schemachange`,
+		Nodes:  nodes(5),
+		Stable: true, // DO NOT COPY to new tests
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup`
 
@@ -49,7 +50,7 @@ func init() {
 			})
 			m.Wait()
 
-			c.Run(ctx, 1, `./workload init kv --drop --db=test`)
+			c.Run(ctx, c.Node(1), `./workload init kv --drop --db=test`)
 			for node := 1; node <= c.nodes; node++ {
 				node := node
 				// TODO(dan): Ideally, the test would fail if this queryload failed,
@@ -61,7 +62,7 @@ func init() {
 						t.Fatal(err)
 					}
 					defer l.close()
-					_ = execCmd(ctx, c.l, "roachprod", "ssh", c.makeNodes(c.Node(node)), "--", cmd)
+					_ = execCmd(ctx, c.l, roachprod, "ssh", c.makeNodes(c.Node(node)), "--", cmd)
 				}()
 			}
 

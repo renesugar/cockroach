@@ -98,42 +98,6 @@ func (p *planner) getVirtualDataSource(
 	}, nil
 }
 
-// getDataSourceAsOneColumn builds a planDataSource from a data source
-// clause and ensures that it returns one column. If the plan would
-// return zero or more than one column, the columns are grouped into
-// a tuple. This is needed for SRF substitution (e.g. `SELECT
-// pg_get_keywords()`).
-func (p *planner) getDataSourceAsOneColumn(
-	ctx context.Context, src *tree.FuncExpr,
-) (planDataSource, error) {
-	ds, err := p.getDataSource(ctx, src, nil, publicColumns)
-	if err != nil {
-		return ds, err
-	}
-	if len(ds.info.SourceColumns) == 1 {
-		return ds, nil
-	}
-
-	// Zero or more than one column: make a tuple.
-
-	// We use the name of the function to determine the name of the
-	// rendered column.
-	fd, err := src.Func.Resolve(p.SessionData().SearchPath)
-	if err != nil {
-		return planDataSource{}, err
-	}
-	newPlan, err := p.makeTupleRender(ctx, ds, fd.Name)
-	if err != nil {
-		return planDataSource{}, err
-	}
-
-	tn := tree.MakeUnqualifiedTableName(tree.Name(fd.Name))
-	return planDataSource{
-		info: sqlbase.NewSourceInfoForSingleTable(tn, planColumns(newPlan)),
-		plan: newPlan,
-	}, nil
-}
-
 // getDataSource builds a planDataSource from a single data source clause
 // (TableExpr) in a SelectClause.
 func (p *planner) getDataSource(
@@ -164,7 +128,7 @@ func (p *planner) getDataSource(
 		return p.getPlanForDesc(ctx, desc, tn, hints, colCfg)
 
 	case *tree.FuncExpr:
-		return p.getGeneratorPlan(ctx, t)
+		return p.getGeneratorPlan(ctx, t, sqlbase.AnonymousTable)
 
 	case *tree.Subquery:
 		return p.getSubqueryPlan(ctx, sqlbase.AnonymousTable, t.Select, nil)
@@ -303,7 +267,7 @@ func renameSource(
 			(len(src.info.SourceAliases) == 1 && src.info.SourceAliases[0].Name == sqlbase.AnonymousTable))
 		noColNameSpecified := len(colAlias) == 0
 		if vg, ok := src.plan.(*valueGenerator); ok && isAnonymousTable && noColNameSpecified {
-			if tType, ok := vg.expr.ResolvedType().(types.TTable); ok && len(tType.Cols) == 1 {
+			if tType, ok := vg.expr.ResolvedType().(types.TTable); ok && len(tType.Cols.Types) == 1 {
 				colAlias = tree.NameList{as.Alias}
 			}
 		}
@@ -324,7 +288,8 @@ func renameSource(
 		for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
 			if colIdx >= len(src.info.SourceColumns) {
 				srcName := tree.ErrString(&tableAlias)
-				return planDataSource{}, errors.Errorf(
+				return planDataSource{}, pgerror.NewErrorf(
+					pgerror.CodeInvalidColumnReferenceError,
 					"source %q has %d columns available but %d columns specified",
 					srcName, aliasIdx, len(colAlias))
 			}
@@ -447,13 +412,15 @@ func (p *planner) getSubqueryPlan(
 	}, nil
 }
 
-func (p *planner) getGeneratorPlan(ctx context.Context, t *tree.FuncExpr) (planDataSource, error) {
+func (p *planner) getGeneratorPlan(
+	ctx context.Context, t *tree.FuncExpr, srcName tree.TableName,
+) (planDataSource, error) {
 	plan, err := p.makeGenerator(ctx, t)
 	if err != nil {
 		return planDataSource{}, err
 	}
 	return planDataSource{
-		info: sqlbase.NewSourceInfoForSingleTable(sqlbase.AnonymousTable, planColumns(plan)),
+		info: sqlbase.NewSourceInfoForSingleTable(srcName, planColumns(plan)),
 		plan: plan,
 	}, nil
 }
@@ -473,60 +440,6 @@ func (p *planner) getSequenceSource(
 		plan: node,
 		info: sqlbase.NewSourceInfoForSingleTable(tn, sequenceSelectColumns),
 	}, nil
-}
-
-// expandStar returns the array of column metadata and name
-// expressions that correspond to the expansion of a star.
-func expandStar(
-	ctx context.Context,
-	src sqlbase.MultiSourceInfo,
-	v tree.VarName,
-	ivarHelper tree.IndexedVarHelper,
-) (columns sqlbase.ResultColumns, exprs []tree.TypedExpr, err error) {
-	if len(src) == 0 || len(src[0].SourceColumns) == 0 {
-		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
-			"cannot use %q without a FROM clause", tree.ErrString(v))
-	}
-
-	colSel := func(src *sqlbase.DataSourceInfo, idx int) {
-		col := src.SourceColumns[idx]
-		if !col.Hidden {
-			ivar := ivarHelper.IndexedVar(idx + src.ColOffset)
-			columns = append(columns, sqlbase.ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
-			exprs = append(exprs, ivar)
-		}
-	}
-
-	switch sel := v.(type) {
-	case tree.UnqualifiedStar:
-		// Simple case: a straight '*'. Take all columns.
-		for _, ds := range src {
-			for i := 0; i < len(ds.SourceColumns); i++ {
-				colSel(ds, i)
-			}
-		}
-	case *tree.AllColumnsSelector:
-		tn, err := tree.NormalizeTableName(&sel.TableName)
-		if err != nil {
-			return nil, nil, err
-		}
-		resolver := sqlbase.ColumnResolver{Sources: src}
-		numRes, _, _, err := resolver.FindSourceMatchingName(ctx, tn)
-		if err != nil {
-			return nil, nil, err
-		}
-		if numRes == tree.NoResults {
-			return nil, nil, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"no data source named %q", tree.ErrString(&tn))
-		}
-		ds := src[resolver.ResolverState.SrcIdx]
-		colSet := ds.SourceAliases[resolver.ResolverState.ColSetIdx].ColumnSet
-		for i, ok := colSet.Next(0); ok; i, ok = colSet.Next(i + 1) {
-			colSel(ds, i)
-		}
-	}
-
-	return columns, exprs, nil
 }
 
 // getAliasedTableName returns the underlying table name for a TableExpr that

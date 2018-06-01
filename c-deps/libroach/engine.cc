@@ -15,6 +15,7 @@
 #include "engine.h"
 #include "db.h"
 #include "encoding.h"
+#include "env_manager.h"
 #include "fmt.h"
 #include "getter.h"
 #include "iterator.h"
@@ -25,9 +26,7 @@ using namespace cockroach;
 
 DBEngine::~DBEngine() {}
 
-DBStatus DBEngine::AssertPreClose() {
-  return kSuccess;
-}
+DBStatus DBEngine::AssertPreClose() { return kSuccess; }
 
 DBSSTable* DBEngine::GetSSTables(int* n) {
   std::vector<rocksdb::LiveFileMetaData> metadata;
@@ -98,11 +97,10 @@ DBString DBEngine::GetUserProperties() {
 
 namespace cockroach {
 
-DBImpl::DBImpl(rocksdb::DB* r, rocksdb::Env* m, std::shared_ptr<rocksdb::Cache> bc,
-               std::shared_ptr<DBEventListener> event_listener, rocksdb::Env* s_env)
+DBImpl::DBImpl(rocksdb::DB* r, std::unique_ptr<EnvManager> e, std::shared_ptr<rocksdb::Cache> bc,
+               std::shared_ptr<DBEventListener> event_listener)
     : DBEngine(r, &iters_count),
-      switching_env(s_env),
-      memenv(m),
+      env_mgr(std::move(e)),
       rep_deleter(r),
       block_cache(bc),
       event_listener(event_listener),
@@ -114,7 +112,6 @@ DBImpl::~DBImpl() {
   rocksdb::Info(opts.info_log, "bloom filter utility:    %0.1f%%",
                 (100.0 * s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_USEFUL)) /
                     s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_CHECKED));
-
 }
 
 DBStatus DBImpl::AssertPreClose() {
@@ -207,6 +204,24 @@ DBString DBImpl::GetCompactionStats() {
   return ToDBString(tmp);
 }
 
+DBStatus DBImpl::GetEnvStats(DBEnvStatsResult* stats) {
+  // Always initialize the field to the empty string.
+  stats->encryption_status = DBString();
+
+  if (this->env_mgr->env_stats_handler == nullptr) {
+    return kSuccess;
+  }
+
+  std::string encryption_status;
+  auto status = this->env_mgr->env_stats_handler->GetEncryptionStats(&encryption_status);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+
+  stats->encryption_status = ToDBString(encryption_status);
+  return kSuccess;
+}
+
 // EnvWriteFile writes the given data as a new "file" in the given engine.
 DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
   rocksdb::Status s;
@@ -224,6 +239,67 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
   }
 
   return kSuccess;
+}
+
+// EnvOpenFile opens a new file in the given engine.
+DBStatus DBImpl::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+  rocksdb::Status status;
+  const rocksdb::EnvOptions soptions;
+  rocksdb::unique_ptr<rocksdb::WritableFile> rocksdb_file;
+
+  // Create the file.
+  status = this->rep->GetEnv()->NewWritableFile(ToString(path), &rocksdb_file, soptions);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  *file = rocksdb_file.release();
+  return kSuccess;
+}
+
+// EnvReadFile reads the content of the given filename.
+DBStatus DBImpl::EnvReadFile(DBSlice path, DBSlice* contents) {
+  rocksdb::Status status;
+  std::string data;  
+
+  status = ReadFileToString(this->rep->GetEnv(), ToString(path), &data);
+  if (!status.ok()) {
+    if (status.IsNotFound()) {
+      return FmtStatus("No such file or directory");
+    }
+    return ToDBStatus(status);
+  }
+  contents->data = static_cast<char*>(malloc(data.size()));
+  contents->len = data.size();
+  memcpy(contents->data, data.c_str(), data.size());
+  return kSuccess;
+}
+
+// CloseFile closes the given file in the given engine.
+DBStatus DBImpl::EnvCloseFile(rocksdb::WritableFile* file) {
+  rocksdb::Status status = file->Close();
+  delete file;
+  return ToDBStatus(status);
+}
+
+// EnvAppendFile appends the given data to the file in the given engine.
+DBStatus DBImpl::EnvAppendFile(rocksdb::WritableFile* file, DBSlice contents) {
+  rocksdb::Status status = file->Append(ToSlice(contents));
+  return ToDBStatus(status);
+}
+
+// EnvSyncFile synchronously writes the data of the file to the disk.
+DBStatus DBImpl::EnvSyncFile(rocksdb::WritableFile* file) {
+  rocksdb::Status status = file->Sync();
+  return ToDBStatus(status);
+}
+
+// EnvDelete deletes the file with the given filename.
+DBStatus DBImpl::EnvDeleteFile(DBSlice path) {
+  rocksdb::Status status = this->rep->GetEnv()->DeleteFile(ToString(path));
+  if (status.IsNotFound()) {
+    return FmtStatus("No such file or directory");
+  }
+  return ToDBStatus(status);
 }
 
 }  // namespace cockroach

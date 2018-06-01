@@ -21,12 +21,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // SessionData contains session parameters. They are all user-configurable.
 // A SQL Session changes fields in SessionData through sql.sessionDataMutator.
 type SessionData struct {
+	// ApplicationName is the name of the application running the
+	// current session. This can be used for logging and per-application
+	// statistics.
+	ApplicationName string
 	// Database indicates the "current" database for the purpose of
 	// resolving names. See searchAndQualifyDatabase() for details.
 	Database string
@@ -60,36 +63,21 @@ type SessionData struct {
 	// SafeUpdates causes errors when the client
 	// sends syntax that may have unwanted side effects.
 	SafeUpdates bool
+	RemoteAddr  net.Addr
+	// ZigzagJoinEnabled indicates whether the planner should try and plan a
+	// zigzag join. Will emit a warning if a zigzag join can't be planned.
+	ZigzagJoinEnabled bool
+
 	// SequenceState gives access to the SQL sequences that have been manipulated
 	// by the session.
 	SequenceState *SequenceState
-	RemoteAddr    net.Addr
-
-	mu struct {
-		syncutil.Mutex
-
-		// applicationName is the name of the application running the
-		// current session. This can be used for logging and per-application
-		// statistics.
-		//
-		// applicationName is protected by a mutex because session serialization
-		// needs to access it concurrently with the session.
-		applicationName string
-	}
 }
 
-// ApplicationName returns the identifier that the client used.
-func (s *SessionData) ApplicationName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mu.applicationName
-}
-
-// SetApplicationName sets the current application name.
-func (s *SessionData) SetApplicationName(name string) {
-	s.mu.Lock()
-	s.mu.applicationName = name
-	s.mu.Unlock()
+// Copy performs a deep copy of SessionData.
+func (s *SessionData) Copy() SessionData {
+	cp := *s
+	cp.SequenceState = s.SequenceState.copy()
+	return cp
 }
 
 // DistSQLExecMode controls if and when the Executor uses DistSQL.
@@ -146,6 +134,9 @@ const (
 	OptimizerOff = iota
 	// OptimizerOn means that we use the optimizer for all supported statements.
 	OptimizerOn
+	// OptimizerLocal means that we use the optimizer for all supported
+	// statements, but we don't try to distribute the resulting plan.
+	OptimizerLocal
 	// OptimizerAlways means that we attempt to use the optimizer always, even
 	// for unsupported statements which result in errors. This mode is useful
 	// for testing.
@@ -158,6 +149,8 @@ func (m OptimizerMode) String() string {
 		return "off"
 	case OptimizerOn:
 		return "on"
+	case OptimizerLocal:
+		return "local"
 	case OptimizerAlways:
 		return "always"
 	default:
@@ -172,6 +165,8 @@ func OptimizerModeFromString(val string) (_ OptimizerMode, ok bool) {
 		return OptimizerOff, true
 	case "ON":
 		return OptimizerOn, true
+	case "LOCAL":
+		return OptimizerLocal, true
 	case "ALWAYS":
 		return OptimizerAlways, true
 	default:

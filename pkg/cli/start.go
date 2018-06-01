@@ -29,7 +29,6 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -55,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -78,6 +78,7 @@ uninitialized, specify the --join flag to point to any healthy node
 (or list of nodes) already part of the cluster.
 `,
 	Example: `  cockroach start --insecure --store=attrs=ssd,path=/mnt/ssd1 [--join=host:port,[host:port]]`,
+	Args:    cobra.NoArgs,
 	RunE:    MaybeShoutError(MaybeDecorateGRPCError(runStart)),
 }
 
@@ -279,7 +280,11 @@ func initExternalIODir(ctx context.Context, firstStore base.StoreSpec) (string, 
 }
 
 func initTempStorageConfig(
-	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, firstStore base.StoreSpec,
+	ctx context.Context,
+	st *cluster.Settings,
+	stopper *stop.Stopper,
+	firstStore base.StoreSpec,
+	specIdx int,
 ) (base.TempStorageConfig, error) {
 	var recordPath string
 	if !firstStore.InMemory {
@@ -338,6 +343,7 @@ func initTempStorageConfig(
 		firstStore,
 		startCtx.tempDir,
 		tempStorageMaxSizeBytes,
+		specIdx,
 	)
 
 	// Set temp directory to first store's path if the temp storage is not
@@ -371,10 +377,6 @@ func initTempStorageConfig(
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
 func runStart(cmd *cobra.Command, args []string) error {
-	if len(args) > 0 {
-		return usageAndError(cmd)
-	}
-
 	tBegin := timeutil.Now()
 
 	// First things first: if the user wants background processing,
@@ -395,7 +397,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// the buffers in the signal handler below. If we started capturing
 	// signals later, some startup logging might be lost.
 	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(signalCh, drainSignals...)
 
 	// Set up a tracing span for the start process.  We want any logging
 	// happening beyond this point to be accounted to this start
@@ -439,7 +441,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if serverCfg.Settings.ExternalIODir, err = initExternalIODir(ctx, serverCfg.Stores.Specs[0]); err != nil {
 		return err
 	}
-	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, serverCfg.Settings, stopper, serverCfg.Stores.Specs[0]); err != nil {
+	// Find a StoreSpec that has encryption at rest turned on. If can't find
+	// one, use the first StoreSpec in the list.
+	var specIdx = 0
+	for i := range serverCfg.Stores.Specs {
+		if serverCfg.Stores.Specs[i].ExtraOptions != nil {
+			specIdx = i
+		}
+	}
+	useStore := serverCfg.Stores.Specs[specIdx]
+	if serverCfg.TempStorageConfig, err = initTempStorageConfig(ctx, serverCfg.Settings, stopper, useStore, specIdx); err != nil {
 		return err
 	}
 
@@ -538,12 +549,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 			// We don't do this in (*server.Server).Start() because we don't want it
 			// in tests.
 			if !envutil.EnvOrDefaultBool("COCKROACH_SKIP_UPDATE_CHECK", false) {
-				s.PeriodicallyCheckForUpdates()
+				s.PeriodicallyCheckForUpdates(ctx)
 			}
 
 			// Now inform the user that the server is running and tell the
 			// user about its run-time derived parameters.
-			pgURL, err := serverCfg.PGURL(url.User(cliCtx.sqlConnUser))
+			pgURL, err := serverCfg.PGURL(url.User(security.RootUser))
 			if err != nil {
 				return err
 			}
@@ -589,7 +600,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 			} else {
 				fmt.Fprintf(tw, "status:\trestarted pre-existing node\n")
 			}
-			fmt.Fprintf(tw, "clusterID:\t%s\n", s.ClusterID())
+
+			// Remember the cluster ID for log file rotation.
+			clusterID := s.ClusterID().String()
+			log.SetClusterID(clusterID)
+			fmt.Fprintf(tw, "clusterID:\t%s\n", clusterID)
+
 			fmt.Fprintf(tw, "nodeID:\t%d\n", nodeID)
 			if err := tw.Flush(); err != nil {
 				return err
@@ -747,22 +763,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	select {
 	case sig := <-signalCh:
 		// This new signal is not welcome, as it interferes with the graceful
-		// shutdown process. On Unix, a signal that was not handled gracefully by
-		// the application should be visible to other processes as an exit code
-		// encoded as 128+signal number.
-		//
-		// Also, on Unix, os.Signal is syscall.Signal and it's convertible to int.
-		returnErr = &cliError{
-			exitCode: 128 + int(sig.(syscall.Signal)),
-			severity: log.Severity_ERROR,
-			cause: errors.Errorf(
-				"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint),
-		}
-		// NB: we do not return here to go through log.Flush below.
+		// shutdown process.
+		log.Shout(ctx, log.Severity_ERROR, fmt.Sprintf(
+			"received signal '%s' during shutdown, initiating hard shutdown%s", sig, hardShutdownHint))
+		handleSignalDuringShutdown(sig)
+		panic("unreachable")
 
 	case <-time.After(time.Minute):
-		returnErr = errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
-		// NB: we do not return here to go through log.Flush below.
+		return errors.Errorf("time limit reached, initiating hard shutdown%s", hardShutdownHint)
 
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
@@ -788,8 +796,7 @@ func reportConfiguration(ctx context.Context) {
 	// running as root in a multi-user environment, or using different
 	// uid/gid across runs in the same data directory. To determine
 	// this, it's easier if the information appears in the log file.
-	log.Infof(ctx, "process identity: uid %d euid %d gid %d egid %d",
-		syscall.Getuid(), syscall.Geteuid(), syscall.Getgid(), syscall.Getegid())
+	log.Infof(ctx, "process identity: %s", sysutil.ProcessIdentity())
 }
 
 func maybeWarnMemorySizes(ctx context.Context) {
@@ -883,6 +890,15 @@ func setupAndInitializeLoggingAndProfiling(ctx context.Context) (*stop.Stopper, 
 		// may not have been ready before the call to MkdirAll() above.
 		log.Shout(ctx, log.Severity_WARNING, "multiple stores configured"+
 			" and --log-dir not specified, you may want to specify --log-dir to disambiguate.")
+	}
+
+	if auditLogDir := serverCfg.SQLAuditLogDirName.String(); auditLogDir != "" && auditLogDir != outputDirectory {
+		// Make sure the path for the audit log exists, if it's a different path than
+		// the main log.
+		if err := os.MkdirAll(auditLogDir, 0755); err != nil {
+			return nil, err
+		}
+		log.Eventf(ctx, "created SQL audit log directory %s", auditLogDir)
 	}
 
 	if startCtx.serverInsecure {
@@ -990,6 +1006,7 @@ Shutdown the server. The first stage is drain, where any new requests
 will be ignored by the server. When all extant requests have been
 completed, the server exits.
 `,
+	Args: cobra.NoArgs,
 	RunE: MaybeDecorateGRPCError(runQuit),
 }
 
@@ -1028,6 +1045,9 @@ func doShutdown(ctx context.Context, c serverpb.AdminClient, onModes []int32) er
 	// out, or perhaps drops the connection while waiting). To that end, we first
 	// run a noop DrainRequest. If that fails, we give up.
 	if err := checkNodeRunning(ctx, c); err != nil {
+		if grpcutil.IsClosedConnection(err) {
+			return nil
+		}
 		return err
 	}
 	// Send a drain request and continue reading until the connection drops (which
@@ -1062,10 +1082,6 @@ type errTryHardShutdown struct{ error }
 
 // runQuit accesses the quit shutdown path.
 func runQuit(cmd *cobra.Command, args []string) (err error) {
-	if len(args) != 0 {
-		return usageAndError(cmd)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1099,16 +1115,21 @@ func runQuit(cmd *cobra.Command, args []string) (err error) {
 	case err := <-errChan:
 		if err != nil {
 			if _, ok := err.(errTryHardShutdown); ok {
-				fmt.Printf("graceful shutdown failed: %s; proceeding with hard shutdown\n", err)
+				log.Warningf(ctx, "graceful shutdown failed: %s; proceeding with hard shutdown\n", err)
 				break
 			}
 			return err
 		}
 		return nil
 	case <-time.After(time.Minute):
-		fmt.Println("timed out; proceeding with hard shutdown")
+		log.Warningf(ctx, "timed out; proceeding with hard shutdown")
 	}
 	// Not passing drain modes tells the server to not bother and go
-	// straight to shutdown.
+	// straight to shutdown. We try two times just in case there is a transient error.
+	err = doShutdown(ctx, c, nil)
+	if err != nil {
+		log.Warningf(ctx, "hard shutdown attempt failed, retrying: %v", err)
+		err = doShutdown(ctx, c, nil)
+	}
 	return errors.Wrap(doShutdown(ctx, c, nil), "hard shutdown failed")
 }

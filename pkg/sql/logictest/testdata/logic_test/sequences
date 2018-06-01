@@ -1,4 +1,4 @@
-# LogicTest: default distsql parallel-stmts
+# LogicTest: default opt distsql distsql-opt distsql-metadata parallel-stmts
 
 # see also files `drop_sequence`, `alter_sequence`, `rename_sequence`
 
@@ -118,11 +118,11 @@ CREATE SEQUENCE ignored_options_test CACHE 1 NO CYCLE
 statement ok
 CREATE SEQUENCE show_create_test
 
-query ITTITTTT colnames
+query ITTITTTTTTT colnames
 SELECT * FROM crdb_internal.create_statements WHERE descriptor_name = 'show_create_test'
 ----
-database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                              state
-50           test           public       64             sequence         show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                              state   create_nofks                                                                                  alter_statements  validate_statements
+52           test           public       66             sequence         show_create_test  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}
 
 query TT colnames
 SHOW CREATE SEQUENCE show_create_test
@@ -177,14 +177,8 @@ SELECT last_value FROM select_test
 1
 
 # Since this is a custom plan node, verify that column validation works.
-statement error pq: column name "foo" not found
+statement error pq: column "foo" does not exist
 SELECT foo from select_test
-
-query TITTTTT colnames
-EXPLAIN (PLAN, METADATA) SELECT * FROM select_test
-----
-Tree             Level  Type             Field  Description  Columns                           Ordering
-sequence select  0      sequence select  ·      ·            (last_value, log_cnt, is_called)  ·
 
 # USING THE `nextval` AND `currval` FUNCTIONS
 

@@ -16,6 +16,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 
@@ -73,7 +74,7 @@ type planMaker interface {
 var _ planMaker = &planner{}
 
 // runParams is a struct containing all parameters passed to planNode.Next() and
-// planNode.Start().
+// startPlan.
 type runParams struct {
 	// context.Context for this method call.
 	ctx context.Context
@@ -176,6 +177,7 @@ var _ planNode = &dropViewNode{}
 var _ planNode = &dropSequenceNode{}
 var _ planNode = &zeroNode{}
 var _ planNode = &unaryNode{}
+var _ planNode = &distSQLWrapper{}
 var _ planNode = &explainDistSQLNode{}
 var _ planNode = &explainPlanNode{}
 var _ planNode = &showTraceNode{}
@@ -189,8 +191,10 @@ var _ planNode = &limitNode{}
 var _ planNode = &ordinalityNode{}
 var _ planNode = &testingRelocateNode{}
 var _ planNode = &renderNode{}
+var _ planNode = &rowCountNode{}
 var _ planNode = &scanNode{}
 var _ planNode = &scatterNode{}
+var _ planNode = &serializeNode{}
 var _ planNode = &showRangesNode{}
 var _ planNode = &showFingerprintsNode{}
 var _ planNode = &sortNode{}
@@ -209,8 +213,35 @@ var _ planNodeFastPath = &DropUserNode{}
 var _ planNodeFastPath = &alterUserSetPasswordNode{}
 var _ planNodeFastPath = &createTableNode{}
 var _ planNodeFastPath = &deleteNode{}
+var _ planNodeFastPath = &rowCountNode{}
+var _ planNodeFastPath = &serializeNode{}
 var _ planNodeFastPath = &setZoneConfigNode{}
-var _ planNodeFastPath = &upsertNode{}
+var _ planNodeFastPath = &controlJobsNode{}
+
+// planNodeRequireSpool serves as marker for nodes whose parent must
+// ensure that the node is fully run to completion (and the results
+// spooled) during the start phase. This is currently implemented by
+// all mutation statements except for upsert.
+type planNodeRequireSpool interface {
+	requireSpool()
+}
+
+var _ planNodeRequireSpool = &serializeNode{}
+
+// planNodeSpool serves as marker for nodes that can perform all their
+// execution during the start phase. This is different from the "fast
+// path" interface because a node that performs all its execution
+// during the start phase might still have some result rows and thus
+// not implement the fast path.
+//
+// This interface exists for the following optimization: nodes
+// that require spooling but are the children of a spooled node
+// do not require the introduction of an explicit spool.
+type planNodeSpooled interface {
+	spooled()
+}
+
+var _ planNodeSpooled = &spoolNode{}
 
 // planTop is the struct that collects the properties
 // of an entire plan.
@@ -317,13 +348,20 @@ func (p *planner) makePlan(ctx context.Context, stmt Statement) error {
 // makeOptimizerPlan is an alternative to makePlan which uses the (experimental)
 // optimizer.
 func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
-	// execEngine is both an exec.Factory and an opt.Catalog. cleanup is not
-	// required on the engine, since planner is cleaned up elsewhere.
-	eng := newExecEngine(p, nil)
-	defer eng.Close()
+	// Start with fast check to see if top-level statement is supported.
+	switch stmt.AST.(type) {
+	case *tree.ParenSelect, *tree.Select, *tree.SelectClause,
+		*tree.UnionClause, *tree.ValuesClause, *tree.Explain:
 
-	o := xform.NewOptimizer(p.EvalContext(), xform.OptimizeAll)
-	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), eng.Catalog(), o.Factory(), stmt.AST)
+	default:
+		return pgerror.Unimplemented("statement", fmt.Sprintf("unsupported statement: %T", stmt.AST))
+	}
+
+	var catalog optCatalog
+	catalog.init(p.execCfg.TableStatsCache, p)
+
+	o := xform.NewOptimizer(p.EvalContext())
+	bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), &catalog, o.Factory(), stmt.AST)
 	root, props, err := bld.Build()
 	if err != nil {
 		return err
@@ -331,11 +369,23 @@ func (p *planner) makeOptimizerPlan(ctx context.Context, stmt Statement) error {
 
 	ev := o.Optimize(root, props)
 
-	node, err := execbuilder.New(eng, ev).Build()
+	factory := makeExecFactory(p)
+	plan, err := execbuilder.New(&factory, ev).Build()
 	if err != nil {
 		return err
 	}
-	p.curPlan.plan = node.(planNode)
+
+	p.curPlan = *plan.(*planTop)
+	p.curPlan.AST = stmt.AST
+
+	cols := planColumns(p.curPlan.plan)
+	if stmt.ExpectedTypes != nil {
+		if !stmt.ExpectedTypes.TypesEqual(cols) {
+			return pgerror.NewError(pgerror.CodeFeatureNotSupportedError,
+				"cached plan must not change result type")
+		}
+	}
+
 	return nil
 }
 
@@ -450,6 +500,13 @@ type autoCommitNode interface {
 	enableAutoCommit()
 }
 
+var _ autoCommitNode = &createTableNode{}
+var _ autoCommitNode = &delayedNode{}
+var _ autoCommitNode = &deleteNode{}
+var _ autoCommitNode = &insertNode{}
+var _ autoCommitNode = &updateNode{}
+var _ autoCommitNode = &upsertNode{}
+
 // startExec calls startExec() on each planNode that supports
 // execStartable using a depth-first, post-order traversal.
 // The subqueries, if any, are also started.
@@ -460,6 +517,9 @@ func startExec(params runParams, plan planNode) error {
 	o := planObserver{
 		enterNode: func(ctx context.Context, _ string, p planNode) (bool, error) {
 			switch p.(type) {
+			case *distSQLWrapper:
+				// Do not recurse: the plan is executed in distSQL.
+				return false, nil
 			case *explainPlanNode, *explainDistSQLNode:
 				// Do not recurse: we're not starting the plan if we just show its structure with EXPLAIN.
 				return false, nil
@@ -488,10 +548,10 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
-		if fn, header, err := planHook(ctx, stmt, p); err != nil {
+		if fn, header, subplans, err := planHook(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
-			return &hookFnNode{f: fn, header: header}, nil
+			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
 	for _, planHook := range wrappedPlanHooks {
@@ -601,10 +661,12 @@ func (p *planner) newPlan(
 		return p.AlterSequence(ctx, n)
 	case *tree.AlterUserSetPassword:
 		return p.AlterUserSetPassword(ctx, n)
-	case *tree.CancelQuery:
-		return p.CancelQuery(ctx, n)
-	case *tree.CancelJob:
-		return p.CancelJob(ctx, n)
+	case *tree.CancelQueries:
+		return p.CancelQueries(ctx, n)
+	case *tree.CancelSessions:
+		return p.CancelSessions(ctx, n)
+	case *tree.ControlJobs:
+		return p.ControlJobs(ctx, n)
 	case *tree.Scrub:
 		return p.Scrub(ctx, n)
 	case *tree.CreateDatabase:
@@ -649,8 +711,6 @@ func (p *planner) newPlan(
 		return p.Insert(ctx, n, desiredTypes)
 	case *tree.ParenSelect:
 		return p.newPlan(ctx, n.Select, desiredTypes)
-	case *tree.PauseJob:
-		return p.PauseJob(ctx, n)
 	case *tree.TestingRelocate:
 		return p.TestingRelocate(ctx, n)
 	case *tree.RenameColumn:
@@ -661,8 +721,6 @@ func (p *planner) newPlan(
 		return p.RenameIndex(ctx, n)
 	case *tree.RenameTable:
 		return p.RenameTable(ctx, n)
-	case *tree.ResumeJob:
-		return p.ResumeJob(ctx, n)
 	case *tree.Revoke:
 		return p.Revoke(ctx, n)
 	case *tree.Scatter:
@@ -782,10 +840,12 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 	switch n := stmt.(type) {
 	case *tree.AlterUserSetPassword:
 		return p.AlterUserSetPassword(ctx, n)
-	case *tree.CancelQuery:
-		return p.CancelQuery(ctx, n)
-	case *tree.CancelJob:
-		return p.CancelJob(ctx, n)
+	case *tree.CancelQueries:
+		return p.CancelQueries(ctx, n)
+	case *tree.CancelSessions:
+		return p.CancelSessions(ctx, n)
+	case *tree.ControlJobs:
+		return p.ControlJobs(ctx, n)
 	case *tree.CreateUser:
 		return p.CreateUser(ctx, n)
 	case *tree.CreateTable:
@@ -798,10 +858,6 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.Explain(ctx, n)
 	case *tree.Insert:
 		return p.Insert(ctx, n, nil)
-	case *tree.PauseJob:
-		return p.PauseJob(ctx, n)
-	case *tree.ResumeJob:
-		return p.ResumeJob(ctx, n)
 	case *tree.Select:
 		return p.Select(ctx, n, nil)
 	case *tree.SelectClause:
@@ -867,4 +923,14 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		// handling here.
 		return nil, nil
 	}
+}
+
+// Mark transaction as operating on the system DB if the descriptor id
+// is within the SystemConfig range.
+func (p *planner) maybeSetSystemConfig(id sqlbase.ID) error {
+	if !sqlbase.IsSystemConfigID(id) {
+		return nil
+	}
+	// Mark transaction as operating on the system DB.
+	return p.txn.SetSystemConfigTrigger()
 }

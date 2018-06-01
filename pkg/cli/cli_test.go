@@ -35,6 +35,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -58,6 +59,8 @@ type cliTest struct {
 	// logScope binds the lifetime of the log files to this test, when t
 	// is not nil
 	logScope *log.TestLogScope
+	// if true, doesn't print args during RunWithArgs
+	omitArgs bool
 }
 
 type cliTestParams struct {
@@ -65,6 +68,7 @@ type cliTestParams struct {
 	insecure   bool
 	noServer   bool
 	storeSpecs []base.StoreSpec
+	locality   roachpb.Locality
 }
 
 func (c *cliTest) fail(err interface{}) {
@@ -123,6 +127,7 @@ func newCLITest(params cliTestParams) cliTest {
 			Insecure:    params.insecure,
 			SSLCertsDir: c.certsDir,
 			StoreSpecs:  params.storeSpecs,
+			Locality:    params.locality,
 		})
 		if err != nil {
 			c.fail(err)
@@ -290,8 +295,10 @@ func (c cliTest) RunWithArgs(origArgs []string) {
 		}
 		args = append(args, origArgs[1:]...)
 
-		fmt.Fprintf(os.Stderr, "%s\n", args)
-		fmt.Println(strings.Join(origArgs, " "))
+		if !c.omitArgs {
+			fmt.Fprintf(os.Stderr, "%s\n", args)
+			fmt.Println(strings.Join(origArgs, " "))
+		}
 
 		return Run(args)
 	}(); err != nil {
@@ -421,7 +428,17 @@ func Example_logging() {
 }
 
 func Example_zone() {
-	c := newCLITest(cliTestParams{})
+	storeSpec := base.DefaultTestStoreSpec
+	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{"ssd"}}
+	c := newCLITest(cliTestParams{
+		storeSpecs: []base.StoreSpec{storeSpec},
+		locality: roachpb.Locality{
+			Tiers: []roachpb.Tier{
+				{Key: "region", Value: "us-east-1"},
+				{Key: "zone", Value: "us-east-1a"},
+			},
+		},
+	})
 	defer c.cleanup()
 
 	c.Run("zone ls")
@@ -461,6 +478,13 @@ func Example_zone() {
 	c.Run("zone rm .timeseries")
 	c.Run("zone set system.jobs@primary --file=./testdata/zone_attrs.yaml")
 	c.Run("zone set system --file=./testdata/zone_attrs_advanced.yaml")
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int)"})
+	c.Run("zone set t --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone ls")
+	c.Run("zone set t.f --file=./testdata/zone_range_max_bytes.yaml")
+	c.Run("zone ls")
+	c.RunWithArgs([]string{"sql", "-e", "drop database t cascade"})
+	c.Run("zone ls")
 
 	// Output:
 	// zone ls
@@ -474,7 +498,7 @@ func Example_zone() {
 	// gc:
 	//   ttlseconds: 90000
 	// num_replicas: 1
-	// constraints: [+us-east-1a, +ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
 	// zone ls
 	// .default
 	// .liveness
@@ -506,7 +530,7 @@ func Example_zone() {
 	// gc:
 	//   ttlseconds: 90000
 	// num_replicas: 1
-	// constraints: [+us-east-1a, +ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
 	// zone set system.descriptor --file=./testdata/zone_attrs.yaml
 	// pq: cannot set zone configs for system config tables; try setting your config on the entire "system" database instead
 	// zone set system.namespace --file=./testdata/zone_attrs.yaml
@@ -519,7 +543,7 @@ func Example_zone() {
 	// gc:
 	//   ttlseconds: 90000
 	// num_replicas: 3
-	// constraints: [+us-east-1a, +ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
 	// zone get system
 	// system
 	// range_min_bytes: 1048576
@@ -527,7 +551,7 @@ func Example_zone() {
 	// gc:
 	//   ttlseconds: 90000
 	// num_replicas: 3
-	// constraints: [+us-east-1a, +ssd]
+	// constraints: [+zone=us-east-1a, +ssd]
 	// zone rm system
 	// CONFIGURE ZONE 1
 	// zone ls
@@ -641,8 +665,41 @@ func Example_zone() {
 	// gc:
 	//   ttlseconds: 90000
 	// num_replicas: 3
-	// constraints: {'+us-east-1a,+ssd': 1, +us-east-1b: 1}
-	// experimental_lease_preferences: [[+us-east1b], [+us-east-1a]]
+	// constraints: {+region=us-east-1: 1, '+zone=us-east-1a,+ssd': 1}
+	// experimental_lease_preferences: [[+region=us-east-1], [+zone=us-east-1a]]
+	// sql -e create database t; create table t.f (x int, y int)
+	// CREATE TABLE
+	// zone set t --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// zone ls
+	// .default
+	// system
+	// system.jobs
+	// t
+	// zone set t.f --file=./testdata/zone_range_max_bytes.yaml
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 90000
+	// num_replicas: 3
+	// constraints: []
+	// zone ls
+	// .default
+	// system
+	// system.jobs
+	// t
+	// t.f
+	// sql -e drop database t cascade
+	// DROP DATABASE
+	// zone ls
+	// .default
+	// system
+	// system.jobs
 }
 
 func Example_sql() {
@@ -674,7 +731,7 @@ func Example_sql() {
 	// Output:
 	// sql -e show application_name
 	// application_name
-	// cockroach
+	// cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// INSERT 1
 	// sql -e select 3 -e select * from t.f
@@ -692,6 +749,8 @@ func Example_sql() {
 	// 42	69
 	// sql --execute=show databases
 	// Database
+	// defaultdb
+	// postgres
 	// system
 	// t
 	// sql -e select 1; select 2
@@ -887,7 +946,7 @@ thenshort`,
 	// -- 1 row
 	// sql --format=html -e select * from t.u
 	// <table>
-	// <thead><tr><th>row</th><th>f&#34;oo</th><th>f&#39;oo</th><th>f\oo</th><th>short<br/>very very long<br/>not much</th><th>very very long<br/>thenshort</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></head>
+	// <thead><tr><th>row</th><th>f&#34;oo</th><th>f&#39;oo</th><th>f\oo</th><th>short<br/>very very long<br/>not much</th><th>very very long<br/>thenshort</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></thead>
 	// <tbody>
 	// <tr><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
 	// </tbody>
@@ -950,7 +1009,7 @@ func Example_sql_empty_table() {
 	// -- 0 rows
 	// sql --format=html -e select * from t.norows
 	// <table>
-	// <thead><tr><th>row</th><th>x</th></tr></head>
+	// <thead><tr><th>row</th><th>x</th></tr></thead>
 	// </tbody>
 	// <tfoot><tr><td colspan=2>0 rows</td></tr></tfoot></table>
 	// sql --format=raw -e select * from t.norows
@@ -981,7 +1040,7 @@ func Example_sql_empty_table() {
 	// -- 3 rows
 	// sql --format=html -e select * from t.nocols
 	// <table>
-	// <thead><tr><th>row</th></tr></head>
+	// <thead><tr><th>row</th></tr></thead>
 	// <tbody>
 	// <tr><td>1</td></tr>
 	// <tr><td>2</td></tr>
@@ -1010,7 +1069,7 @@ func Example_sql_empty_table() {
 	// -- 0 rows
 	// sql --format=html -e select * from t.nocolsnorows
 	// <table>
-	// <thead><tr><th>row</th></tr></head>
+	// <thead><tr><th>row</th></tr></thead>
 	// </tbody>
 	// <tfoot><tr><td colspan=1>0 rows</td></tr></tfoot></table>
 	// sql --format=raw -e select * from t.nocolsnorows
@@ -1334,7 +1393,7 @@ func Example_sql_table() {
 	// -- 9 rows
 	// sql --format=html -e select * from t.t
 	// <table>
-	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></head>
+	// <thead><tr><th>row</th><th>s</th><th>d</th></tr></thead>
 	// <tbody>
 	// <tr><td>1</td><td>foo</td><td>printable ASCII</td></tr>
 	// <tr><td>2</td><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
@@ -1397,6 +1456,83 @@ func Example_sql_table() {
 	// ## 4
 	// tabs
 	// # 9 rows
+}
+
+func TestRenderHTML(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cols := []string{"colname"}
+	align := "d"
+	rows := [][]string{
+		{"<b>foo</b>"},
+		{"bar"},
+	}
+
+	type testCase struct {
+		reporter htmlReporter
+		out      string
+	}
+
+	testCases := []testCase{
+		{
+			reporter: htmlReporter{},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td><b>foo</b></td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true},
+			out: `<table>
+<thead><tr><th>colname</th></tr></thead>
+<tbody>
+<tr><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>bar</td></tr>
+</tbody>
+</table>
+`,
+		},
+		{
+			reporter: htmlReporter{rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>foo</b></td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+		{
+			reporter: htmlReporter{escape: true, rowStats: true},
+			out: `<table>
+<thead><tr><th>row</th><th>colname</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>&lt;b&gt;foo&lt;/b&gt;</td></tr>
+<tr><td>2</td><td>bar</td></tr>
+</tbody>
+<tfoot><tr><td colspan=2>2 rows</td></tr></tfoot></table>
+`,
+		},
+	}
+
+	for _, tc := range testCases {
+		name := fmt.Sprintf("escape=%v/rowStats=%v", tc.reporter.escape, tc.reporter.rowStats)
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := render(&tc.reporter, &buf, cols, newRowSliceIter(rows, align), nil /* noRowsHook */)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.out != buf.String() {
+				t.Errorf("expected:\n%s\ngot:\n%s", tc.out, buf.String())
+			}
+		})
+	}
 }
 
 func Example_misc_pretty() {
@@ -1594,6 +1730,7 @@ Available Commands:
   node        list, inspect or remove nodes
   dump        dump sql tables
 
+  demo        open a demo sql shell
   gen         generate auxiliary files
   version     output version information
   debug       debugging commands
@@ -1652,7 +1789,7 @@ Use "cockroach [command] --help" for more information about a command.
 			}
 
 			// Filter out all test flags.
-			testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule)`)
+			testFlagRE := regexp.MustCompile(`--(test\.|verbosity|vmodule|rewrite)`)
 			lines := strings.Split(buf.String(), "\n")
 			final := []string{}
 			for _, l := range lines {
@@ -1714,9 +1851,7 @@ func TestCLITimeout(t *testing.T) {
 		}
 
 		const exp = `node status 1 --timeout 1ns
-operation timed out.
-
-context deadline exceeded
+pq: query execution canceled due to statement timeout
 `
 		if out != exp {
 			err := errors.Errorf("unexpected output:\n%q\nwanted:\n%q", out, exp)
@@ -1868,7 +2003,7 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		testcases = append(testcases,
 			testCase{"leader_ranges", baseIdx, 3},
 			testCase{"leaseholder_ranges", baseIdx + 1, 3},
-			testCase{"ranges", baseIdx + 2, 20},
+			testCase{"ranges", baseIdx + 2, 22},
 			testCase{"unavailable_ranges", baseIdx + 3, 1},
 			testCase{"underreplicated_ranges", baseIdx + 4, 1},
 		)
@@ -1998,18 +2133,43 @@ func TestGenAutocomplete(t *testing.T) {
 		}
 	}()
 
-	const minsize = 25000
-	acpath := filepath.Join(acdir, "cockroach.bash")
+	for _, tc := range []struct {
+		shell  string
+		expErr string
+	}{
+		{shell: ""},
+		{shell: "bash"},
+		{shell: "zsh"},
+		{shell: "bad", expErr: `invalid argument "bad" for "cockroach gen autocomplete"`},
+	} {
+		t.Run("shell="+tc.shell, func(t *testing.T) {
+			const minsize = 1000
+			acpath := filepath.Join(acdir, "output-"+tc.shell)
 
-	if err := Run([]string{"gen", "autocomplete", "--out=" + acpath}); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(acpath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size := info.Size(); size < minsize {
-		t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+			args := []string{"gen", "autocomplete", "--out=" + acpath}
+			if len(tc.shell) > 0 {
+				args = append(args, tc.shell)
+			}
+			err := Run(args)
+			if tc.expErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if !testutils.IsError(err, tc.expErr) {
+					t.Fatalf("expected error %s, found %v", tc.expErr, err)
+				}
+				return
+			}
+
+			info, err := os.Stat(acpath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if size := info.Size(); size < minsize {
+				t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
+			}
+		})
 	}
 }
 
@@ -2020,17 +2180,18 @@ func TestJunkPositionalArguments(t *testing.T) {
 	defer c.cleanup()
 
 	for i, test := range []string{
-		"start junk",
-		"sql junk",
-		"gen man junk",
-		"gen autocomplete junk",
-		"gen example-data intro junk",
+		"start",
+		"sql",
+		"gen man",
+		"gen example-data intro",
 	} {
-		out, err := c.RunWithCapture(test)
+		const junk = "junk"
+		line := test + " " + junk
+		out, err := c.RunWithCapture(line)
 		if err != nil {
 			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
 		}
-		exp := test + "\ninvalid arguments\n"
+		exp := fmt.Sprintf("%s\nunknown command %q for \"cockroach %s\"\n", line, junk, test)
 		if exp != out {
 			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
 		}
@@ -2053,6 +2214,9 @@ writing ` + os.DevNull + `
   debug/events
   debug/liveness
   debug/settings
+  debug/gossip/liveness
+  debug/gossip/nodes
+  debug/metrics
   debug/nodes/1/status
   debug/nodes/1/gossip
   debug/nodes/1/stacks
@@ -2077,6 +2241,10 @@ writing ` + os.DevNull + `
   debug/nodes/1/ranges/18
   debug/nodes/1/ranges/19
   debug/nodes/1/ranges/20
+  debug/nodes/1/ranges/21
+  debug/nodes/1/ranges/22
+  debug/schema/defaultdb@details
+  debug/schema/postgres@details
   debug/schema/system@details
   debug/schema/system/descriptor
   debug/schema/system/eventlog

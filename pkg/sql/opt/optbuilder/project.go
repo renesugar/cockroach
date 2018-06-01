@@ -16,188 +16,228 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 )
+
+// constructProjectForScope constructs a projection if it will result in a different
+// set of columns than its input. Either way, it updates projectionsScope.group
+// with the output memo group ID.
+func (b *Builder) constructProjectForScope(inScope, projectionsScope *scope) {
+	// Don't add an unnecessary "pass through" project.
+	if projectionsScope.hasSameColumns(inScope) {
+		projectionsScope.group = inScope.group
+	} else {
+		projectionsScope.group = b.constructProject(inScope.group, projectionsScope.cols)
+	}
+}
+
+func (b *Builder) constructProject(input memo.GroupID, cols []scopeColumn) memo.GroupID {
+	def := memo.ProjectionsOpDef{
+		SynthesizedCols: make(opt.ColList, 0, len(cols)),
+	}
+
+	groupList := make([]memo.GroupID, 0, len(cols))
+
+	// Deduplicate the columns; we only need to project each column once.
+	colSet := opt.ColSet{}
+	for i := range cols {
+		id, group := cols[i].id, cols[i].group
+		if !colSet.Contains(int(id)) {
+			if group == 0 {
+				def.PassthroughCols.Add(int(id))
+			} else {
+				def.SynthesizedCols = append(def.SynthesizedCols, id)
+				groupList = append(groupList, group)
+			}
+			colSet.Add(int(id))
+		}
+	}
+
+	return b.factory.ConstructProject(
+		input,
+		b.factory.ConstructProjections(
+			b.factory.InternList(groupList),
+			b.factory.InternProjectionsOpDef(&def),
+		),
+	)
+}
 
 // buildProjectionList builds a set of memo groups that represent the given
 // list of select expressions.
 //
-// The return value `projections` is an ordered list of top-level memo
-// groups corresponding to each select expression. See Builder.buildStmt
-// for a description of the remaining input values (outScope is passed as
-// a parameter here rather than a return value).
+// See Builder.buildStmt for a description of the remaining input values.
 //
 // As a side-effect, the appropriate scopes are updated with aggregations
 // (scope.groupby.aggs)
-func (b *Builder) buildProjectionList(
-	selects tree.SelectExprs, inScope *scope, outScope *scope,
-) (projections []opt.GroupID) {
-	projections = make([]opt.GroupID, 0, len(selects))
+func (b *Builder) buildProjectionList(selects tree.SelectExprs, inScope *scope, outScope *scope) {
 	for _, e := range selects {
-		subset := b.buildProjection(e.Expr, string(e.As), inScope, outScope)
-		projections = append(projections, subset...)
-	}
+		// Pre-normalize any VarName so the work is not done twice below.
+		if err := e.NormalizeTopLevelVarName(); err != nil {
+			panic(builderError{err})
+		}
 
-	return projections
+		// Special handling for "*" and "<table>.*".
+		if v, ok := e.Expr.(tree.VarName); ok {
+			switch v.(type) {
+			case tree.UnqualifiedStar, *tree.AllColumnsSelector:
+				if e.As != "" {
+					panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
+						"%q cannot be aliased", tree.ErrString(v))})
+				}
+
+				exprs := b.expandStar(e.Expr, inScope)
+				for _, e := range exprs {
+					b.buildScalarProjection(e, "", inScope, outScope)
+				}
+				continue
+			}
+		}
+
+		// Output column names should exactly match the original expression, so we
+		// have to determine the output column name before we perform type
+		// checking.
+		label := b.getColName(e)
+		texpr := inScope.resolveType(e.Expr, types.Any)
+		b.buildScalarProjection(texpr, label, inScope, outScope)
+	}
 }
 
-// buildProjection builds a set of memo groups that represent a projection
-// expression.
-//
-// projection  The given projection expression.
-// label       If a new column is synthesized (e.g., for a scalar expression),
-//             it will be labeled with this string.
-//
-// The return value `projections` is an ordered list of top-level memo
-// groups corresponding to the expression. The list generally consists of a
-// single memo group except in the case of "*", where the expression is
-// expanded to multiple columns.
-//
-// See Builder.buildStmt for a description of the remaining input values
-// (outScope is passed as a parameter here rather than a return value because
-// the newly bound variables are appended to a growing list to be returned by
-// buildProjectionList).
-func (b *Builder) buildProjection(
-	projection tree.Expr, label string, inScope, outScope *scope,
-) (projections []opt.GroupID) {
-	exprs := b.expandStarAndResolveType(projection, inScope)
-	if len(exprs) > 1 && label != "" {
-		panic(errorf("\"%s\" cannot be aliased", projection))
+// getColName returns the output column name for a projection expression.
+// It assumes that top-level variable names have already been normalized via a
+// call to NormalizeTopLevelVarName().
+// NB: This function is copied from sql/getRenderColName() in sql/render.go.
+func (b *Builder) getColName(expr tree.SelectExpr) string {
+	if expr.As != "" {
+		return string(expr.As)
 	}
 
-	projections = make([]opt.GroupID, 0, len(exprs))
-	for _, e := range exprs {
-		projections = append(projections, b.buildScalarProjection(e, label, inScope, outScope))
+	switch t := expr.Expr.(type) {
+	case *tree.ColumnItem:
+		// If the expression designates a column, try to reuse that column's name
+		// as projection name.
+		return t.Column()
+
+	case *tree.FuncExpr:
+		// Special case for projecting builtin functions: the column name for an
+		// otherwise un-named builtin output column is just the name of the builtin.
+		fd, err := t.Func.Resolve(b.semaCtx.SearchPath)
+		if err != nil {
+			panic(builderError{err})
+		}
+		return fd.Name
+
+	case *tree.ColumnAccessExpr:
+		// Special case for projecting a column accessor.
+		if t.Star {
+			// TODO(bram): remove this, this case should never happen once (srf).* is
+			// correctly implemented.
+			return t.Expr.String()
+		}
+		return t.ColName
 	}
 
-	return projections
+	return expr.Expr.String()
 }
 
 // buildScalarProjection builds a set of memo groups that represent a scalar
-// expression.
+// expression, and then projects a new output column (either passthrough or
+// synthesized) in outScope having that expression as its value.
 //
 // texpr   The given scalar expression.
 // label   If a new column is synthesized, it will be labeled with this string.
 //         For example, the query `SELECT (x + 1) AS "x_incr" FROM t` has a
 //         projection with a synthesized column "x_incr".
 //
-// The return value corresponds to the top-level memo group ID for this scalar
-// expression.
+// The return value corresponds to the new column which has been created for
+// this scalar expression.
 //
-// See Builder.buildStmt for a description of the remaining input values
-// (outScope is passed as a parameter here rather than a return value because
-// the newly bound variables are appended to a growing list to be returned by
-// buildProjectionList).
+// See Builder.buildStmt for a description of the remaining input values.
 func (b *Builder) buildScalarProjection(
 	texpr tree.TypedExpr, label string, inScope, outScope *scope,
-) opt.GroupID {
-	// NB: The case statements are sorted lexicographically.
-	switch t := texpr.(type) {
-	case *columnProps:
-		return b.buildVariableProjection(t, label, inScope, outScope)
-
-	case *tree.FuncExpr:
-		out, col := b.buildFunction(t, label, inScope)
-		if col != nil {
-			// Function was mapped to a column reference, such as in the case
-			// of an aggregate.
-			outScope.cols = append(outScope.cols, *col)
-		} else {
-			out = b.buildDefaultScalarProjection(texpr, out, label, inScope, outScope)
-		}
-		return out
-
-	case *tree.ParenExpr:
-		return b.buildScalarProjection(t.TypedInnerExpr(), label, inScope, outScope)
-
-	default:
-		out := b.buildScalar(texpr, inScope)
-		out = b.buildDefaultScalarProjection(texpr, out, label, inScope, outScope)
-		return out
-	}
+) *scopeColumn {
+	b.buildScalarHelper(texpr, label, inScope, outScope)
+	return &outScope.cols[len(outScope.cols)-1]
 }
 
-// buildVariableProjection builds a memo group that represents the given
-// column. label contains an optional alias for the column (e.g., if specified
-// with the AS keyword).
-//
-// The return value corresponds to the top-level memo group ID for this scalar
-// expression.
-//
-// See Builder.buildStmt for a description of the remaining input values
-// (outScope is passed as a parameter here rather than a return value because
-// the newly bound variables are appended to a growing list to be returned by
-// buildProjectionList).
-func (b *Builder) buildVariableProjection(
-	col *columnProps, label string, inScope, outScope *scope,
-) opt.GroupID {
-	if inScope.inGroupingContext() && !inScope.groupby.inAgg && !inScope.groupby.aggInScope.hasColumn(col.index) {
-		panic(groupingError(col.String()))
-	}
-	out := b.factory.ConstructVariable(b.factory.InternPrivate(col.index))
-	outScope.cols = append(outScope.cols, *col)
-
-	// Update the column name with the alias if it exists, and mark the column
-	// as a visible member of an anonymous table.
-	col = &outScope.cols[len(outScope.cols)-1]
-	if label != "" {
-		col.name = tree.Name(label)
-	}
-	col.table.TableName = ""
-	col.hidden = false
-	return out
-}
-
-// buildDefaultScalarProjection builds a set of memo groups that represent
-// a scalar expression.
+// finishBuildScalar completes construction of a new scalar expression. If
+// outScope is nil, then finishBuildScalar returns the result memo group, which
+// can be nested within the larger expression being built. If outScope is not
+// nil, then finishBuildScalar synthesizes a new output column in outScope with
+// the expression as its value.
 //
 // texpr     The given scalar expression. The expression is any scalar
 //           expression except for a bare variable or aggregate (those are
 //           handled separately in buildVariableProjection and
 //           buildFunction).
 // group     The memo group that has already been built for the given
-//           expression. It may be replaced by a variable reference if the
-//           expression already exists (e.g., as a GROUP BY column).
+//           expression.
 // label     If a new column is synthesized, it will be labeled with this
 //           string.
 //
-// The return value corresponds to the top-level memo group ID for this scalar
-// expression.
-//
-// See Builder.buildStmt for a description of the remaining input values
-// (outScope is passed as a parameter here rather than a return value because
-// the newly bound variables are appended to a growing list to be returned by
-// buildProjectionList).
-func (b *Builder) buildDefaultScalarProjection(
-	texpr tree.TypedExpr, group opt.GroupID, label string, inScope, outScope *scope,
-) opt.GroupID {
-	if inScope.inGroupingContext() && !inScope.groupby.inAgg {
-		if len(inScope.groupby.varsUsed) > 0 {
-			if _, ok := inScope.groupby.groupStrs[symbolicExprStr(texpr)]; !ok {
-				// This expression was not found among the GROUP BY expressions.
-				i := inScope.groupby.varsUsed[0]
-				col := b.colMap[i]
-				panic(groupingError(col.String()))
-			}
-
-			// Reset varsUsed for the next projection.
-			inScope.groupby.varsUsed = inScope.groupby.varsUsed[:0]
-		}
-
-		if col := inScope.findGrouping(group); col != nil {
-			// The column already exists, so use that instead.
-			col = &b.colMap[col.index]
-			if label != "" {
-				col.name = tree.Name(label)
-			}
-			outScope.cols = append(outScope.cols, *col)
-
-			// Replace the expression with a reference to the column.
-			return b.factory.ConstructVariable(b.factory.InternPrivate(col.index))
-		}
+// See Builder.buildStmt for a description of the remaining input and return
+// values.
+func (b *Builder) finishBuildScalar(
+	texpr tree.TypedExpr, group memo.GroupID, label string, inScope, outScope *scope,
+) (out memo.GroupID) {
+	if outScope == nil {
+		return group
 	}
 
-	b.synthesizeColumn(outScope, label, texpr.ResolvedType(), texpr)
+	// Avoid synthesizing a new column if possible.
+	if col := outScope.findExistingCol(texpr); col != nil {
+		col = outScope.appendColumn(col, label)
+		col.group = group
+		return
+	}
+
+	b.synthesizeColumn(outScope, label, texpr.ResolvedType(), texpr, group)
 	return group
+}
+
+// finishBuildScalarRef constructs a reference to the given column. If outScope
+// is nil, then finishBuildScalarRef returns a Variable expression that refers
+// to the column. This expression can be nested within the larger expression
+// being constructed. If outScope is not nil, then finishBuildScalarRef adds the
+// column to outScope, either as a passthrough column (if it already exists in
+// the input scope), or a variable expression.
+//
+// col     Column containing the scalar expression that's been referenced.
+// label   If passthrough column is added, it will optionally be labeled with
+//         this string (if not empty).
+//
+// See Builder.buildStmt for a description of the remaining input and return
+// values.
+func (b *Builder) finishBuildScalarRef(
+	col *scopeColumn, label string, inScope, outScope *scope,
+) (out memo.GroupID) {
+	// If this is not a projection context, then wrap the column reference with
+	// a Variable expression that can be embedded in outer expression(s).
+	if outScope == nil {
+		return b.factory.ConstructVariable(b.factory.InternColumnID(col.id))
+	}
+
+	// Outer columns must be wrapped in a variable expression and assigned a new
+	// column id before projection.
+	if inScope.isOuterColumn(col.id) {
+		// Avoid synthesizing a new column if possible.
+		existing := outScope.findExistingCol(col)
+		if existing == nil {
+			if label == "" {
+				label = string(col.name)
+			}
+			group := b.factory.ConstructVariable(b.factory.InternColumnID(col.id))
+			b.synthesizeColumn(outScope, label, col.typ, col, group)
+			return group
+		}
+
+		col = existing
+	}
+
+	// Project the column, which has the side effect of making it visible.
+	col = outScope.appendColumn(col, label)
+	col.hidden = false
+	return col.group
 }

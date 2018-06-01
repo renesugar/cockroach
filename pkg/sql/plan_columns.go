@@ -79,12 +79,22 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return n.columns
 	case *zeroNode:
 		return n.columns
+	case *deleteNode:
+		return n.columns
+	case *updateNode:
+		return n.columns
+	case *insertNode:
+		return n.columns
+	case *upsertNode:
+		return n.columns
+	case *indexJoinNode:
+		return n.resultColumns
 
 	// Nodes with a fixed schema.
 	case *scrubNode:
 		return n.getColumns(mut, scrubColumns)
 	case *explainDistSQLNode:
-		return n.getColumns(mut, explainDistSQLColumns)
+		return n.getColumns(mut, sqlbase.ExplainDistSQLColumns)
 	case *testingRelocateNode:
 		return n.getColumns(mut, relocateNodeColumns)
 	case *scatterNode:
@@ -98,19 +108,9 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 	case *splitNode:
 		return n.getColumns(mut, splitNodeColumns)
 	case *showTraceReplicaNode:
-		return n.getColumns(mut, showTraceReplicaColumns)
+		return n.getColumns(mut, sqlbase.ShowReplicaTraceColumns)
 	case *sequenceSelectNode:
 		return n.getColumns(mut, sequenceSelectColumns)
-
-	// Nodes using the RETURNING helper.
-	case *deleteNode:
-		return n.rh.columns
-	case *insertNode:
-		return n.rh.columns
-	case *updateNode:
-		return n.rh.columns
-	case *upsertNode:
-		return n.rh.columns
 
 	// Nodes that have the same schema as their source or their
 	// valueNode helper.
@@ -118,9 +118,13 @@ func getPlanColumns(plan planNode, mut bool) sqlbase.ResultColumns {
 		return getPlanColumns(n.plan, mut)
 	case *filterNode:
 		return getPlanColumns(n.source.plan, mut)
-	case *indexJoinNode:
-		return getPlanColumns(n.table, mut)
 	case *limitNode:
+		return getPlanColumns(n.plan, mut)
+	case *spoolNode:
+		return getPlanColumns(n.source, mut)
+	case *serializeNode:
+		return getPlanColumns(n.source, mut)
+	case *distSQLWrapper:
 		return getPlanColumns(n.plan, mut)
 	}
 

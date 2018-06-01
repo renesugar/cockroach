@@ -121,8 +121,7 @@ var (
 			},
 		}},
 		{name: "/Table", start: TableDataMin, end: TableDataMax, entries: []dictEntry{
-			{name: "", prefix: nil, ppFunc: decodeKeyPrint,
-				psFunc: parseUnsupported},
+			{name: "", prefix: nil, ppFunc: decodeKeyPrint, psFunc: tableKeyParse},
 		}},
 	}
 
@@ -145,8 +144,9 @@ var (
 		{name: "AbortSpan", suffix: LocalAbortSpanSuffix, ppFunc: abortSpanKeyPrint, psFunc: abortSpanKeyParse},
 		{name: "RaftTombstone", suffix: LocalRaftTombstoneSuffix},
 		{name: "RaftHardState", suffix: LocalRaftHardStateSuffix},
-		{name: "RaftAppliedIndex", suffix: LocalRaftAppliedIndexSuffix},
-		{name: "LeaseAppliedIndex", suffix: LocalLeaseAppliedIndexSuffix},
+		{name: "RangeAppliedState", suffix: LocalRangeAppliedStateSuffix},
+		{name: "RaftAppliedIndex", suffix: LocalRaftAppliedIndexLegacySuffix},
+		{name: "LeaseAppliedIndex", suffix: LocalLeaseAppliedIndexLegacySuffix},
 		{name: "RaftLog", suffix: LocalRaftLogSuffix,
 			ppFunc: raftLogKeyPrint,
 			psFunc: raftLogKeyParse,
@@ -156,7 +156,7 @@ var (
 		{name: "RangeLastReplicaGCTimestamp", suffix: LocalRangeLastReplicaGCTimestampSuffix},
 		{name: "RangeLastVerificationTimestamp", suffix: LocalRangeLastVerificationTimestampSuffixDeprecated},
 		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
-		{name: "RangeStats", suffix: LocalRangeStatsSuffix},
+		{name: "RangeStats", suffix: LocalRangeStatsLegacySuffix},
 		{name: "RangeTxnSpanGCThreshold", suffix: LocalTxnSpanGCThresholdSuffix},
 		{name: "RangeFrozenStatus", suffix: LocalRangeFrozenStatusSuffix},
 		{name: "RangeLastGC", suffix: LocalRangeLastGCSuffix},
@@ -216,12 +216,39 @@ func localStoreKeyParse(input string) (remainder string, output roachpb.Key) {
 			return
 		}
 	}
-	slashPos := strings.Index(input[1:], "/")
+	input = mustShiftSlash(input)
+	slashPos := strings.IndexByte(input, '/')
 	if slashPos < 0 {
 		slashPos = len(input)
 	}
-	remainder = input[:slashPos] // `/something/else` -> `/else`
-	output = roachpb.Key(input[1:slashPos])
+	remainder = input[slashPos:] // `/something/else` -> `/else`
+	output = roachpb.Key(input[:slashPos])
+	return
+}
+
+const strSystemConfigSpan = "SystemConfigSpan"
+const strSystemConfigSpanStart = "Start"
+
+func tableKeyParse(input string) (remainder string, output roachpb.Key) {
+	input = mustShiftSlash(input)
+	slashPos := strings.Index(input, "/")
+	if slashPos < 0 {
+		slashPos = len(input)
+	}
+	remainder = input[slashPos:] // `/something/else` -> `/else`
+	tableIDStr := input[:slashPos]
+	if tableIDStr == strSystemConfigSpan {
+		if remainder[1:] == strSystemConfigSpanStart {
+			remainder = ""
+		}
+		output = SystemConfigSpan.Key
+		return
+	}
+	tableID, err := strconv.ParseUint(tableIDStr, 10, 32)
+	if err != nil {
+		panic(&errUglifyUnsupported{err})
+	}
+	output = roachpb.Key(MakeTablePrefix(uint32(tableID)))
 	return
 }
 
@@ -269,7 +296,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 	var rangeID int64
 	var err error
 	input = mustShiftSlash(input)
-	if endPos := strings.Index(input, "/"); endPos > 0 {
+	if endPos := strings.IndexByte(input, '/'); endPos > 0 {
 		rangeID, err = strconv.ParseInt(input[:endPos], 10, 64)
 		if err != nil {
 			panic(err)
@@ -284,7 +311,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 	var replicated bool
 	switch {
 	case bytes.Equal(localRangeIDUnreplicatedInfix, []byte(infix)):
-	case bytes.Equal(localRangeIDReplicatedInfix, []byte(infix)):
+	case bytes.Equal(LocalRangeIDReplicatedInfix, []byte(infix)):
 		replicated = true
 	default:
 		panic(errors.Errorf("invalid infix: %q", infix))
@@ -539,38 +566,38 @@ func prettyPrintInternal(valDirs []encoding.Direction, key roachpb.Key, quoteRaw
 
 // PrettyPrint prints the key in a human readable format:
 //
-// Key's Format                                   Key's Value
-// /Local/...                                        "\x01"+...
-// 		/Store/...                                     "\x01s"+...
-//		/RangeID/...                                   "\x01s"+[rangeid]
-//			/[rangeid]/AbortSpan/[id]                   "\x01s"+[rangeid]+"abc-"+[id]
-//			/[rangeid]/Lease						                 "\x01s"+[rangeid]+"rfll"
-//			/[rangeid]/RaftTombstone                     "\x01s"+[rangeid]+"rftb"
-//			/[rangeid]/RaftHardState						         "\x01s"+[rangeid]+"rfth"
-//			/[rangeid]/RaftAppliedIndex						       "\x01s"+[rangeid]+"rfta"
-//			/[rangeid]/RaftLog/logIndex:[logIndex]       "\x01s"+[rangeid]+"rftl"+[logIndex]
-//			/[rangeid]/RaftTruncatedState                "\x01s"+[rangeid]+"rftt"
-//			/[rangeid]/RaftLastIndex                     "\x01s"+[rangeid]+"rfti"
-//			/[rangeid]/RangeLastReplicaGCTimestamp       "\x01s"+[rangeid]+"rlrt"
-//			/[rangeid]/RangeLastVerificationTimestamp    "\x01s"+[rangeid]+"rlvt"
-//			/[rangeid]/RangeStats                        "\x01s"+[rangeid]+"stat"
-//		/Range/...                                     "\x01k"+...
-//			[key]/RangeDescriptor                        "\x01k"+[key]+"rdsc"
-//			[key]/Transaction/[id]	                     "\x01k"+[key]+"txn-"+[txn-id]
-//			[key]/QueueLastProcessed/[queue]             "\x01k"+[key]+"qlpt"+[queue]
-// /Local/Max                                        "\x02"
+//   Key format                                        Key value
+//   /Local/...                                        "\x01"+...
+//      /Store/...                                     "\x01s"+...
+//      /RangeID/...                                   "\x01s"+[rangeid]
+//        /[rangeid]/AbortSpan/[id]                    "\x01s"+[rangeid]+"abc-"+[id]
+//        /[rangeid]/Lease                             "\x01s"+[rangeid]+"rfll"
+//        /[rangeid]/RaftTombstone                     "\x01s"+[rangeid]+"rftb"
+//        /[rangeid]/RaftHardState                     "\x01s"+[rangeid]+"rfth"
+//        /[rangeid]/RaftAppliedIndex                  "\x01s"+[rangeid]+"rfta"
+//        /[rangeid]/RaftLog/logIndex:[logIndex]       "\x01s"+[rangeid]+"rftl"+[logIndex]
+//        /[rangeid]/RaftTruncatedState                "\x01s"+[rangeid]+"rftt"
+//        /[rangeid]/RaftLastIndex                     "\x01s"+[rangeid]+"rfti"
+//        /[rangeid]/RangeLastReplicaGCTimestamp       "\x01s"+[rangeid]+"rlrt"
+//        /[rangeid]/RangeLastVerificationTimestamp    "\x01s"+[rangeid]+"rlvt"
+//        /[rangeid]/RangeStats                        "\x01s"+[rangeid]+"stat"
+//      /Range/...                                     "\x01k"+...
+//        [key]/RangeDescriptor                        "\x01k"+[key]+"rdsc"
+//        [key]/Transaction/[id]                       "\x01k"+[key]+"txn-"+[txn-id]
+//        [key]/QueueLastProcessed/[queue]             "\x01k"+[key]+"qlpt"+[queue]
+//   /Local/Max                                        "\x02"
 //
-// /Meta1/[key]                                      "\x02"+[key]
-// /Meta2/[key]                                      "\x03"+[key]
-// /System/...                                       "\x04"
-//		/NodeLiveness/[key]                            "\x04\0x00liveness-"+[key]
-//		/StatusNode/[key]                              "\x04status-node-"+[key]
-// /System/Max                                       "\x05"
+//   /Meta1/[key]                                      "\x02"+[key]
+//   /Meta2/[key]                                      "\x03"+[key]
+//   /System/...                                       "\x04"
+//      /NodeLiveness/[key]                            "\x04\0x00liveness-"+[key]
+//      /StatusNode/[key]                              "\x04status-node-"+[key]
+//   /System/Max                                       "\x05"
 //
-// /Table/[key]                                      [key]
+//   /Table/[key]                                      [key]
 //
-// /Min                                              ""
-// /Max                                              "\xff\xff"
+//   /Min                                              ""
+//   /Max                                              "\xff\xff"
 //
 // valDirs correspond to the encoding direction of each encoded value in key.
 // For example, table keys could have column values encoded in ascending or
@@ -605,7 +632,9 @@ func UglyPrint(input string) (_ roachpb.Key, rErr error) {
 		if err == nil {
 			err = errIllegalInput
 		}
-		return nil, errors.Errorf(`can't parse "%s" after reading %s: %s`, input, origInput[:len(origInput)-len(input)], err)
+		err = errors.Errorf(`can't parse "%s" after reading %s: %s`,
+			input, origInput[:len(origInput)-len(input)], err)
+		return nil, &errUglifyUnsupported{err}
 	}
 
 	var entries []dictEntry // nil if not pinned to a subrange

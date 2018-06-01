@@ -225,7 +225,7 @@ func (r *RocksDBMap) NewIterator() SortedDiskMapIterator {
 	// NOTE: prefix is only false because we can't use the normal prefix
 	// extractor. This iterator still only does prefix iteration. See
 	// RocksDBMapIterator.Valid().
-	return &RocksDBMapIterator{iter: r.store.NewIterator(false /* prefix */), makeKey: r.makeKey, prefix: r.prefix}
+	return &RocksDBMapIterator{iter: r.store.NewIterator(IterOptions{}), makeKey: r.makeKey, prefix: r.prefix}
 }
 
 // NewBatchWriter implements the SortedDiskMap interface.
@@ -323,7 +323,7 @@ func (b *RocksDBMapBatchWriter) Put(k []byte, v []byte) error {
 
 // Flush implements the SortedDiskMapBatchWriter interface.
 func (b *RocksDBMapBatchWriter) Flush() error {
-	if len(b.batch.Repr()) < 1 {
+	if b.batch.Empty() {
 		return nil
 	}
 	if err := b.batch.Commit(false /* syncCommit */); err != nil {

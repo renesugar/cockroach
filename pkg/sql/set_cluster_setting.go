@@ -58,11 +58,7 @@ func (p *planner) SetClusterSetting(
 		// For DEFAULT, let the value reference be nil. That's a RESET in disguise.
 		if _, ok := n.Value.(tree.DefaultVal); !ok {
 			expr := n.Value
-			if s, ok := expr.(*tree.UnresolvedName); ok {
-				// Special rule for SET: because SET doesn't apply in the context
-				// of a table, SET ... = IDENT really means SET ... = 'IDENT'.
-				expr = tree.NewStrVal(tree.AsStringWithFlags(s, tree.FmtBareIdentifiers))
-			}
+			expr = unresolvedNameToStrVal(expr)
 
 			var requiredType types.T
 			switch setting.(type) {
@@ -97,11 +93,9 @@ func (p *planner) SetClusterSetting(
 }
 
 func (n *setClusterSettingNode) startExec(params runParams) error {
-	ie := InternalExecutor{ExecCfg: params.extendedEvalCtx.ExecCfg}
-
 	var reportedValue string
 	if n.value == nil {
-		if _, err := ie.ExecuteStatementInTransaction(
+		if _, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx, "reset-setting", params.p.txn,
 			"DELETE FROM system.settings WHERE name = $1", n.name,
 		); err != nil {
@@ -110,11 +104,11 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 		reportedValue = "DEFAULT"
 	} else {
 		// TODO(dt): validate and properly encode str according to type.
-		encoded, err := params.p.toSettingString(params.ctx, ie, n.st, n.name, n.setting, n.value)
+		encoded, err := params.p.toSettingString(params.ctx, n.st, n.name, n.setting, n.value)
 		if err != nil {
 			return err
 		}
-		if _, err := ie.ExecuteStatementInTransaction(
+		if _, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx, "update-setting", params.p.txn,
 			`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, NOW(), $3)`,
 			n.name, encoded, n.setting.Typ(),
@@ -140,7 +134,6 @@ func (n *setClusterSettingNode) Close(_ context.Context)        {}
 
 func (p *planner) toSettingString(
 	ctx context.Context,
-	ie InternalExecutor,
 	st *cluster.Settings,
 	name string,
 	setting settings.Setting,
@@ -154,7 +147,7 @@ func (p *planner) toSettingString(
 	switch setting := setting.(type) {
 	case *settings.StringSetting:
 		if s, ok := d.(*tree.DString); ok {
-			if err := setting.Validate(string(*s)); err != nil {
+			if err := setting.Validate(&st.SV, string(*s)); err != nil {
 				return "", err
 			}
 			return string(*s), nil
@@ -162,8 +155,10 @@ func (p *planner) toSettingString(
 		return "", errors.Errorf("cannot use %s %T value for string setting", d.ResolvedType(), d)
 	case *settings.StateMachineSetting:
 		if s, ok := d.(*tree.DString); ok {
-			datums, err := ie.QueryRowInTransaction(
-				ctx, "retrieve-prev-setting", p.txn, "SELECT value FROM system.settings WHERE name = $1", name,
+			datums, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+				ctx, "retrieve-prev-setting",
+				p.txn,
+				"SELECT value FROM system.settings WHERE name = $1", name,
 			)
 			if err != nil {
 				return "", err

@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awsutil"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -60,19 +62,14 @@ type TableStatistic struct {
 	// The number of rows that have a NULL in any of the columns in ColumnIDs.
 	NullCount uint64
 
-	// Indicates whether or not there is a histogram for this statistic.
-	HasHistogram bool
+	// Histogram (if available)
+	// TODO(radu): perhaps store the histogram in a more convenient format (Datums
+	// instead of bytes).
+	Histogram *HistogramData
 }
 
 func (s TableStatistic) String() string {
 	return awsutil.Prettify(s)
-}
-
-// HistogramCacheKey is used as the key type for entries in the TableStatisticsCache
-// which contain a histogram.
-type HistogramCacheKey struct {
-	TableID     sqlbase.ID
-	StatisticID uint64
 }
 
 // A TableStatisticsCache contains two underlying LRU caches:
@@ -86,44 +83,56 @@ type TableStatisticsCache struct {
 	// manipulates an internal LRU list.
 	mu struct {
 		syncutil.Mutex
-		statsCache     *cache.UnorderedCache
-		histogramCache *cache.UnorderedCache
+		cache *cache.UnorderedCache
 	}
+	Gossip      *gossip.Gossip
 	ClientDB    *client.DB
 	SQLExecutor sqlutil.InternalExecutor
 }
 
-// NewTableStatisticsCache creates a new TableStatisticsCache, with the
-// size of the underlying statsCache set to statsCacheSize, and the size of
-// the underlying histogramCache set to histogramCacheSize.
-// Both underlying caches internally use a hash map, so lookups are cheap.
+// NewTableStatisticsCache creates a new TableStatisticsCache that can hold
+// statistics for <cacheSize> tables.
 func NewTableStatisticsCache(
-	statsCacheSize int, histogramCacheSize int, db *client.DB, sqlExecutor sqlutil.InternalExecutor,
+	cacheSize int, g *gossip.Gossip, db *client.DB, sqlExecutor sqlutil.InternalExecutor,
 ) *TableStatisticsCache {
 	tableStatsCache := &TableStatisticsCache{
+		Gossip:      g,
 		ClientDB:    db,
 		SQLExecutor: sqlExecutor,
 	}
-	tableStatsCache.mu.statsCache = cache.NewUnorderedCache(cache.Config{
+	tableStatsCache.mu.cache = cache.NewUnorderedCache(cache.Config{
 		Policy:      cache.CacheLRU,
-		ShouldEvict: func(s int, key, value interface{}) bool { return s > statsCacheSize },
+		ShouldEvict: func(s int, key, value interface{}) bool { return s > cacheSize },
 	})
-	tableStatsCache.mu.histogramCache = cache.NewUnorderedCache(cache.Config{
-		Policy:      cache.CacheLRU,
-		ShouldEvict: func(s int, key, value interface{}) bool { return s > histogramCacheSize },
-	})
+	g.RegisterCallback(
+		gossip.MakePrefixPattern(gossip.KeyTableStatAddedPrefix),
+		tableStatsCache.tableStatAddedGossipUpdate,
+	)
 	return tableStatsCache
+}
+
+// tableStatAddedGossipUpdate is the gossip callback that fires when a new
+// statistic is available for a table.
+func (sc *TableStatisticsCache) tableStatAddedGossipUpdate(key string, value roachpb.Value) {
+	tableID, err := gossip.TableIDFromTableStatAddedKey(key)
+	if err != nil {
+		log.Errorf(context.Background(), "tableStatAddedGossipUpdate(%s) error: %v", key, err)
+		return
+	}
+	sc.InvalidateTableStats(context.Background(), sqlbase.ID(tableID))
 }
 
 // lookupTableStats returns the cached statistics of the given table ID.
 // The second return value is true if the stats were found in the
 // cache, and false otherwise.
+//
+// The statistics are ordered by their CreatedAt time (newest-to-oldest).
 func (sc *TableStatisticsCache) lookupTableStats(
 	ctx context.Context, tableID sqlbase.ID,
 ) ([]*TableStatistic, bool) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	if v, ok := sc.mu.statsCache.Get(tableID); ok {
+	if v, ok := sc.mu.cache.Get(tableID); ok {
 		if log.V(2) {
 			log.Infof(ctx, "lookup statistics for table %d: %s", tableID, v)
 		}
@@ -131,26 +140,6 @@ func (sc *TableStatisticsCache) lookupTableStats(
 	}
 	if log.V(2) {
 		log.Infof(ctx, "lookup statistics for table %d: not found", tableID)
-	}
-	return nil, false
-}
-
-// lookupHistogram returns the cached histogram of the given table ID and
-// statistic ID. The second return value is true if the histogram was found
-// in the cache, and false otherwise.
-func (sc *TableStatisticsCache) lookupHistogram(
-	ctx context.Context, tableID sqlbase.ID, statisticID uint64,
-) (*HistogramData, bool) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	if v, ok := sc.mu.histogramCache.Get(HistogramCacheKey{tableID, statisticID}); ok {
-		if log.V(2) {
-			log.Infof(ctx, "lookup histogram for table %d, statistic %d: %s", tableID, statisticID, v)
-		}
-		return v.(*HistogramData), true
-	}
-	if log.V(2) {
-		log.Infof(ctx, "lookup histogram for table %d, statistic %d: not found", tableID, statisticID)
 	}
 	return nil, false
 }
@@ -170,28 +159,8 @@ func (sc *TableStatisticsCache) refreshTableStats(
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.mu.statsCache.Add(tableID, tableStatistics)
+	sc.mu.cache.Add(tableID, tableStatistics)
 	return tableStatistics, nil
-}
-
-// refreshHistogram updates the cached histogram for the given table ID and
-// statistic ID by issuing a query to system.table_statistics, and
-// returns the histogram.
-func (sc *TableStatisticsCache) refreshHistogram(
-	ctx context.Context, tableID sqlbase.ID, statisticID uint64,
-) (*HistogramData, error) {
-	histogram, err := sc.getHistogramFromDB(ctx, tableID, statisticID)
-	if err != nil {
-		return nil, err
-	}
-
-	if log.V(2) {
-		log.Infof(ctx, "updating histogram for table %d, statistic %d: %s", tableID, statisticID, histogram)
-	}
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	sc.mu.histogramCache.Add(HistogramCacheKey{tableID, statisticID}, histogram)
-	return histogram, nil
 }
 
 // GetTableStats looks up statistics for the requested table ID in the cache,
@@ -206,18 +175,6 @@ func (sc *TableStatisticsCache) GetTableStats(
 	return sc.refreshTableStats(ctx, tableID)
 }
 
-// GetHistogram looks up the histogram for the requested table ID and
-// statistic ID in the cache, and if the histogram is not present in the
-// cache, it looks it up in system.table_statistics.
-func (sc *TableStatisticsCache) GetHistogram(
-	ctx context.Context, tableID sqlbase.ID, statisticID uint64,
-) (*HistogramData, error) {
-	if histogram, ok := sc.lookupHistogram(ctx, tableID, statisticID); ok {
-		return histogram, nil
-	}
-	return sc.refreshHistogram(ctx, tableID, statisticID)
-}
-
 // InvalidateTableStats invalidates the cached statistics for the given table ID.
 func (sc *TableStatisticsCache) InvalidateTableStats(ctx context.Context, tableID sqlbase.ID) {
 	if log.V(2) {
@@ -225,20 +182,7 @@ func (sc *TableStatisticsCache) InvalidateTableStats(ctx context.Context, tableI
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.mu.statsCache.Del(tableID)
-}
-
-// InvalidateHistogram invalidates the cached histogram for the given table ID
-// and statistic ID.
-func (sc *TableStatisticsCache) InvalidateHistogram(
-	ctx context.Context, tableID sqlbase.ID, statisticID uint64,
-) {
-	if log.V(2) {
-		log.Infof(ctx, "evicting histogram for table %d, statistic %d", tableID, statisticID)
-	}
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	sc.mu.histogramCache.Del(HistogramCacheKey{tableID, statisticID})
+	sc.mu.cache.Del(tableID)
 }
 
 const (
@@ -250,7 +194,7 @@ const (
 	rowCountIndex
 	distinctCountIndex
 	nullCountIndex
-	hasHistogramIndex
+	histogramIndex
 	statsLen
 )
 
@@ -280,7 +224,7 @@ func parseStats(datums tree.Datums) (*TableStatistic, error) {
 		{"rowCount", rowCountIndex, types.Int, false},
 		{"distinctCount", distinctCountIndex, types.Int, false},
 		{"nullCount", nullCountIndex, types.Int, false},
-		{"histogram", hasHistogramIndex, types.Bool, false},
+		{"histogram", histogramIndex, types.Bytes, true},
 	}
 	for _, v := range expectedTypes {
 		if datums[v.fieldIndex].ResolvedType() != v.expectedType &&
@@ -298,48 +242,26 @@ func parseStats(datums tree.Datums) (*TableStatistic, error) {
 		RowCount:      (uint64)(*datums[rowCountIndex].(*tree.DInt)),
 		DistinctCount: (uint64)(*datums[distinctCountIndex].(*tree.DInt)),
 		NullCount:     (uint64)(*datums[nullCountIndex].(*tree.DInt)),
-		HasHistogram:  (bool)(*datums[hasHistogramIndex].(*tree.DBool)),
 	}
 	columnIDs := datums[columnIDsIndex].(*tree.DArray)
 	tableStatistic.ColumnIDs = make([]sqlbase.ColumnID, len(columnIDs.Array))
 	for i, d := range columnIDs.Array {
 		tableStatistic.ColumnIDs[i] = sqlbase.ColumnID((int32)(*d.(*tree.DInt)))
 	}
-	if datums[nameIndex].ResolvedType() == types.String {
+	if datums[nameIndex] != tree.DNull {
 		tableStatistic.Name = string(*datums[nameIndex].(*tree.DString))
+	}
+	if datums[histogramIndex] != tree.DNull {
+		tableStatistic.Histogram = &HistogramData{}
+		if err := protoutil.Unmarshal(
+			[]byte(*datums[histogramIndex].(*tree.DBytes)),
+			tableStatistic.Histogram,
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	return tableStatistic, nil
-}
-
-// parseHistogram converts the given datums to a HistogramData object.
-func parseHistogram(datums tree.Datums) (*HistogramData, error) {
-	if datums == nil || datums.Len() == 0 {
-		return nil, nil
-	}
-
-	// Validate the input length.
-	if datums.Len() != 1 {
-		return nil, errors.Errorf("%d values returned from table statistics lookup. Expected %d", datums.Len(), 1)
-	}
-	datum := datums[0]
-
-	// Validate the input type.
-	if datum.ResolvedType() != types.Bytes && datum.ResolvedType() != types.Unknown {
-		return nil, errors.Errorf("histogram returned from table statistics lookup has type %s. Expected %s",
-			datum.ResolvedType(), types.Bytes)
-	}
-
-	// Extract datum value.
-	if datum.ResolvedType() == types.Bytes {
-		histogram := &HistogramData{}
-		if err := protoutil.Unmarshal([]byte(*datum.(*tree.DBytes)), histogram); err != nil {
-			return nil, err
-		}
-		return histogram, nil
-	}
-
-	return nil, nil
 }
 
 // getTableStatsFromDB retrieves the statistics in system.table_statistics
@@ -348,18 +270,24 @@ func (sc *TableStatisticsCache) getTableStatsFromDB(
 	ctx context.Context, tableID sqlbase.ID,
 ) ([]*TableStatistic, error) {
 	const getTableStatisticsStmt = `
-SELECT "tableID", "statisticID", name, "columnIDs", "createdAt", "rowCount", "distinctCount", "nullCount", histogram IS NOT NULL
+SELECT
+  "tableID",
+	"statisticID",
+	name,
+	"columnIDs",
+	"createdAt",
+	"rowCount",
+	"distinctCount",
+	"nullCount",
+	histogram
 FROM system.table_statistics
 WHERE "tableID" = $1
+ORDER BY "createdAt" DESC
 `
-	var rows []tree.Datums
-	if err := sc.ClientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		var err error
-		rows, _ /* cols */, err = sc.SQLExecutor.QueryRowsInTransaction(
-			ctx, "get-table-statistics", txn, getTableStatisticsStmt, tableID,
-		)
-		return err
-	}); err != nil {
+	rows, _ /* cols */, err := sc.SQLExecutor.Query(
+		ctx, "get-table-statistics", nil /* txn */, getTableStatisticsStmt, tableID,
+	)
+	if err != nil {
 		return nil, err
 	}
 
@@ -373,36 +301,4 @@ WHERE "tableID" = $1
 	}
 
 	return statsList, nil
-}
-
-// getHistogramFromDB retrieves the histogram in system.table_statistics
-// for the given table ID and statistic ID. Returns an error if the histogram
-// does not exist.
-func (sc *TableStatisticsCache) getHistogramFromDB(
-	ctx context.Context, tableID sqlbase.ID, statisticID uint64,
-) (*HistogramData, error) {
-	const getHistogramStmt = `
-SELECT histogram
-FROM system.table_statistics
-WHERE "tableID" = $1 AND "statisticID" = $2
-`
-	var row tree.Datums
-	if err := sc.ClientDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-		var err error
-		row, err = sc.SQLExecutor.QueryRowInTransaction(ctx, "get-histogram", txn, getHistogramStmt, tableID, statisticID)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	histogram, err := parseHistogram(row)
-	if err != nil {
-		return nil, err
-	}
-
-	if histogram == nil {
-		return nil, errors.Errorf("histogram not found for table %d, statistic %d", tableID, statisticID)
-	}
-
-	return histogram, nil
 }

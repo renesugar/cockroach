@@ -61,7 +61,7 @@ type ProposalData struct {
 
 	// command is serialized and proposed to raft. In the event of
 	// reproposals its MaxLeaseIndex field is mutated.
-	command storagebase.RaftCommand
+	command *storagebase.RaftCommand
 
 	// endCmds.finish is called after command execution to update the timestamp cache &
 	// command queue.
@@ -71,7 +71,7 @@ type ProposalData struct {
 	// proposalResult come from LocalEvalResult).
 	//
 	// Attention: this channel is not to be signaled directly downstream of Raft.
-	// Always use ProposalData.finishRaftApplication().
+	// Always use ProposalData.finishApplication().
 	doneCh chan proposalResult
 
 	// Local contains the results of evaluating the request
@@ -90,9 +90,10 @@ type ProposalData struct {
 	Request *roachpb.BatchRequest
 }
 
-// finishRaftApplication is called downstream of Raft when a command application
-// has finished. proposal.doneCh is signaled with pr so that the proposer is
-// unblocked.
+// finishApplication is when a command application has finished. This will be
+// called downstream of Raft if the command required consensus, but can be
+// called upstream of Raft if the command did not and was never proposed.
+// proposal.doneCh is signaled with pr so that the proposer is unblocked.
 //
 // It first invokes the endCmds function and then sends the specified
 // proposalResult on the proposal's done channel. endCmds is invoked here in
@@ -106,7 +107,7 @@ type ProposalData struct {
 // encountered upstream of Raft, we might still want to resolve intents:
 // upstream of Raft, pr.intents represent intents encountered by a request, not
 // the current txn's intents.
-func (proposal *ProposalData) finishRaftApplication(pr proposalResult) {
+func (proposal *ProposalData) finishApplication(pr proposalResult) {
 	if proposal.endCmds != nil {
 		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
 		proposal.endCmds = nil
@@ -257,13 +258,28 @@ func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease) {
 	// by the previous lease holder.
 	r.mu.Lock()
 	r.mu.state.Lease = &newLease
+	expirationBasedLease := r.requiresExpiringLeaseRLocked()
 	r.mu.Unlock()
 
-	// Gossip the first range whenever its lease is acquired. We check to
-	// make sure the lease is active so that a trailing replica won't process
-	// an old lease request and attempt to gossip the first range.
+	// Gossip the first range whenever its lease is acquired. We check to make
+	// sure the lease is active so that a trailing replica won't process an old
+	// lease request and attempt to gossip the first range.
 	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
 		r.gossipFirstRange(ctx)
+	}
+
+	// Whenever we first acquire an expiration-based lease, notify the lease
+	// renewer worker that we want it to keep proactively renewing the lease
+	// before it expires.
+	if leaseChangingHands && iAmTheLeaseHolder && expirationBasedLease && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
+		// It's not worth blocking on a full channel here since the worst that can
+		// happen is the lease times out and has to be reacquired when needed, but
+		// log an error since it's pretty unexpected.
+		select {
+		case r.store.expirationBasedLeaseChan <- r:
+		default:
+			log.Warningf(ctx, "unable to kick off proactive lease renewal; channel full")
+		}
 	}
 
 	if leaseChangingHands && !iAmTheLeaseHolder {
@@ -366,7 +382,7 @@ func addSSTablePreApply(
 			// pass it the path in the sideload store as it deletes the passed path on
 			// success.
 			if linkErr := os.Link(path, ingestPath); linkErr == nil {
-				ingestErr := eng.IngestExternalFile(ctx, ingestPath, noModify)
+				ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath}, noModify)
 				if ingestErr == nil {
 					// Adding without modification succeeded, no copy necessary.
 					log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
@@ -376,7 +392,7 @@ func addSSTablePreApply(
 					log.Fatalf(ctx, "failed to move ingest sst: %v", rmErr)
 				}
 				const seqNoMsg = "Global seqno is required, but disabled"
-				if err, ok := err.(*engine.RocksDBError); ok && !strings.Contains(err.Error(), seqNoMsg) {
+				if err, ok := ingestErr.(*engine.RocksDBError); ok && !strings.Contains(ingestErr.Error(), seqNoMsg) {
 					log.Fatalf(ctx, "while ingesting %s: %s", ingestPath, err)
 				}
 			}
@@ -401,13 +417,13 @@ func addSSTablePreApply(
 			}
 		}
 
-		if err := writeFileSyncing(ctx, path, sst.Data, 0600, st, limiter); err != nil {
+		if err := writeFileSyncing(ctx, path, sst.Data, eng, 0600, st, limiter); err != nil {
 			log.Fatalf(ctx, "while ingesting %s: %s", path, err)
 		}
 		copied = true
 	}
 
-	if err := eng.IngestExternalFile(ctx, path, modify); err != nil {
+	if err := eng.IngestExternalFiles(ctx, []string{path}, modify); err != nil {
 		log.Fatalf(ctx, "while ingesting %s: %s", path, err)
 	}
 	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, path)
@@ -418,6 +434,8 @@ func addSSTablePreApply(
 // away from this node to target, if this node is the current raft
 // leader. We don't attempt to transfer leadership if the transferee
 // is behind on applying the log.
+//
+// TODO(tschottdorf): there's also maybeTransferRaftLeader. Only one should exist.
 func (r *Replica) maybeTransferRaftLeadership(ctx context.Context, target roachpb.ReplicaID) {
 	err := r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
 		// Only the raft leader can attempt a leadership transfer.
@@ -459,6 +477,7 @@ func (r *Replica) handleReplicatedEvalResult(
 		rResult.Timestamp = hlc.Timestamp{}
 		rResult.DeprecatedStartKey = nil
 		rResult.DeprecatedEndKey = nil
+		rResult.PrevLeaseProposal = nil
 	}
 
 	if rResult.BlockReads {
@@ -481,7 +500,7 @@ func (r *Replica) handleReplicatedEvalResult(
 	r.mu.Unlock()
 
 	r.store.metrics.addMVCCStats(deltaStats)
-	rResult.Delta = enginepb.MVCCNetworkStats{}
+	rResult.Delta = enginepb.MVCCStatsDelta{}
 
 	if needsSplitBySize {
 		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
@@ -521,7 +540,7 @@ func (r *Replica) handleReplicatedEvalResult(
 				end := engine.MakeMVCCMetadataKey(
 					keys.RaftLogKey(r.RangeID, newTruncState.Index).PrefixEnd(),
 				)
-				iter := r.store.Engine().NewIterator(false /* prefix */)
+				iter := r.store.Engine().NewIterator(engine.IterOptions{})
 				// Clear the log entries. Intentionally don't use range deletion
 				// tombstones (ClearRange()) due to performance concerns connected
 				// to having many range deletion tombstones. There is a chance that
@@ -563,6 +582,19 @@ func (r *Replica) handleReplicatedEvalResult(
 		// field in ReplicatedEvalResult" assertion to fire if we didn't clear it.
 		if rResult.State.Stats != nil && (*rResult.State.Stats == enginepb.MVCCStats{}) {
 			rResult.State.Stats = nil
+		}
+
+		if rResult.State.UsingAppliedStateKey {
+			r.mu.Lock()
+			// If we're already using the AppliedStateKey then there's nothing
+			// to do. This flag is idempotent so it's ok that we see this flag
+			// multiple times, but we want to make sure it doesn't cause us to
+			// perform repeated state assertions, so clear it before the
+			// shouldAssert determination.
+			if r.mu.state.UsingAppliedStateKey {
+				rResult.State.UsingAppliedStateKey = false
+			}
+			r.mu.Unlock()
 		}
 
 		if (*rResult.State == storagebase.ReplicaState{}) {
@@ -653,9 +685,8 @@ func (r *Replica) handleReplicatedEvalResult(
 		}
 
 		if newLease := rResult.State.Lease; newLease != nil {
-			rResult.State.Lease = nil // for assertion
-
 			r.leasePostApply(ctx, *newLease)
+			rResult.State.Lease = nil
 		}
 
 		if newThresh := rResult.State.GCThreshold; newThresh != nil {
@@ -674,6 +705,13 @@ func (r *Replica) handleReplicatedEvalResult(
 				r.mu.Unlock()
 			}
 			rResult.State.TxnSpanGCThreshold = nil
+		}
+
+		if rResult.State.UsingAppliedStateKey {
+			r.mu.Lock()
+			r.mu.state.UsingAppliedStateKey = true
+			r.mu.Unlock()
+			rResult.State.UsingAppliedStateKey = false
 		}
 
 		if (*rResult.State == storagebase.ReplicaState{}) {
@@ -708,18 +746,10 @@ func (r *Replica) handleReplicatedEvalResult(
 }
 
 func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.LocalResult) {
-	// Enqueue failed push transactions on the txnWaitQueue.
-	if !r.store.cfg.DontRetryPushTxnFailures {
-		if tpErr, ok := lResult.Err.GetDetail().(*roachpb.TransactionPushError); ok {
-			r.txnWaitQueue.Enqueue(&tpErr.PusheeTxn)
-		}
-	}
-
 	// Fields for which no action is taken in this method are zeroed so that
 	// they don't trigger an assertion at the end of the method (which checks
 	// that all fields were handled).
 	{
-		lResult.Err = nil
 		lResult.Reply = nil
 	}
 

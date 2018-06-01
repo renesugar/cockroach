@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
@@ -35,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
@@ -526,7 +526,9 @@ func loadAllDescs(
 	return allDescs, nil
 }
 
-func resolveTargetsToDescriptors(
+// ResolveTargetsToDescriptors performs name resolution on a set of targets and
+// returns the resulting descriptors.
+func ResolveTargetsToDescriptors(
 	ctx context.Context, p sql.PlanHookState, endTime hlc.Timestamp, targets tree.TargetList,
 ) ([]sqlbase.Descriptor, []sqlbase.ID, error) {
 	allDescs, err := loadAllDescs(ctx, p.ExecCfg().DB, endTime)
@@ -648,7 +650,7 @@ func backup(
 	maxConcurrentExports := clusterNodeCount(gossip) * int(storage.ExportRequestsLimit.Get(&settings.SV))
 	exportsSem := make(chan struct{}, maxConcurrentExports)
 
-	g, gCtx := errgroup.WithContext(ctx)
+	g := ctxgroup.WithContext(ctx)
 
 	requestFinishedCh := make(chan struct{}, len(spans)) // enough buffer to never block
 
@@ -656,29 +658,29 @@ func backup(
 	// block forever. This is needed for TestBackupRestoreResume which doesn't
 	// have any spans. Users should never hit this.
 	if len(spans) > 0 {
-		g.Go(func() error {
-			return progressLogger.Loop(gCtx, requestFinishedCh)
+		g.GoCtx(func(ctx context.Context) error {
+			return progressLogger.Loop(ctx, requestFinishedCh)
 		})
 	}
 
 	for i := range allSpans {
 		select {
 		case exportsSem <- struct{}{}:
-		case <-ctx.Done():
-			return mu.exported, ctx.Err()
+		case <-g.Done:
+			return mu.exported, g.Err()
 		}
 
 		span := allSpans[i]
-		g.Go(func() error {
+		g.GoCtx(func(ctx context.Context) error {
 			defer func() { <-exportsSem }()
 			header := roachpb.Header{Timestamp: span.end}
 			req := &roachpb.ExportRequest{
-				Span:       span.span,
-				Storage:    exportStore.Conf(),
-				StartTime:  span.start,
-				MVCCFilter: roachpb.MVCCFilter(backupDesc.MVCCFilter),
+				RequestHeader: roachpb.RequestHeaderFromSpan(span.span),
+				Storage:       exportStore.Conf(),
+				StartTime:     span.start,
+				MVCCFilter:    roachpb.MVCCFilter(backupDesc.MVCCFilter),
 			}
-			rawRes, pErr := client.SendWrappedWith(gCtx, db.GetSender(), header, req)
+			rawRes, pErr := client.SendWrappedWith(ctx, db.GetSender(), header, req)
 			if pErr != nil {
 				return pErr.GoError()
 			}
@@ -773,25 +775,26 @@ func VerifyUsableExportTarget(
 	return nil
 }
 
+// backupPlanHook implements PlanHookFn.
 func backupPlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (func(context.Context, chan<- tree.Datums) error, sqlbase.ResultColumns, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
 	backupStmt, ok := stmt.(*tree.Backup)
 	if !ok {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	toFn, err := p.TypeAsString(backupStmt.To, "BACKUP")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	incrementalFromFn, err := p.TypeAsStringArray(backupStmt.IncrementalFrom, "BACKUP")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	optsFn, err := p.TypeAsStringOpts(backupStmt.Options, backupOptionExpectValues)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	header := sqlbase.ResultColumns{
@@ -804,7 +807,7 @@ func backupPlanHook(
 		{Name: "bytes", Typ: types.Int},
 	}
 
-	fn := func(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
@@ -823,17 +826,7 @@ func backupPlanHook(
 			return errors.Errorf("BACKUP cannot be used inside a transaction")
 		}
 
-		// older nodes don't know about many new fields, e.g. MVCCAll and may
-		// incorrectly evaluate either an export RPC, or a resumed backup job.
-		// VersionClearRange was introduced after most of these new fields and the
-		// jobs resume refactorings, though we may still wish to bump this to 2.0
-		// when that is defined.
-		if !p.ExecCfg().Settings.Version.IsMinSupported(cluster.VersionClearRange) {
-			return errors.Errorf(
-				"running BACKUP on a 2.x node requires cluster version >= %s (",
-				cluster.VersionByKey(cluster.VersionClearRange).String(),
-			)
-		}
+		requireVersion2 := false
 
 		to, err := toFn()
 		if err != nil {
@@ -866,9 +859,10 @@ func backupPlanHook(
 		mvccFilter := MVCCFilter_Latest
 		if _, ok := opts[backupOptRevisionHistory]; ok {
 			mvccFilter = MVCCFilter_All
+			requireVersion2 = true
 		}
 
-		targetDescs, completeDBs, err := resolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
+		targetDescs, completeDBs, err := ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
 		if err != nil {
 			return err
 		}
@@ -996,6 +990,22 @@ func backupPlanHook(
 			}
 		}
 
+		// older nodes don't know about many new fields, e.g. MVCCAll and may
+		// incorrectly evaluate either an export RPC, or a resumed backup job.
+		if requireVersion2 && !p.ExecCfg().Settings.Version.IsMinSupported(cluster.Version2_0) {
+			return errors.Errorf(
+				"BACKUP features introduced in 2.0 requires cluster version >= %s (",
+				cluster.VersionByKey(cluster.Version2_0).String(),
+			)
+		}
+
+		// if CompleteDbs is lost by a 1.x node, FormatDescriptorTrackingVersion
+		// means that a 2.0 node will disallow `RESTORE DATABASE foo`, but `RESTORE
+		// foo.table1, foo.table2...` will still work. MVCCFilter would be
+		// mis-handled, but is disallowed above. IntroducedSpans may also be lost by
+		// a 1.x node, meaning that if 1.1 nodes may resume a backup, the limitation
+		// of requiring full backups after schema changes remains.
+
 		backupDesc := BackupDescriptor{
 			StartTime:         startTime,
 			EndTime:           endTime,
@@ -1057,7 +1067,7 @@ func backupPlanHook(
 		}
 		return <-errCh
 	}
-	return fn, header, nil
+	return fn, header, nil, nil
 }
 
 type backupResumer struct {
@@ -1169,27 +1179,28 @@ func backupResumeHook(typ jobs.Type, settings *cluster.Settings) jobs.Resumer {
 	}
 }
 
+// showBackupPlanHook implements PlanHookFn.
 func showBackupPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (func(context.Context, chan<- tree.Datums) error, sqlbase.ResultColumns, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
 	backup, ok := stmt.(*tree.ShowBackup)
 	if !ok {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	if err := utilccl.CheckEnterpriseEnabled(
 		p.ExecCfg().Settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "SHOW BACKUP",
 	); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if err := p.RequireSuperUser(ctx, "SHOW BACKUP"); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	toFn, err := p.TypeAsString(backup.Path, "SHOW BACKUP")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	header := sqlbase.ResultColumns{
 		{Name: "database", Typ: types.String},
@@ -1199,7 +1210,7 @@ func showBackupPlanHook(
 		{Name: "size_bytes", Typ: types.Int},
 		{Name: "rows", Typ: types.Int},
 	}
-	fn := func(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		// TODO(dan): Move this span into sql.
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer tracing.FinishSpan(span)
@@ -1254,7 +1265,7 @@ func showBackupPlanHook(
 		}
 		return nil
 	}
-	return fn, header, nil
+	return fn, header, nil, nil
 }
 
 type versionedValues struct {
@@ -1274,10 +1285,10 @@ func getAllRevisions(
 	// TODO(dt): version check.
 	header := roachpb.Header{Timestamp: endTime}
 	req := &roachpb.ExportRequest{
-		Span:       roachpb.Span{Key: startKey, EndKey: endKey},
-		StartTime:  startTime,
-		MVCCFilter: roachpb.MVCCFilter_All,
-		ReturnSST:  true,
+		RequestHeader: roachpb.RequestHeader{Key: startKey, EndKey: endKey},
+		StartTime:     startTime,
+		MVCCFilter:    roachpb.MVCCFilter_All,
+		ReturnSST:     true,
 	}
 	resp, pErr := client.SendWrappedWith(ctx, db.GetSender(), header, req)
 	if pErr != nil {

@@ -22,7 +22,11 @@ import (
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
 
+	"bytes"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -43,8 +47,10 @@ const notUsableInfo = "Not usable; exposed only for compatibility with PostgreSQ
 // the existence of this map.
 var typeBuiltinsHaveUnderscore = map[oid.Oid]struct{}{
 	types.Any.Oid():         {},
+	types.AnyArray.Oid():    {},
 	types.Date.Oid():        {},
 	types.Time.Oid():        {},
+	types.TimeTZ.Oid():      {},
 	types.Decimal.Oid():     {},
 	types.Interval.Oid():    {},
 	types.JSON.Oid():        {},
@@ -87,6 +93,9 @@ func initPGBuiltins() {
 	}
 	// Make array type i/o builtins.
 	for name, builtins := range makeTypeIOBuiltins("array_", types.AnyArray) {
+		Builtins[name] = builtins
+	}
+	for name, builtins := range makeTypeIOBuiltins("anyarray_", types.AnyArray) {
 		Builtins[name] = builtins
 	}
 }
@@ -143,8 +152,10 @@ func makePGGetViewDef(argTypes tree.ArgTypes) tree.Builtin {
 		DistsqlBlacklist: true,
 		ReturnType:       tree.FixedReturnType(types.String),
 		Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			r, err := ctx.Planner.QueryRow(
-				ctx.Ctx(), "SELECT definition FROM pg_catalog.pg_views v JOIN pg_catalog.pg_class c ON "+
+			r, err := ctx.InternalExecutor.QueryRow(
+				ctx.Ctx(), "pg_get_viewdef",
+				ctx.Txn,
+				"SELECT definition FROM pg_catalog.pg_views v JOIN pg_catalog.pg_class c ON "+
 					"c.relname=v.viewname WHERE oid=$1", args[0])
 			if err != nil {
 				return nil, err
@@ -165,8 +176,10 @@ func makePGGetConstraintDef(argTypes tree.ArgTypes) tree.Builtin {
 		DistsqlBlacklist: true,
 		ReturnType:       tree.FixedReturnType(types.String),
 		Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-			r, err := ctx.Planner.QueryRow(
-				ctx.Ctx(), "SELECT condef FROM pg_catalog.pg_constraint WHERE oid=$1", args[0])
+			r, err := ctx.InternalExecutor.QueryRow(
+				ctx.Ctx(), "pg_get_constraintdef",
+				ctx.Txn,
+				"SELECT condef FROM pg_catalog.pg_constraint WHERE oid=$1", args[0])
 			if err != nil {
 				return nil, err
 			}
@@ -236,9 +249,9 @@ func makePGPrivilegeInquiryDef(
 	for _, argType := range argTypes {
 		withUser := argType[0].Name == "user"
 
-		infoFmt := "does current user have privilege for %s"
+		infoFmt := "Returns whether or not the current user has privileges for %s."
 		if withUser {
-			infoFmt = "does user have privilege for %s"
+			infoFmt = "Returns whether or not the user has privileges for %s."
 		}
 
 		variants = append(variants, tree.Builtin{
@@ -281,8 +294,8 @@ func makePGPrivilegeInquiryDef(
 }
 
 // getNameForArg determines the object name for the specified argument, which
-// should be either a STRING or an OID. If the object is not found, the returned
-// string will be empty.
+// should be either an unwrapped STRING or an OID. If the object is not found,
+// the returned string will be empty.
 func getNameForArg(ctx *tree.EvalContext, arg tree.Datum, pgTable, pgCol string) (string, error) {
 	var query string
 	switch t := arg.(type) {
@@ -291,9 +304,9 @@ func getNameForArg(ctx *tree.EvalContext, arg tree.Datum, pgTable, pgCol string)
 	case *tree.DOid:
 		query = fmt.Sprintf("SELECT %s FROM pg_catalog.%s WHERE oid = $1 LIMIT 1", pgCol, pgTable)
 	default:
-		log.Fatalf(ctx.Ctx(), "expected arg type %T", t)
+		log.Fatalf(ctx.Ctx(), "unexpected arg type %T", t)
 	}
-	r, err := ctx.Planner.QueryRow(ctx.Ctx(), query, arg)
+	r, err := ctx.InternalExecutor.QueryRow(ctx.Ctx(), "get-name-for-arg", ctx.Txn, query, arg)
 	if err != nil || r == nil {
 		return "", err
 	}
@@ -301,8 +314,8 @@ func getNameForArg(ctx *tree.EvalContext, arg tree.Datum, pgTable, pgCol string)
 }
 
 // getTableNameForArg determines the qualified table name for the specified
-// argument, which should be either a STRING or an OID. If the table is not
-// found, the returned pointer will be nil.
+// argument, which should be either an unwrapped STRING or an OID. If the table
+// is not found, the returned pointer will be nil.
 func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName, error) {
 	switch t := arg.(type) {
 	case *tree.DString:
@@ -321,8 +334,9 @@ func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName,
 		}
 		return tn, nil
 	case *tree.DOid:
-		r, err := ctx.Planner.QueryRow(ctx.Ctx(), `
-			SELECT n.nspname, c.relname FROM pg_class c
+		r, err := ctx.InternalExecutor.QueryRow(ctx.Ctx(), "get-table-name-for-arg",
+			ctx.Txn,
+			`SELECT n.nspname, c.relname FROM pg_class c
 			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 			WHERE c.oid = $1`, t)
 		if err != nil || r == nil {
@@ -334,7 +348,7 @@ func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName,
 		tn := tree.MakeTableNameWithSchema(db, schema, table)
 		return &tn, nil
 	default:
-		log.Fatalf(ctx.Ctx(), "expected arg type %T", t)
+		log.Fatalf(ctx.Ctx(), "unexpected arg type %T", t)
 	}
 	return nil, nil
 }
@@ -343,7 +357,7 @@ func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName,
 type pgPrivList map[string]func(withGrantOpt bool) (tree.Datum, error)
 
 // parsePrivilegeStr parses the provided privilege string and calls into the
-// privilege option map for each specified privielge.
+// privilege option map for each specified privilege.
 func parsePrivilegeStr(arg tree.Datum, availOpts pgPrivList) (tree.Datum, error) {
 	// Postgres allows WITH GRANT OPTION to be added to a privilege type to
 	// test whether the privilege is held with grant option.
@@ -402,10 +416,14 @@ func evalPrivilegeCheck(
 	}
 	for _, p := range privChecks {
 		query := fmt.Sprintf(`
-			SELECT bool_or(privilege_type IN ('%s', '%s')) IS TRUE 
-			FROM information_schema.%s WHERE grantee = $1 AND %s`,
+			SELECT bool_or(privilege_type IN ('%s', '%s')) IS TRUE
+			FROM information_schema.%s WHERE grantee IN ($1, $2) AND %s`,
 			privilege.ALL, p, infoTable, pred)
-		r, err := ctx.Planner.QueryRow(ctx.Ctx(), query, user)
+		// TODO(mberhault): "public" is a constant defined in sql/sqlbase, but importing that
+		// would cause a dependency cycle sqlbase -> sem/transform -> sem/builtins -> sqlbase
+		r, err := ctx.InternalExecutor.QueryRow(
+			ctx.Ctx(), "eval-privilege-check", ctx.Txn, query, "public", user,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -501,8 +519,10 @@ var pgBuiltins = map[string][]tree.Builtin{
 			DistsqlBlacklist: true,
 			ReturnType:       tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				r, err := ctx.Planner.QueryRow(
-					ctx.Ctx(), "SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid=$1", args[0])
+				r, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "pg_get_indexdef",
+					ctx.Txn,
+					"SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid=$1", args[0])
 				if err != nil {
 					return nil, err
 				}
@@ -525,6 +545,7 @@ var pgBuiltins = map[string][]tree.Builtin{
 		makePGGetViewDef(tree.ArgTypes{{"view_oid", types.Oid}, {"pretty_bool", types.Bool}}),
 	},
 
+	// TODO(bram): Make sure the reported type is correct for tuples. See #25523.
 	"pg_typeof": {
 		tree.Builtin{
 			Types:        tree.ArgTypes{{"val", types.Any}},
@@ -545,8 +566,10 @@ var pgBuiltins = map[string][]tree.Builtin{
 			ReturnType:       tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				oid := args[0]
-				t, err := ctx.Planner.QueryRow(
-					ctx.Ctx(), "SELECT rolname FROM pg_catalog.pg_roles WHERE oid=$1", oid)
+				t, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "pg_get_userbyid",
+					ctx.Txn,
+					"SELECT rolname FROM pg_catalog.pg_roles WHERE oid=$1", oid)
 				if err != nil {
 					return nil, err
 				}
@@ -570,9 +593,11 @@ var pgBuiltins = map[string][]tree.Builtin{
 			DistsqlBlacklist: true,
 			ReturnType:       tree.FixedReturnType(types.String),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				r, err := ctx.Planner.QueryRow(
-					ctx.Ctx(), `SELECT seqstart, seqmin, seqmax, seqincrement, seqcycle, seqcache, seqtypid
-FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
+				r, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "pg_sequence_parameters",
+					ctx.Txn,
+					`SELECT seqstart, seqmin, seqmax, seqincrement, seqcycle, seqcache, seqtypid `+
+						`FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 				if err != nil {
 					return nil, err
 				}
@@ -616,6 +641,23 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ *tree.EvalContext, _ tree.Datums) (tree.Datum, error) {
 				return tree.DNull, nil
+			},
+			Info: notUsableInfo,
+		},
+	},
+	"quote_ident": {
+		tree.Builtin{
+			Types:      tree.ArgTypes{{"text", types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				/* From the PG source code:
+				 * Can avoid quoting if ident starts with a lowercase letter or underscore
+				 * and contains only lowercase letters, digits, and underscores, *and* is
+				 * not any SQL keyword.  Otherwise, supply quotes.
+				 */
+				var buf bytes.Buffer
+				lex.EncodeRestrictedSQLIdent(&buf, string(tree.MustBeDString(args[0])), lex.EncBareStrings)
+				return tree.NewDString(buf.String()), nil
 			},
 			Info: notUsableInfo,
 		},
@@ -687,7 +729,9 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 				oid := args[0]
-				t, err := ctx.Planner.QueryRow(ctx.Ctx(),
+				t, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "pg_table_is_visible",
+					ctx.Txn,
 					"SELECT nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid "+
 						"WHERE c.oid=$1 AND nspname=ANY(current_schemas(true));", oid)
 				if err != nil {
@@ -739,7 +783,8 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"any column of table",
 		argTypeOpts{{"table", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			tn, err := getTableNameForArg(ctx, args[0])
+			tableArg := tree.UnwrapDatum(ctx, args[0])
+			tn, err := getTableNameForArg(ctx, tableArg)
 			if err != nil {
 				return nil, err
 			}
@@ -791,7 +836,8 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"column",
 		argTypeOpts{{"table", strOrOidTypes}, {"column", []types.T{types.String, types.Int}}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			tn, err := getTableNameForArg(ctx, args[0])
+			tableArg := tree.UnwrapDatum(ctx, args[0])
+			tn, err := getTableNameForArg(ctx, tableArg)
 			if err != nil {
 				return nil, err
 			}
@@ -808,7 +854,8 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 
 				// Verify that the column exists in the table.
 				var colPred string
-				switch t := args[1].(type) {
+				colArg := tree.UnwrapDatum(ctx, args[1])
+				switch t := colArg.(type) {
 				case *tree.DString:
 					colPred = "column_name = $1"
 				case *tree.DInt:
@@ -817,13 +864,16 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 					log.Fatalf(ctx.Ctx(), "expected arg type %T", t)
 				}
 
-				if r, err := ctx.Planner.QueryRow(ctx.Ctx(), fmt.Sprintf(`
+				if r, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "has-column-privilege",
+					ctx.Txn,
+					fmt.Sprintf(`
 					SELECT column_name FROM information_schema.columns
-					WHERE %s AND %s`, pred, colPred), args[1]); err != nil {
+					WHERE %s AND %s`, pred, colPred), colArg); err != nil {
 					return nil, err
 				} else if r == nil {
 					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-						"column %s of relation %s does not exist", args[1], args[0])
+						"column %s of relation %s does not exist", colArg, tableArg)
 				}
 			}
 
@@ -863,16 +913,17 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"database",
 		argTypeOpts{{"database", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			db, err := getNameForArg(ctx, args[0], "pg_database", "datname")
+			dbArg := tree.UnwrapDatum(ctx, args[0])
+			db, err := getNameForArg(ctx, dbArg, "pg_database", "datname")
 			if err != nil {
 				return nil, err
 			}
 			retNull := false
 			if db == "" {
-				switch args[0].(type) {
+				switch dbArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeInvalidCatalogNameError,
-						"database %s does not exist", args[0])
+						"database %s does not exist", dbArg)
 				case *tree.DOid:
 					// Postgres returns NULL if no matching language is found
 					// when given an OID.
@@ -917,15 +968,16 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"foreign-data wrapper",
 		argTypeOpts{{"fdw", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			fdw, err := getNameForArg(ctx, args[0], "pg_foreign_data_wrapper", "fdwname")
+			fdwArg := tree.UnwrapDatum(ctx, args[0])
+			fdw, err := getNameForArg(ctx, fdwArg, "pg_foreign_data_wrapper", "fdwname")
 			if err != nil {
 				return nil, err
 			}
 			if fdw == "" {
-				switch args[0].(type) {
+				switch fdwArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
-						"foreign-data wrapper %s does not exist", args[0])
+						"foreign-data wrapper %s does not exist", fdwArg)
 				case *tree.DOid:
 					// Unlike most of the functions, Postgres does not return
 					// NULL when an OID does not match.
@@ -944,10 +996,11 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"function",
 		argTypeOpts{{"function", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
+			oidArg := tree.UnwrapDatum(ctx, args[0])
 			// When specifying a function by a text string rather than by OID,
 			// the allowed input is the same as for the regprocedure data type.
 			var oid tree.Datum
-			switch t := args[0].(type) {
+			switch t := oidArg.(type) {
 			case *tree.DString:
 				var err error
 				oid, err = tree.PerformCast(ctx, t, coltypes.RegProcedure)
@@ -984,16 +1037,17 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"language",
 		argTypeOpts{{"language", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			lang, err := getNameForArg(ctx, args[0], "pg_language", "lanname")
+			langArg := tree.UnwrapDatum(ctx, args[0])
+			lang, err := getNameForArg(ctx, langArg, "pg_language", "lanname")
 			if err != nil {
 				return nil, err
 			}
 			retNull := false
 			if lang == "" {
-				switch args[0].(type) {
+				switch langArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
-						"language %s does not exist", args[0])
+						"language %s does not exist", langArg)
 				case *tree.DOid:
 					// Postgres returns NULL if no matching language is found
 					// when given an OID.
@@ -1016,16 +1070,17 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"schema",
 		argTypeOpts{{"schema", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			schema, err := getNameForArg(ctx, args[0], "pg_namespace", "nspname")
+			schemaArg := tree.UnwrapDatum(ctx, args[0])
+			schema, err := getNameForArg(ctx, schemaArg, "pg_namespace", "nspname")
 			if err != nil {
 				return nil, err
 			}
 			retNull := false
 			if schema == "" {
-				switch args[0].(type) {
+				switch schemaArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeInvalidSchemaNameError,
-						"schema %s does not exist", args[0])
+						"schema %s does not exist", schemaArg)
 				case *tree.DOid:
 					// Postgres returns NULL if no matching schema is found
 					// when given an OID.
@@ -1061,7 +1116,8 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"sequence",
 		argTypeOpts{{"sequence", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			tn, err := getTableNameForArg(ctx, args[0])
+			seqArg := tree.UnwrapDatum(ctx, args[0])
+			tn, err := getTableNameForArg(ctx, seqArg)
 			if err != nil {
 				return nil, err
 			}
@@ -1073,14 +1129,16 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 				retNull = true
 			} else {
 				// Verify that the table name is actually a sequence.
-				if r, err := ctx.Planner.QueryRow(ctx.Ctx(), `
-					SELECT sequence_name FROM information_schema.sequences
-					WHERE sequence_catalog = $1 AND sequence_schema = $2 AND sequence_name = $3`,
+				if r, err := ctx.InternalExecutor.QueryRow(
+					ctx.Ctx(), "has-sequence-privilege",
+					ctx.Txn,
+					`SELECT sequence_name FROM information_schema.sequences `+
+						`WHERE sequence_catalog = $1 AND sequence_schema = $2 AND sequence_name = $3`,
 					tn.CatalogName, tn.SchemaName, tn.TableName); err != nil {
 					return nil, err
 				} else if r == nil {
 					return nil, pgerror.NewErrorf(pgerror.CodeWrongObjectTypeError,
-						"%s is not a sequence", args[0])
+						"%s is not a sequence", seqArg)
 				}
 
 				pred = fmt.Sprintf(
@@ -1117,15 +1175,16 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"foreign server",
 		argTypeOpts{{"server", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			server, err := getNameForArg(ctx, args[0], "pg_foreign_server", "srvname")
+			serverArg := tree.UnwrapDatum(ctx, args[0])
+			server, err := getNameForArg(ctx, serverArg, "pg_foreign_server", "srvname")
 			if err != nil {
 				return nil, err
 			}
 			if server == "" {
-				switch args[0].(type) {
+				switch serverArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
-						"server %s does not exist", args[0])
+						"server %s does not exist", serverArg)
 				case *tree.DOid:
 					// Unlike most of the functions, Postgres does not return
 					// NULL when an OID does not match.
@@ -1144,7 +1203,8 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"table",
 		argTypeOpts{{"table", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			tn, err := getTableNameForArg(ctx, args[0])
+			tableArg := tree.UnwrapDatum(ctx, args[0])
+			tn, err := getTableNameForArg(ctx, tableArg)
 			if err != nil {
 				return nil, err
 			}
@@ -1217,15 +1277,16 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"tablespace",
 		argTypeOpts{{"tablespace", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
-			tablespace, err := getNameForArg(ctx, args[0], "pg_tablespace", "spcname")
+			tablespaceArg := tree.UnwrapDatum(ctx, args[0])
+			tablespace, err := getNameForArg(ctx, tablespaceArg, "pg_tablespace", "spcname")
 			if err != nil {
 				return nil, err
 			}
 			if tablespace == "" {
-				switch args[0].(type) {
+				switch tablespaceArg.(type) {
 				case *tree.DString:
 					return nil, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
-						"tablespace %s does not exist", args[0])
+						"tablespace %s does not exist", tablespaceArg)
 				case *tree.DOid:
 					// Unlike most of the functions, Postgres does not return
 					// NULL when an OID does not match.
@@ -1244,10 +1305,11 @@ FROM pg_catalog.pg_sequence WHERE seqrelid=$1`, args[0])
 		"type",
 		argTypeOpts{{"type", strOrOidTypes}},
 		func(ctx *tree.EvalContext, args tree.Datums, user string) (tree.Datum, error) {
+			oidArg := tree.UnwrapDatum(ctx, args[0])
 			// When specifying a type by a text string rather than by OID, the
 			// allowed input is the same as for the regtype data type.
 			var oid tree.Datum
-			switch t := args[0].(type) {
+			switch t := oidArg.(type) {
 			case *tree.DString:
 				var err error
 				oid, err = tree.PerformCast(ctx, t, coltypes.RegType)

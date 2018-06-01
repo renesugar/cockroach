@@ -71,8 +71,20 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER USER foo WITH PASSWORD ??`, `ALTER USER`},
 
 		{`CANCEL ??`, `CANCEL`},
-		{`CANCEL JOB ??`, `CANCEL JOB`},
-		{`CANCEL QUERY ??`, `CANCEL QUERY`},
+		{`CANCEL JOB ??`, `CANCEL JOBS`},
+		{`CANCEL JOBS ??`, `CANCEL JOBS`},
+		{`CANCEL QUERY ??`, `CANCEL QUERIES`},
+		{`CANCEL QUERY IF ??`, `CANCEL QUERIES`},
+		{`CANCEL QUERY IF EXISTS ??`, `CANCEL QUERIES`},
+		{`CANCEL QUERIES ??`, `CANCEL QUERIES`},
+		{`CANCEL QUERIES IF ??`, `CANCEL QUERIES`},
+		{`CANCEL QUERIES IF EXISTS ??`, `CANCEL QUERIES`},
+		{`CANCEL SESSION ??`, `CANCEL SESSIONS`},
+		{`CANCEL SESSION IF ??`, `CANCEL SESSIONS`},
+		{`CANCEL SESSION IF EXISTS ??`, `CANCEL SESSIONS`},
+		{`CANCEL SESSIONS ??`, `CANCEL SESSIONS`},
+		{`CANCEL SESSIONS IF ??`, `CANCEL SESSIONS`},
+		{`CANCEL SESSIONS IF EXISTS ??`, `CANCEL SESSIONS`},
 
 		{`CREATE UNIQUE ??`, `CREATE`},
 		{`CREATE UNIQUE INDEX ??`, `CREATE INDEX`},
@@ -192,9 +204,9 @@ func TestContextualHelp(t *testing.T) {
 		{`GRANT ALL ON foo TO ??`, `GRANT`},
 		{`GRANT ALL ON foo TO bar ??`, `GRANT`},
 
-		{`PAUSE ??`, `PAUSE JOB`},
+		{`PAUSE ??`, `PAUSE JOBS`},
 
-		{`RESUME ??`, `RESUME JOB`},
+		{`RESUME ??`, `RESUME JOBS`},
 
 		{`REVOKE ALL ??`, `REVOKE`},
 		{`REVOKE ALL ON foo FROM ??`, `REVOKE`},
@@ -279,6 +291,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW SYNTAX ??`, `SHOW SYNTAX`},
 		{`SHOW SYNTAX 'foo' ??`, `SHOW SYNTAX`},
 
+		{`SHOW EXPERIMENTAL_RANGES ??`, `SHOW RANGES`},
+
 		{`SHOW USERS ??`, `SHOW USERS`},
 
 		{`TRUNCATE foo ??`, `TRUNCATE`},
@@ -352,6 +366,10 @@ func TestContextualHelp(t *testing.T) {
 
 		{`IMPORT TABLE foo CREATE USING 'foo.sql' CSV DATA ('foo') ??`, `IMPORT`},
 		{`IMPORT TABLE ??`, `IMPORT`},
+
+		{`EXPORT ??`, `EXPORT`},
+		{`EXPORT INTO CSV 'a' ??`, `EXPORT`},
+		{`EXPORT INTO CSV 'a' FROM SELECT a ??`, `SELECT`},
 	}
 
 	// The following checks that the test definition above exercises all

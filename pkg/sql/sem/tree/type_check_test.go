@@ -55,6 +55,10 @@ func TestTypeCheck(t *testing.T) {
 		{`IF(NULL, 2, 3)`, `IF(NULL, 2:::INT, 3:::INT)`},
 		{`IF(NULL, 2, 3.0)`, `IF(NULL, 2:::DECIMAL, 3.0:::DECIMAL)`},
 		{`IF(true, (1, 2), (1, 3))`, `IF(true, (1:::INT, 2:::INT), (1:::INT, 3:::INT))`},
+		{`IFERROR(1, 1.2, '')`, `IFERROR(1:::DECIMAL, 1.2:::DECIMAL, '':::STRING)`},
+		{`IFERROR(NULL, 3, '')`, `IFERROR(NULL, 3:::INT, '':::STRING)`},
+		{`ISERROR(123)`, `ISERROR(123:::INT)`},
+		{`ISERROR(NULL)`, `ISERROR(NULL)`},
 		{`IFNULL(1, 2)`, `IFNULL(1:::INT, 2:::INT)`},
 		{`IFNULL(1, 2.0)`, `IFNULL(1:::DECIMAL, 2.0:::DECIMAL)`},
 		{`IFNULL(NULL, 2)`, `IFNULL(NULL, 2:::INT)`},
@@ -106,6 +110,41 @@ func TestTypeCheck(t *testing.T) {
 		{`1:::DECIMAL + $1`, `1:::DECIMAL + $1:::DECIMAL`},
 		{`$1:::INT`, `$1:::INT`},
 
+		// Tuples with labels
+		{`(ROW (1) AS a)`, `(ROW(1:::INT) AS a)`},
+		{`(ROW(1:::INT) AS a)`, `(ROW(1:::INT) AS a)`},
+		{`((1,2) AS a,b)`, `((1:::INT, 2:::INT) AS a, b)`},
+		{`((1:::INT, 2:::INT) AS a, b)`, `((1:::INT, 2:::INT) AS a, b)`},
+		{`(ROW (1,2) AS a,b)`, `(ROW(1:::INT, 2:::INT) AS a, b)`},
+		{`(ROW(1:::INT, 2:::INT) AS a, b)`, `(ROW(1:::INT, 2:::INT) AS a, b)`},
+		{
+			`((1,2,3) AS "One","Two","Three")`,
+			`((1:::INT, 2:::INT, 3:::INT) AS "One", "Two", "Three")`,
+		},
+		{
+			`((1:::INT, 2:::INT, 3:::INT) AS "One", "Two", "Three")`,
+			`((1:::INT, 2:::INT, 3:::INT) AS "One", "Two", "Three")`,
+		},
+		{
+			`(ROW (1,2,3) AS "One",Two,"Three")`,
+			`(ROW(1:::INT, 2:::INT, 3:::INT) AS "One", two, "Three")`,
+		},
+		{
+			`(ROW(1:::INT, 2:::INT, 3:::INT) AS "One", two, "Three")`,
+			`(ROW(1:::INT, 2:::INT, 3:::INT) AS "One", two, "Three")`,
+		},
+		// And tuples without labels still work as advertized
+		{`(ROW (1))`, `ROW(1:::INT)`},
+		{`ROW(1:::INT)`, `ROW(1:::INT)`},
+		{`((1,2))`, `(1:::INT, 2:::INT)`},
+		{`(1:::INT, 2:::INT)`, `(1:::INT, 2:::INT)`},
+		{`(ROW (1,2))`, `ROW(1:::INT, 2:::INT)`},
+		{`ROW(1:::INT, 2:::INT)`, `ROW(1:::INT, 2:::INT)`},
+
+		{`((ROW (1) AS a)).a`, `1:::INT`},
+		{`((('1', 2) AS a, b)).a`, `'1':::STRING`},
+		{`((('1', 2) AS a, b)).b`, `2:::INT`},
+
 		// These outputs, while bizarre looking, are correct and expected. The
 		// type annotation is caused by the call to tree.Serialize, which formats the
 		// output using the Parseable formatter which inserts type annotations
@@ -144,7 +183,7 @@ func TestTypeCheckError(t *testing.T) {
 		{`1.1 # 3.1`, `unsupported binary operator:`},
 		{`~0.1`, `unsupported unary operator:`},
 		{`'a' > 2`, `unsupported comparison operator:`},
-		{`a`, `name "a" is not defined`},
+		{`a`, `column "a" does not exist`},
 		{`COS(*)`, `cannot use "*" in this context`},
 		{`a.*`, `cannot use "a.*" in this context`},
 		{`1 AND true`, `incompatible AND argument type: int`},
@@ -178,6 +217,39 @@ func TestTypeCheckError(t *testing.T) {
 		{`ANNOTATE_TYPE('a', int)`, `could not parse "a" as type int`},
 		{`ANNOTATE_TYPE(ANNOTATE_TYPE(1, int), decimal)`, `incompatible type annotation for ANNOTATE_TYPE(1, INT) as decimal, found type: int`},
 		{`3:::int[]`, `incompatible type annotation for 3 as int[], found type: int`},
+
+		{
+			`((1,2) AS a)`,
+			`mismatch in tuple definition: 2 expressions, 1 labels`,
+		},
+		{
+			`(ROW (1) AS a,b)`,
+			`mismatch in tuple definition: 1 expressions, 2 labels`,
+		},
+		{
+			`((1,2) AS a,a)`,
+			`duplicate tuple label: "a, a"`,
+		},
+		{
+			`((1,2,3) AS a,b,a)`,
+			`duplicate tuple label: "a, b, a"`,
+		},
+		{
+			`((ROW (1, '2') AS a,b)).x`,
+			`could not identify column "x" in tuple{int AS a, string AS b}`,
+		},
+		{
+			`(((1, '2') AS a,b)).x`,
+			`could not identify column "x" in tuple{int AS a, string AS b}`,
+		},
+		{
+			`((ROW (1) AS a)).*`,
+			`star expansion of tuples is not supported`,
+		},
+		{
+			`((('1', 2) AS a, b)).*`,
+			`star expansion of tuples is not supported`,
+		},
 	}
 	for _, d := range testData {
 		expr, err := parser.ParseExpr(d.expr)

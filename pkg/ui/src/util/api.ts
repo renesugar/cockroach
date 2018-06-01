@@ -83,6 +83,17 @@ export type RangeLogResponseMessage =
 export type CommandQueueRequestMessage = protos.cockroach.server.serverpb.CommandQueueRequest;
 export type CommandQueueResponseMessage = protos.cockroach.server.serverpb.CommandQueueResponse;
 
+export type SettingsRequestMessage = protos.cockroach.server.serverpb.SettingsRequest;
+export type SettingsResponseMessage = protos.cockroach.server.serverpb.SettingsResponse;
+
+export type UserLoginRequestMessage = protos.cockroach.server.serverpb.UserLoginRequest;
+export type UserLoginResponseMessage = protos.cockroach.server.serverpb.UserLoginResponse;
+
+export type StoresRequestMessage = protos.cockroach.server.serverpb.StoresRequest;
+export type StoresResponseMessage = protos.cockroach.server.serverpb.StoresResponse;
+
+export type UserLogoutResponseMessage = protos.cockroach.server.serverpb.UserLogoutResponse;
+
 // API constants
 
 export const API_PREFIX = "_admin/v1";
@@ -152,7 +163,7 @@ function timeoutFetch<TResponse$Properties, TResponse, TResponseBuilder extends 
   });
 }
 
-export type APIRequestFn<TRequest, TResponse> = (req: TRequest, timeout?: moment.Duration) => Promise<TResponse>;
+export type APIRequestFn<TReq, TResponse> = (req: TReq, timeout?: moment.Duration) => Promise<TResponse>;
 
 // propsToQueryString is a helper function that converts a set of object
 // properties to a query string
@@ -251,7 +262,7 @@ export function getLogs(req: LogsRequestMessage, timeout?: moment.Duration): Pro
 }
 
 // getLiveness gets cluster liveness information from the current node.
-export function getLiveness(_: LivenessRequestMessage, timeout?: moment.Duration): Promise<LivenessResponseMessage> {
+export function getLiveness(_req: LivenessRequestMessage, timeout?: moment.Duration): Promise<LivenessResponseMessage> {
   return timeoutFetch(serverpb.LivenessResponse, `${API_PREFIX}/liveness`, null, timeout);
 }
 
@@ -300,4 +311,22 @@ export function getRangeLog(
 // getCommandQueue returns a representation of the command queue for a given range id
 export function getCommandQueue(req: CommandQueueRequestMessage, timeout?: moment.Duration): Promise<CommandQueueResponseMessage> {
   return timeoutFetch(serverpb.CommandQueueResponse, `${STATUS_PREFIX}/range/${req.range_id}/cmdqueue`, null, timeout);
+}
+
+// getSettings gets all cluster settings
+export function getSettings(_req: SettingsRequestMessage, timeout?: moment.Duration): Promise<SettingsResponseMessage> {
+  return timeoutFetch(serverpb.SettingsResponse, `${API_PREFIX}/settings`, null, timeout);
+}
+
+export function userLogin(req: UserLoginRequestMessage, timeout?: moment.Duration): Promise<UserLoginResponseMessage> {
+  return timeoutFetch(serverpb.UserLoginResponse, `login`, req as any, timeout);
+}
+
+export function userLogout(timeout?: moment.Duration): Promise<UserLogoutResponseMessage> {
+  return timeoutFetch(serverpb.UserLogoutResponse, `logout`, null, timeout);
+}
+
+// getStores returns information about a node's stores.
+export function getStores(req: StoresRequestMessage, timeout?: moment.Duration): Promise<StoresResponseMessage> {
+  return timeoutFetch(serverpb.StoresResponse, `${STATUS_PREFIX}/stores/${req.node_id}`, null, timeout);
 }

@@ -754,7 +754,7 @@ END;
 func assureTxnAborted(t *testing.T, s serverutils.TestServerInterface, txn *roachpb.Transaction) {
 	abortBa := roachpb.BatchRequest{}
 	push := &roachpb.PushTxnRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key: txn.Key,
 		},
 		PusheeTxn: txn.TxnMeta,
@@ -1471,7 +1471,7 @@ func TestDistSQLRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// One of the rows in the table.
-	targetKey := roachpb.Key("\273\211\212")
+	targetKey := roachpb.Key("\275\211\212")
 
 	restarted := true
 
@@ -1691,22 +1691,22 @@ func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 		name                              string
 		autoCommit                        bool
 		clientDirectedRetry               bool
-		expectedTxnStateAfterRetriableErr sql.TxnStateEnum
+		expectedTxnStateAfterRetriableErr string
 	}{
 		{
 			name:                              "client_directed_retries",
 			clientDirectedRetry:               true,
-			expectedTxnStateAfterRetriableErr: sql.RestartWait,
+			expectedTxnStateAfterRetriableErr: "RestartWait",
 		},
 		{
 			name:                              "no_client_directed_retries",
 			clientDirectedRetry:               false,
-			expectedTxnStateAfterRetriableErr: sql.Aborted,
+			expectedTxnStateAfterRetriableErr: "Aborted",
 		},
 		{
 			name:                              "autocommit",
 			autoCommit:                        true,
-			expectedTxnStateAfterRetriableErr: sql.NoTxn,
+			expectedTxnStateAfterRetriableErr: "NoTxn",
 		},
 	}
 	for _, tc := range tests {
@@ -1759,7 +1759,7 @@ func TestTxnAutoRetriesDisabledAfterResultsHaveBeenSentToClient(t *testing.T) {
 			if err := sqlDB.QueryRow("SHOW TRANSACTION STATUS").Scan(&state); err != nil {
 				t.Fatal(err)
 			}
-			if expStateStr := tc.expectedTxnStateAfterRetriableErr.String(); state != expStateStr {
+			if expStateStr := tc.expectedTxnStateAfterRetriableErr; state != expStateStr {
 				t.Fatalf("expected state %s, got: %s", expStateStr, state)
 			}
 		})

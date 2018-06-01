@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -75,7 +74,7 @@ func initCLIDefaults() {
 	cliCtx.showTimes = false
 	cliCtx.cmdTimeout = 0 // no timeout
 	cliCtx.sqlConnURL = ""
-	cliCtx.sqlConnUser = security.RootUser
+	cliCtx.sqlConnUser = ""
 	cliCtx.sqlConnDBName = ""
 
 	sqlCtx.execStmts = nil
@@ -93,6 +92,7 @@ func initCLIDefaults() {
 	debugCtx.inputFile = ""
 	debugCtx.printSystemConfig = false
 	debugCtx.maxResults = 1000
+	debugCtx.ballastSize = base.SizeSpec{}
 
 	zoneCtx.zoneConfig = ""
 	zoneCtx.zoneDisableReplication = false
@@ -152,13 +152,6 @@ type cliContext struct {
 // Defaults set by InitCLIDefaults() above.
 var cliCtx = cliContext{Config: baseCfg}
 
-func cmdTimeoutContext(ctx context.Context) (context.Context, func()) {
-	if cliCtx.cmdTimeout != 0 {
-		return context.WithTimeout(ctx, cliCtx.cmdTimeout)
-	}
-	return context.WithCancel(ctx)
-}
-
 // sqlCtx captures the command-line parameters of the `sql` command.
 // Defaults set by InitCLIDefaults() above.
 var sqlCtx = struct {
@@ -194,6 +187,7 @@ var debugCtx struct {
 	sizes             bool
 	replicated        bool
 	inputFile         string
+	ballastSize       base.SizeSpec
 	printSystemConfig bool
 	maxResults        int64
 }

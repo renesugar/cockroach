@@ -92,6 +92,8 @@ func DatumTypeToColumnType(t types.T) (T, error) {
 		return Date, nil
 	case types.Time:
 		return Time, nil
+	case types.TimeTZ:
+		return TimeTZ, nil
 	case types.String:
 		return String, nil
 	case types.Name:
@@ -116,6 +118,16 @@ func DatumTypeToColumnType(t types.T) (T, error) {
 			return nil, err
 		}
 		return ArrayOf(elemTyp, nil)
+	case types.TTuple:
+		colTyp := make(TTuple, len(typ.Types))
+		for i := range typ.Types {
+			elemTyp, err := DatumTypeToColumnType(typ.Types[i])
+			if err != nil {
+				return nil, err
+			}
+			colTyp[i] = elemTyp
+		}
+		return colTyp, nil
 	case types.TOidWrapper:
 		return DatumTypeToColumnType(typ.T)
 	}
@@ -124,8 +136,15 @@ func DatumTypeToColumnType(t types.T) (T, error) {
 		"value type %s cannot be used for table columns", t)
 }
 
-// CastTargetToDatumType produces a types.T equivalent to the given
-// SQL cast target type.
+// CastTargetToDatumType produces the types.T that is closest to the given SQL
+// cast target type. The resulting type might not be exactly equivalent. For
+// example, the following source and destination types are not equivalent,
+// because the destination type allows strings that are longer than two
+// characters. If a string having three characters were converted to VARCHAR(2),
+// the extra character would be truncated (i.e. it's a lossy conversion).
+//
+//   VARCHAR(2) => STRING
+//
 func CastTargetToDatumType(t CastTargetType) types.T {
 	switch ct := t.(type) {
 	case *TBool:
@@ -146,6 +165,8 @@ func CastTargetToDatumType(t CastTargetType) types.T {
 		return types.Date
 	case *TTime:
 		return types.Time
+	case *TTimeTZ:
+		return types.TimeTZ
 	case *TTimestamp:
 		return types.Timestamp
 	case *TTimestampTZ:
@@ -171,6 +192,12 @@ func CastTargetToDatumType(t CastTargetType) types.T {
 		default:
 			panic(fmt.Sprintf("unexpected CastTarget %T[%T]", t, ct.ParamType))
 		}
+	case TTuple:
+		ret := types.TTuple{Types: make([]types.T, len(ct))}
+		for i := range ct {
+			ret.Types[i] = CastTargetToDatumType(ct[i])
+		}
+		return ret
 	case *TOid:
 		return TOidToType(ct)
 	default:

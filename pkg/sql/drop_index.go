@@ -44,7 +44,7 @@ func (p *planner) DropIndex(ctx context.Context, n *tree.DropIndex) (planNode, e
 		var err error
 		// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 		// TODO(vivek): check if the cache can be used.
-		p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		p.runWithOptions(resolveFlags{skipCache: true}, func() {
 			tn, tableDesc, err = expandIndexName(ctx, p, index, !n.IfExists /* requireTable */)
 		})
 		if err != nil {
@@ -74,7 +74,7 @@ func (n *dropIndexNode) startExec(params runParams) error {
 		// drop need to be visible to the second drop.
 		var tableDesc *TableDescriptor
 		var err error
-		params.p.runWithOptions(resolveFlags{allowAdding: true, skipCache: true}, func() {
+		params.p.runWithOptions(resolveFlags{skipCache: true}, func() {
 			tableDesc, err = ResolveExistingObject(
 				ctx, params.p, index.tn, true /*required*/, requireTableDesc)
 		})
@@ -214,7 +214,7 @@ func (p *planner) dropIndexByName(
 		return fmt.Errorf("index %q in the middle of being added, try again later", idxName)
 	}
 
-	if err := tableDesc.Validate(ctx, p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
 		return err
 	}
 	mutationID, err := p.createSchemaChangeJob(ctx, tableDesc, jobDesc)

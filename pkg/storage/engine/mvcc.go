@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 const (
@@ -46,12 +48,12 @@ var (
 	NilKey = MVCCKey{}
 )
 
-// AccountForSelf adjusts ms to account for the predicted impact it will have on
-// the values that it records when the structure is initially stored. Specifically,
-// MVCCStats is stored on the RangeStats key, which means that its creation will
-// have an impact on system-local data size and key count.
-func AccountForSelf(ms *enginepb.MVCCStats, rangeID roachpb.RangeID) error {
-	key := keys.RangeStatsKey(rangeID)
+// AccountForLegacyMVCCStats adjusts ms to account for the predicted impact it
+// will have on the values that it records when the structure is initially stored.
+// Specifically, MVCCStats is stored on the RangeStats legacy key, which means
+// that its creation will have an impact on system-local data size and key count.
+func AccountForLegacyMVCCStats(ms *enginepb.MVCCStats, rangeID roachpb.RangeID) error {
+	key := keys.RangeStatsLegacyKey(rangeID)
 	metaKey := MakeMVCCMetadataKey(key)
 
 	// MVCCStats is stored inline, so compute MVCCMetadata accordingly.
@@ -690,13 +692,13 @@ func (b *getBuffer) release() {
 // the previous value (if any) is read instead.
 func MVCCGet(
 	ctx context.Context,
-	engine Reader,
+	eng Reader,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	consistent bool,
 	txn *roachpb.Transaction,
 ) (*roachpb.Value, []roachpb.Intent, error) {
-	iter := engine.NewIterator(true)
+	iter := eng.NewIterator(IterOptions{Prefix: true})
 	value, intents, err := iter.MVCCGet(key, timestamp, txn, consistent, false /* tombstones */)
 	iter.Close()
 	return value, intents, err
@@ -707,13 +709,13 @@ func MVCCGet(
 // set to nil for tombstones.
 func MVCCGetWithTombstone(
 	ctx context.Context,
-	engine Reader,
+	eng Reader,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	consistent bool,
 	txn *roachpb.Transaction,
 ) (*roachpb.Value, []roachpb.Intent, error) {
-	iter := engine.NewIterator(true)
+	iter := eng.NewIterator(IterOptions{Prefix: true})
 	value, intents, err := iter.MVCCGet(key, timestamp, txn, consistent, true /* tombstones */)
 	iter.Close()
 	return value, intents, err
@@ -1025,7 +1027,7 @@ func (b *putBuffer) putMeta(
 // the value. In addition, zero timestamp values may be merged.
 func MVCCPut(
 	ctx context.Context,
-	engine ReadWriter,
+	eng ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1037,10 +1039,10 @@ func MVCCPut(
 	var iter Iterator
 	blind := ms == nil && timestamp == (hlc.Timestamp{})
 	if !blind {
-		iter = engine.NewIterator(true)
+		iter = eng.NewIterator(IterOptions{Prefix: true})
 		defer iter.Close()
 	}
-	return mvccPutUsingIter(ctx, engine, iter, ms, key, timestamp, value, txn, nil /* valueFn */)
+	return mvccPutUsingIter(ctx, eng, iter, ms, key, timestamp, value, txn, nil /* valueFn */)
 }
 
 // MVCCBlindPut is a fast-path of MVCCPut. See the MVCCPut comments for details
@@ -1071,7 +1073,7 @@ func MVCCDelete(
 	timestamp hlc.Timestamp,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	return mvccPutUsingIter(ctx, engine, iter, ms, key, timestamp, noValue, txn, nil /* valueFn */)
@@ -1219,7 +1221,8 @@ func mvccPutInternal(
 					txn.Epoch, meta.Txn.Epoch, txn.ID)
 			} else if txn.Epoch == meta.Txn.Epoch &&
 				(txn.Sequence < meta.Txn.Sequence ||
-					(txn.Sequence == meta.Txn.Sequence && txn.BatchIndex <= meta.Txn.BatchIndex)) {
+					(txn.Sequence == meta.Txn.Sequence &&
+						txn.DeprecatedBatchIndex <= meta.Txn.DeprecatedBatchIndex)) {
 				// Replay error if we encounter an older sequence number or
 				// the same (or earlier) batch index for the same sequence.
 				return roachpb.NewTransactionRetryError(roachpb.RETRY_POSSIBLE_REPLAY)
@@ -1370,7 +1373,7 @@ func MVCCIncrement(
 	txn *roachpb.Transaction,
 	inc int64,
 ) (int64, error) {
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	var int64Val int64
@@ -1420,7 +1423,7 @@ func MVCCConditionalPut(
 	expVal *roachpb.Value,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	return mvccConditionalPutUsingIter(ctx, engine, iter, ms, key, timestamp, value, expVal, txn)
@@ -1460,7 +1463,7 @@ func mvccConditionalPutUsingIter(
 		func(existVal *roachpb.Value) ([]byte, error) {
 			if expValPresent, existValPresent := expVal != nil, existVal.IsPresent(); expValPresent && existValPresent {
 				// Every type flows through here, so we can't use the typed getters.
-				if !bytes.Equal(expVal.RawBytes, existVal.RawBytes) {
+				if !expVal.EqualData(*existVal) {
 					return nil, &roachpb.ConditionFailedError{
 						ActualValue: existVal.ShallowClone(),
 					}
@@ -1491,7 +1494,7 @@ func MVCCInitPut(
 	failOnTombstones bool,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 	return mvccInitPutUsingIter(ctx, engine, iter, ms, key, timestamp, value, failOnTombstones, txn)
 }
@@ -1531,7 +1534,7 @@ func mvccInitPutUsingIter(
 				return nil, &roachpb.ConditionFailedError{ActualValue: existVal.ShallowClone()}
 			}
 			if existVal.IsPresent() {
-				if !bytes.Equal(value.RawBytes, existVal.RawBytes) {
+				if !value.EqualData(*existVal) {
 					return nil, &roachpb.ConditionFailedError{
 						ActualValue: existVal.ShallowClone(),
 					}
@@ -1616,7 +1619,7 @@ func MVCCDeleteRange(
 	}
 
 	buf := newPutBuffer()
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 
 	for i := range kvs {
 		err = mvccPutInternal(
@@ -1661,12 +1664,20 @@ func mvccScanInternal(
 	}
 
 	var ownIter bool
+	var withStats bool
 	if iter == nil {
-		iter = engine.NewIterator(false)
+		if sp := opentracing.SpanFromContext(ctx); sp != nil && !tracing.IsBlackHoleSpan(sp) {
+			withStats = true
+		}
+		iter = engine.NewIterator(IterOptions{WithStats: withStats})
 		ownIter = true
 	}
 	kvData, numKvs, intentData, err := iter.MVCCScan(
 		key, endKey, max, timestamp, txn, consistent, reverse, tombstones)
+
+	if withStats {
+		log.Eventf(ctx, "engine stats: %+v", iter.Stats())
+	}
 	if ownIter {
 		iter.Close()
 	}
@@ -1859,7 +1870,7 @@ func MVCCIterate(
 	f func(roachpb.KeyValue) (bool, error),
 ) ([]roachpb.Intent, error) {
 	// Get a new iterator.
-	iter := engine.NewIterator(false)
+	iter := engine.NewIterator(IterOptions{})
 	defer iter.Close()
 
 	return MVCCIterateUsingIter(
@@ -1965,7 +1976,7 @@ func MVCCIterateUsingIter(
 func MVCCResolveWriteIntent(
 	ctx context.Context, engine ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent,
 ) error {
-	iterAndBuf := GetBufUsingIter(engine.NewIterator(true))
+	iterAndBuf := GetBufUsingIter(engine.NewIterator(IterOptions{Prefix: true}))
 	err := MVCCResolveWriteIntentUsingIter(ctx, engine, iterAndBuf, ms, intent)
 	// Using defer would be more convenient, but it is measurably slower.
 	iterAndBuf.Cleanup()
@@ -2086,7 +2097,7 @@ func mvccResolveWriteIntent(
 	}
 
 	// A commit in an older epoch or timestamp is prevented by the
-	// sequence cache under normal operation. Replays of EndTransaction
+	// abort span under normal operation. Replays of EndTransaction
 	// commands which occur after the transaction record has been erased
 	// make this a possibility; we treat such intents as uncommitted.
 	//
@@ -2277,7 +2288,7 @@ type IterAndBuf struct {
 
 // GetIterAndBuf returns an IterAndBuf for passing into various MVCC* methods.
 func GetIterAndBuf(engine Reader) IterAndBuf {
-	return GetBufUsingIter(engine.NewIterator(false))
+	return GetBufUsingIter(engine.NewIterator(IterOptions{}))
 }
 
 // GetBufUsingIter returns an IterAndBuf using the supplied iterator.
@@ -2387,7 +2398,7 @@ func MVCCGarbageCollect(
 ) error {
 	// We're allowed to use a prefix iterator because we always Seek() the
 	// iterator when handling a new user key.
-	iter := engine.NewIterator(true)
+	iter := engine.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	var count int64
@@ -2518,20 +2529,64 @@ func MVCCFindSplitKey(
 		key = roachpb.RKey(keys.LocalMax)
 	}
 
-	it := engine.NewIterator(false /* prefix */)
+	it := engine.NewIterator(IterOptions{})
 	defer it.Close()
 
-	minSplitKey := key
-	// If this is a table, we can only split at row boundaries.
-	if remainder, _, err := keys.DecodeTablePrefix(roachpb.Key(key)); err == nil {
-		// If this is the first range containing a table, its start key won't
-		// actually contain any row information, just the table ID. We don't want
-		// to restrict splits on such tables, since key.PrefixEnd will just be the
-		// end of the table span.
-		if len(remainder) > 0 {
-			minSplitKey = roachpb.RKey(roachpb.Key(key).PrefixEnd())
-		}
+	// We must never return a split key that falls within a table row. (Rows in
+	// tables with multiple column families are comprised of multiple keys, one
+	// key per column family.)
+	//
+	// Managing this is complicated: the logic for picking a split key that
+	// creates ranges of the right size lives in C++, while the logic for
+	// determining whether a key falls within a table row lives in Go.
+	//
+	// Most of the time, we can let C++ pick whatever key it wants. If it picks a
+	// key in the middle of a row, we simply rewind the key to the start of the
+	// row. This is handled by keys.EnsureSafeSplitKey.
+	//
+	// If, however, that first row in the range is so large that it exceeds the
+	// range size threshold on its own, and that row is comprised of multiple
+	// column families, we have a problem. C++ will hand us a key in the middle of
+	// that row, keys.EnsureSafeSplitKey will rewind the key to the beginning of
+	// the row, and... we'll end up with what's likely to be the start key of the
+	// range. The higher layers of the stack will take this to mean that no splits
+	// are required, when in fact the range is desperately in need of a split.
+	//
+	// Note that the first range of a table or a partition of a table does not
+	// start on a row boundary and so we have a slightly different problem.
+	// Instead of not splitting the range at all, we'll create a split at the
+	// start of the first row, resulting in an unnecessary empty range from the
+	// beginning of the table to the first row in the table (e.g., from /Table/51
+	// to /Table/51/1/aardvark...). The right-hand side of the split will then be
+	// susceptible to never being split as outlined above.
+	//
+	// To solve both of these problems, we find the end of the first row in Go,
+	// then plumb that to C++ as a "minimum split key." We're then guaranteed that
+	// the key C++ returns will rewind to the start key of the range.
+	//
+	// On a related note, we find the first row by actually looking at the first
+	// key in the the range. A previous version of this code attempted to derive
+	// the first row only by looking at `key`, the start key of the range; this
+	// was dangerous because partitioning can split off ranges that do not start
+	// at valid row keys. The keys that are present in the range, by contrast, are
+	// necessarily valid row keys.
+	it.Seek(MakeMVCCMetadataKey(key.AsRawKey()))
+	if ok, err := it.Valid(); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, nil
 	}
+	minSplitKey := key
+	if _, _, err := keys.DecodeTablePrefix(it.UnsafeKey().Key); err == nil {
+		// The first key in this range represents a row in a SQL table. Advance the
+		// minSplitKey past this row to avoid the problems described above.
+		firstRowKey, err := keys.EnsureSafeSplitKey(it.Key().Key)
+		if err != nil {
+			return nil, err
+		}
+		minSplitKey = roachpb.RKey(firstRowKey.PrefixEnd())
+	}
+
 	splitKey, err := it.FindSplitKey(
 		MakeMVCCMetadataKey(key.AsRawKey()),
 		MakeMVCCMetadataKey(endKey.AsRawKey()),
@@ -2541,7 +2596,8 @@ func MVCCFindSplitKey(
 	if err != nil {
 		return nil, err
 	}
-	// The family ID has been removed from this key, making it a valid split point.
+	// Ensure the key is a valid split point that does not fall in the middle of a
+	// SQL row by removing the column family ID, if any, from the end of the key.
 	return keys.EnsureSafeSplitKey(splitKey.Key)
 }
 
@@ -2587,7 +2643,7 @@ func ComputeStatsGo(
 ) (enginepb.MVCCStats, error) {
 	var ms enginepb.MVCCStats
 
-	meta := &enginepb.MVCCMetadata{}
+	var meta enginepb.MVCCMetadata
 	var prevKey []byte
 	first := false
 
@@ -2617,7 +2673,24 @@ func ComputeStatsGo(
 			}
 		}
 
-		isSys := bytes.Compare(unsafeKey.Key, keys.LocalMax) < 0
+		// Check for ignored keys.
+		if bytes.HasPrefix(unsafeKey.Key, keys.LocalRangeIDPrefix) {
+			// RangeID-local key.
+			_ /* rangeID */, infix, suffix, _ /* detail */, err := keys.DecodeRangeIDKey(unsafeKey.Key)
+			if err != nil {
+				return enginepb.MVCCStats{}, errors.Wrap(err, "unable to decode rangeID key")
+			}
+
+			if infix.Equal(keys.LocalRangeIDReplicatedInfix) {
+				// Replicated RangeID-local key.
+				if suffix.Equal(keys.LocalRangeAppliedStateSuffix) {
+					// RangeAppliedState key. Ignore.
+					continue
+				}
+			}
+		}
+
+		isSys := isSysLocal(unsafeKey.Key)
 		isValue := unsafeKey.IsValue()
 		implicitMeta := isValue && !bytes.Equal(unsafeKey.Key, prevKey)
 		prevKey = append(prevKey[:0], unsafeKey.Key...)
@@ -2641,7 +2714,7 @@ func ComputeStatsGo(
 			first = true
 
 			if !implicitMeta {
-				if err := protoutil.Unmarshal(unsafeValue, meta); err != nil {
+				if err := protoutil.Unmarshal(unsafeValue, &meta); err != nil {
 					return ms, errors.Wrap(err, "unable to decode MVCCMetadata")
 				}
 			}

@@ -70,7 +70,7 @@ func (r *Replica) CheckConsistency(
 	id := uuid.MakeV4()
 
 	checkArgs := roachpb.ComputeChecksumRequest{
-		Span: roachpb.Span{
+		RequestHeader: roachpb.RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
@@ -129,7 +129,7 @@ func (r *Replica) CheckConsistency(
 		log.Infof(ctx, "triggering stats recomputation to resolve delta of %+v", results[0].Response.Delta)
 
 		req := roachpb.RecomputeStatsRequest{
-			Span: roachpb.Span{Key: desc.StartKey.AsRawKey()},
+			RequestHeader: roachpb.RequestHeader{Key: desc.StartKey.AsRawKey()},
 		}
 
 		var b client.Batch
@@ -346,7 +346,7 @@ func (r *Replica) computeChecksumDone(
 
 			delta := result.PersistedMS
 			delta.Subtract(result.RecomputedMS)
-			c.Delta = enginepb.MVCCNetworkStats(delta)
+			c.Delta = enginepb.MVCCStatsDelta(delta)
 		}
 		c.gcTimestamp = timeutil.Now().Add(batcheval.ReplicaChecksumGCInterval)
 		c.Snapshot = snapshot
@@ -377,7 +377,7 @@ func (r *Replica) sha512(
 	legacyTombstoneKey := engine.MakeMVCCMetadataKey(keys.RaftTombstoneIncorrectLegacyKey(desc.RangeID))
 
 	// Iterate over all the data in the range.
-	iter := snap.NewIterator(false /* prefix */)
+	iter := snap.NewIterator(engine.IterOptions{})
 	defer iter.Close()
 
 	var alloc bufalloc.ByteAllocator

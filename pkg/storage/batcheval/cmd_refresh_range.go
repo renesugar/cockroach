@@ -44,7 +44,7 @@ func RefreshRange(
 
 	// Use a time-bounded iterator to avoid unnecessarily iterating over
 	// older data.
-	iter := batch.NewTimeBoundIterator(h.Txn.OrigTimestamp, h.Txn.Timestamp)
+	iter := batch.NewTimeBoundIterator(h.Txn.OrigTimestamp, h.Txn.Timestamp, false)
 	defer iter.Close()
 	// Iterate over values until we discover any value written at or
 	// after the original timestamp, but before or at the current
@@ -53,7 +53,7 @@ func RefreshRange(
 	// committed values and returns all intents, including those from
 	// the txn itself. Note that we include tombstones, which must be
 	// considered as updates on refresh.
-	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Header(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
+	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), h.Txn.OrigTimestamp, h.Txn.Timestamp)
 	intents, err := engine.MVCCIterateUsingIter(
 		ctx,
 		batch,

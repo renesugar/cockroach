@@ -25,12 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload"
 )
 
-var csvServerCmd = &cobra.Command{
+var csvServerCmd = setCmdDefaults(&cobra.Command{
 	Use:   `csv-server`,
 	Short: `Serves csv table data through an HTTP interface`,
 	Args:  cobra.NoArgs,
 	RunE:  runCSVServer,
-}
+})
 
 var port *int
 
@@ -40,16 +40,7 @@ func init() {
 }
 
 func runCSVServer(_ *cobra.Command, _ []string) error {
-	mux := http.NewServeMux()
-	for _, meta := range workload.Registered() {
-		meta := meta
-		prefix := fmt.Sprintf(`/csv/%s/`, meta.Name)
-		mux.HandleFunc(prefix, func(w http.ResponseWriter, req *http.Request) {
-			if err := workload.HandleCSV(w, req, prefix, meta); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-		})
-	}
+	mux := workload.CSVMux(workload.Registered())
 
 	// Cribbed straight from pprof's `init()` method. See:
 	// https://golang.org/src/net/http/pprof/pprof.go

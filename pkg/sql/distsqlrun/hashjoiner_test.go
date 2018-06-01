@@ -33,864 +33,24 @@ import (
 	"github.com/pkg/errors"
 )
 
-type hashJoinerTestCase struct {
-	spec       HashJoinerSpec
-	outCols    []uint32
-	leftTypes  []sqlbase.ColumnType
-	leftInput  sqlbase.EncDatumRows
-	rightTypes []sqlbase.ColumnType
-	rightInput sqlbase.EncDatumRows
-	expected   sqlbase.EncDatumRows
-}
-
 func TestHashJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	columnTypeInt := sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}
-	v := [10]sqlbase.EncDatum{}
-	for i := range v {
-		v[i] = sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
-	}
-	null := sqlbase.EncDatum{Datum: tree.DNull}
-
-	testCases := []hashJoinerTestCase{
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.InnerJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[4]},
-				{v[2], v[4]},
-				{v[3], v[1]},
-				{v[4], v[5]},
-				{v[5], v[5]},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-		},
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.InnerJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1, 3},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[1]},
-				{v[0], v[0]},
-				{v[0], v[5]},
-				{v[0], v[4]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[0], v[0], v[1]},
-				{v[0], v[0], v[0]},
-				{v[0], v[0], v[5]},
-				{v[0], v[0], v[4]},
-				{v[0], v[1], v[4]},
-				{v[0], v[1], v[1]},
-				{v[0], v[1], v[0]},
-				{v[0], v[1], v[5]},
-				{v[0], v[1], v[4]},
-			},
-		},
-		// Test that inner joins work with filter expressions.
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.InnerJoin,
-				OnExpr:         Expression{Expr: "@4 >= 4"},
-				// Implicit AND @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1, 3},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[1]},
-				{v[1], v[0]},
-				{v[1], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[1]},
-				{v[0], v[0]},
-				{v[0], v[5]},
-				{v[0], v[4]},
-				{v[1], v[4]},
-				{v[1], v[1]},
-				{v[1], v[0]},
-				{v[1], v[5]},
-				{v[1], v[4]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[0], v[0], v[5]},
-				{v[0], v[0], v[4]},
-				{v[0], v[1], v[4]},
-				{v[0], v[1], v[5]},
-				{v[0], v[1], v[4]},
-				{v[1], v[0], v[4]},
-				{v[1], v[0], v[5]},
-				{v[1], v[0], v[4]},
-				{v[1], v[1], v[4]},
-				{v[1], v[1], v[5]},
-				{v[1], v[1], v[4]},
-			},
-		},
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftOuterJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[4]},
-				{v[2], v[4]},
-				{v[3], v[1]},
-				{v[4], v[5]},
-				{v[5], v[5]},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], null, null},
-				{v[1], v[0], v[4]},
-				{v[2], null, null},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-				{v[5], null, null},
-			},
-		},
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.RightOuterJoin,
-				// Implicit @1 = @4 constraint.
-			},
-			outCols:   []uint32{3, 1, 2},
-			leftTypes: threeIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[4]},
-				{v[2], v[4]},
-				{v[3], v[1]},
-				{v[4], v[5]},
-				{v[5], v[5]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], null, null},
-				{v[1], v[0], v[4]},
-				{v[2], null, null},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-				{v[5], null, null},
-			},
-		},
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.FullOuterJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[4]},
-				{v[2], v[4]},
-				{v[3], v[1]},
-				{v[4], v[5]},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-				{v[5], v[5], v[1]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], null, null},
-				{v[1], v[0], v[4]},
-				{v[2], null, null},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-				{null, v[5], v[1]},
-			},
-		},
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.InnerJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[2], v[4]},
-				{v[3], v[1]},
-				{v[4], v[5]},
-				{v[5], v[5]},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1], v[0], v[4]},
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[3], v[4], v[1]},
-				{v[4], v[4], v[5]},
-			},
-		},
-		// Test that left outer joins work with filters as expected.
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftOuterJoin,
-				OnExpr:         Expression{Expr: "@3 = 9"},
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: oneIntCol,
-			leftInput: sqlbase.EncDatumRows{
-				{v[1]},
-				{v[2]},
-				{v[3]},
-				{v[5]},
-				{v[6]},
-				{v[7]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[2], v[8]},
-				{v[3], v[9]},
-				{v[4], v[9]},
-
-				// Rows that match v[5].
-				{v[5], v[9]},
-				{v[5], v[9]},
-
-				// Rows that match v[6] but the ON condition fails.
-				{v[6], v[8]},
-				{v[6], v[8]},
-
-				// Rows that match v[7], ON condition fails for one.
-				{v[7], v[8]},
-				{v[7], v[9]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], null},
-				{v[2], null},
-				{v[3], v[3]},
-				{v[5], v[5]},
-				{v[5], v[5]},
-				{v[6], null},
-				{v[7], v[7]},
-			},
-		},
-		// Test that right outer joins work with filters as expected.
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.RightOuterJoin,
-				OnExpr:         Expression{Expr: "@2 > 1"},
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: oneIntCol,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0]},
-				{v[1]},
-				{v[2]},
-			},
-			rightTypes: oneIntCol,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1]},
-				{v[2]},
-				{v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{null, v[1]},
-				{v[2], v[2]},
-				{null, v[3]},
-			},
-		},
-		// Test that full outer joins work with filters as expected.
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.FullOuterJoin,
-				OnExpr:         Expression{Expr: "@2 > 1"},
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: oneIntCol,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0]},
-				{v[1]},
-				{v[2]},
-			},
-			rightTypes: oneIntCol,
-			rightInput: sqlbase.EncDatumRows{
-				{v[1]},
-				{v[2]},
-				{v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], null},
-				{null, v[1]},
-				{v[1], null},
-				{v[2], v[2]},
-				{null, v[3]},
-			},
-		},
-
-		// Tests for behavior when input contains NULLs.
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0, 1},
-				RightEqColumns: []uint32{0, 1},
-				Type:           sqlbase.InnerJoin,
-				// Implicit @1,@2 = @3,@4 constraint.
-			},
-			outCols:   []uint32{0, 1, 2, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], null},
-				{null, v[2]},
-				{null, null},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[1], null, v[5]},
-				{null, v[2], v[6]},
-				{null, null, v[7]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[0], v[0], v[4]},
-			},
-		},
-
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0, 1},
-				RightEqColumns: []uint32{0, 1},
-				Type:           sqlbase.LeftOuterJoin,
-				// Implicit @1,@2 = @3,@4 constraint.
-			},
-			outCols:   []uint32{0, 1, 2, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], null},
-				{null, v[2]},
-				{null, null},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[1], null, v[5]},
-				{null, v[2], v[6]},
-				{null, null, v[7]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[0], v[0], v[4]},
-				{v[1], null, null, null, null},
-				{null, v[2], null, null, null},
-				{null, null, null, null, null},
-			},
-		},
-
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0, 1},
-				RightEqColumns: []uint32{0, 1},
-				Type:           sqlbase.RightOuterJoin,
-				// Implicit @1,@2 = @3,@4 constraint.
-			},
-			outCols:   []uint32{0, 1, 2, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], null},
-				{null, v[2]},
-				{null, null},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[1], null, v[5]},
-				{null, v[2], v[6]},
-				{null, null, v[7]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[0], v[0], v[4]},
-				{null, null, v[1], null, v[5]},
-				{null, null, null, v[2], v[6]},
-				{null, null, null, null, v[7]},
-			},
-		},
-
-		{
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0, 1},
-				RightEqColumns: []uint32{0, 1},
-				Type:           sqlbase.FullOuterJoin,
-				// Implicit @1,@2 = @3,@4 constraint.
-			},
-			outCols:   []uint32{0, 1, 2, 3, 4},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], null},
-				{null, v[2]},
-				{null, null},
-			},
-			rightTypes: threeIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0], v[4]},
-				{v[1], null, v[5]},
-				{null, v[2], v[6]},
-				{null, null, v[7]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0], v[0], v[0], v[0], v[4]},
-				{null, null, v[1], null, v[5]},
-				{null, null, null, v[2], v[6]},
-				{null, null, null, null, v[7]},
-				{v[1], null, null, null, null},
-				{null, v[2], null, null, null},
-				{null, null, null, null, null},
-			},
-		},
-		{
-			// Ensure semi join doesn't emit extra rows when
-			// there are multiple matching rows in the
-			// rightInput and the rightInput is smaller.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[2], v[0]},
-				{v[2], v[1]},
-				{v[3], v[5]},
-				{v[3], v[4]},
-				{v[3], v[3]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[1]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0]},
-				{v[2]},
-				{v[2]},
-			},
-		},
-		{
-			// Ensure semi join doesn't emit extra rows when
-			// there are multiple matching rows in the
-			// rightInput and the leftInput is smaller
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[1]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[2], v[0]},
-				{v[2], v[1]},
-				{v[3], v[5]},
-				{v[3], v[4]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0]},
-				{v[0]},
-				{v[2]},
-			},
-		},
-		{
-			// Ensure nulls don't match with any value
-			// for semi joins.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[1]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{null, v[1]},
-				{v[3], v[5]},
-				{v[3], v[4]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0]},
-				{v[0]},
-			},
-		},
-		{
-			// Ensure that nulls don't match
-			// with nulls for semiJoins
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{null, v[1]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{null, v[1]},
-				{v[3], v[5]},
-				{v[3], v[4]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[0]},
-			},
-		},
-		{
-			// Ensure that semi joins respect OnExprs.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				OnExpr:         Expression{Expr: "@1 > 1"},
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-				{v[2], v[2]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[2], v[1]},
-				{v[2], v[2]},
-			},
-		},
-		{
-			// Ensure that semi joins respect OnExprs on both inputs.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				OnExpr:         Expression{Expr: "@4 > 4 and @2 + @4 = 8"},
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-				{v[2], v[2]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[2], v[2]},
-			},
-		},
-		{
-			// Ensure that anti-joins don't produce duplicates when left
-			// side is smaller.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[1]},
-			},
-		},
-		{
-			// Ensure that anti-joins don't produce duplicates when right
-			// side is smaller.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{v[1], v[2]},
-				{v[2], v[1]},
-				{v[3], v[4]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[1]},
-				{v[1], v[2]},
-			},
-		},
-		{
-			// Ensure nulls aren't equal in anti-joins.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{null, v[2]},
-				{v[2], v[1]},
-				{v[3], v[4]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{null, v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[1]},
-				{null, v[2]},
-			},
-		},
-		{
-			// Ensure nulls don't match to anything in anti-joins.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{null, v[2]},
-				{v[2], v[1]},
-				{v[3], v[4]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{null, v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[1]},
-				{null, v[2]},
-			},
-		},
-		{
-			// Ensure anti-joins obey OnExpr constraints on columns
-			// from both inputs.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				OnExpr:         Expression{Expr: "(@2 + @4) % 2 = 0"},
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[1], v[2]},
-				{v[1], v[3]},
-				{v[2], v[2]},
-				{v[2], v[3]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[2]},
-				{v[2], v[1]},
-				{v[3], v[3]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[2]},
-				{v[1], v[3]},
-				{v[2], v[2]},
-			},
-		},
-		{
-			// Ensure anti-joins obey OnExpr constraints on columns
-			// from both inputs when left input is smaller.
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				OnExpr:         Expression{Expr: "(@2 + @4) % 2 = 0"},
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[1], v[2]},
-				{v[1], v[3]},
-				{v[2], v[2]},
-				{v[2], v[3]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[2]},
-				{v[2], v[1]},
-				{v[3], v[3]},
-				{v[4], v[1]},
-				{v[4], v[2]},
-				{v[4], v[3]},
-				{v[4], v[4]},
-			},
-			expected: sqlbase.EncDatumRows{
-				{v[1], v[2]},
-				{v[1], v[3]},
-				{v[2], v[2]},
-			},
-		},
-	}
+	testCases := joinerTestCases()
 
 	// Add INTERSECT ALL cases with HashJoinerSpecs.
 	for _, tc := range intersectAllTestCases() {
-		testCases = append(testCases, setOpTestCaseToHashJoinerTestCase(tc))
+		testCases = append(testCases, setOpTestCaseToJoinerTestCase(tc))
 	}
 
 	// Add EXCEPT ALL cases with HashJoinerSpecs.
 	for _, tc := range exceptAllTestCases() {
-		testCases = append(testCases, setOpTestCaseToHashJoinerTestCase(tc))
+		testCases = append(testCases, setOpTestCaseToJoinerTestCase(tc))
 	}
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st))
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -919,21 +79,26 @@ func TestHashJoiner(t *testing.T) {
 				rightInput := NewRowBuffer(c.rightTypes, c.rightInput, RowBufferArgs{})
 				out := &RowBuffer{}
 				flowCtx := FlowCtx{
-					Ctx:         ctx,
 					Settings:    st,
 					EvalCtx:     evalCtx,
 					TempStorage: tempEngine,
 					diskMonitor: &diskMonitor,
 				}
 				post := PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-				h, err := newHashJoiner(&flowCtx, &c.spec, leftInput, rightInput, &post, out)
+				spec := &HashJoinerSpec{
+					LeftEqColumns:  c.leftEqCols,
+					RightEqColumns: c.rightEqCols,
+					Type:           c.joinType,
+					OnExpr:         c.onExpr,
+				}
+				h, err := newHashJoiner(&flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out)
 				if err != nil {
 					return err
 				}
 				outTypes := h.OutputTypes()
 				setup(h)
 				h.forcedStoredSide = &side
-				h.Run(nil)
+				h.Run(context.Background(), nil /* wg */)
 
 				if !out.ProducerClosed {
 					return errors.New("output RowReceiver not closed")
@@ -995,73 +160,11 @@ func TestHashJoinerError(t *testing.T) {
 		v[i] = sqlbase.DatumToEncDatum(columnTypeInt, tree.NewDInt(tree.DInt(i)))
 	}
 
-	testCases := []struct {
-		description string
-		spec        HashJoinerSpec
-		outCols     []uint32
-		leftTypes   []sqlbase.ColumnType
-		leftInput   sqlbase.EncDatumRows
-		rightTypes  []sqlbase.ColumnType
-		rightInput  sqlbase.EncDatumRows
-		expectedErr error
-	}{
-		{
-			description: "Ensure that columns from the right input cannot be in semi-join output.",
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftSemiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1, 2},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-				{v[2], v[2]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expectedErr: errors.Errorf("invalid output column %d (only %d available)", 2, 2),
-		},
-		{
-			description: "Ensure that columns from the right input cannot be in anti-join output.",
-			spec: HashJoinerSpec{
-				LeftEqColumns:  []uint32{0},
-				RightEqColumns: []uint32{0},
-				Type:           sqlbase.LeftAntiJoin,
-				// Implicit @1 = @3 constraint.
-			},
-			outCols:   []uint32{0, 1, 2},
-			leftTypes: twoIntCols,
-			leftInput: sqlbase.EncDatumRows{
-				{v[0], v[0]},
-				{v[1], v[1]},
-				{v[2], v[1]},
-				{v[2], v[2]},
-			},
-			rightTypes: twoIntCols,
-			rightInput: sqlbase.EncDatumRows{
-				{v[0], v[4]},
-				{v[0], v[4]},
-				{v[2], v[5]},
-				{v[2], v[6]},
-				{v[3], v[3]},
-			},
-			expectedErr: errors.Errorf("invalid output column %d (only %d available)", 2, 2),
-		},
-	}
+	testCases := joinerErrorTestCases()
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st))
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +192,6 @@ func TestHashJoinerError(t *testing.T) {
 			rightInput := NewRowBuffer(c.rightTypes, c.rightInput, RowBufferArgs{})
 			out := &RowBuffer{}
 			flowCtx := FlowCtx{
-				Ctx:         ctx,
 				Settings:    st,
 				EvalCtx:     evalCtx,
 				TempStorage: tempEngine,
@@ -1097,13 +199,19 @@ func TestHashJoinerError(t *testing.T) {
 			}
 
 			post := PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			h, err := newHashJoiner(&flowCtx, &c.spec, leftInput, rightInput, &post, out)
+			spec := &HashJoinerSpec{
+				LeftEqColumns:  c.leftEqCols,
+				RightEqColumns: c.rightEqCols,
+				Type:           c.joinType,
+				OnExpr:         c.onExpr,
+			}
+			h, err := newHashJoiner(&flowCtx, 0 /* processorID */, spec, leftInput, rightInput, &post, out)
 			if err != nil {
 				return err
 			}
 			outTypes := h.OutputTypes()
 			setup(h)
-			h.Run(nil)
+			h.Run(context.Background(), nil /* wg */)
 
 			if !out.ProducerClosed {
 				return errors.New("output RowReceiver not closed")
@@ -1224,13 +332,12 @@ func TestHashJoinerDrain(t *testing.T) {
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 	flowCtx := FlowCtx{
-		Ctx:      ctx,
 		Settings: settings,
 		EvalCtx:  evalCtx,
 	}
 
 	post := PostProcessSpec{Projection: true, OutputColumns: outCols}
-	h, err := newHashJoiner(&flowCtx, &spec, leftInput, rightInput, &post, out)
+	h, err := newHashJoiner(&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1240,7 +347,7 @@ func TestHashJoinerDrain(t *testing.T) {
 	h.initialBufferSize = 0
 
 	out.ConsumerDone()
-	h.Run(nil)
+	h.Run(context.Background(), nil /* wg */)
 
 	if !out.ProducerClosed {
 		t.Fatalf("output RowReceiver not closed")
@@ -1348,20 +455,19 @@ func TestHashJoinerDrainAfterBuildPhaseError(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	flowCtx := FlowCtx{
-		Ctx:      context.Background(),
 		Settings: st,
 		EvalCtx:  evalCtx,
 	}
 
 	post := PostProcessSpec{Projection: true, OutputColumns: outCols}
-	h, err := newHashJoiner(&flowCtx, &spec, leftInput, rightInput, &post, out)
+	h, err := newHashJoiner(&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Disable initial buffering. We always store the right stream in this case.
 	h.initialBufferSize = 0
 
-	h.Run(nil)
+	h.Run(context.Background(), nil /* wg */)
 
 	if !out.ProducerClosed {
 		t.Fatalf("output RowReceiver not closed")
@@ -1396,11 +502,28 @@ func BenchmarkHashJoiner(b *testing.B) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := tree.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
+	diskMonitor := mon.MakeMonitor(
+		"test-disk",
+		mon.DiskResource,
+		nil, /* curCount */
+		nil, /* maxHist */
+		-1,  /* increment: use default block size */
+		math.MaxInt64,
+		st,
+	)
+	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	defer diskMonitor.Stop(ctx)
 	flowCtx := &FlowCtx{
-		Ctx:      ctx,
-		Settings: st,
-		EvalCtx:  evalCtx,
+		Settings:    st,
+		EvalCtx:     evalCtx,
+		diskMonitor: &diskMonitor,
 	}
+	tempEngine, err := engine.NewTempEngine(base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tempEngine.Close()
+	flowCtx.TempStorage = tempEngine
 
 	spec := &HashJoinerSpec{
 		LeftEqColumns:  []uint32{0},
@@ -1411,23 +534,36 @@ func BenchmarkHashJoiner(b *testing.B) {
 	post := &PostProcessSpec{}
 
 	const numCols = 1
-	for _, numRows := range []int{0, 1 << 2, 1 << 4, 1 << 8, 1 << 12, 1 << 16} {
-		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
-			rows := makeIntRows(numRows, numCols)
-			leftInput := NewRepeatableRowSource(oneIntCol, rows)
-			rightInput := NewRepeatableRowSource(oneIntCol, rows)
-			b.SetBytes(int64(8 * numRows * numCols))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				// TODO(asubiotto): Get rid of uncleared state between
-				// hashJoiner Run()s to omit instantiation time from benchmarks.
-				h, err := newHashJoiner(flowCtx, spec, leftInput, rightInput, post, &RowDisposer{})
-				if err != nil {
-					b.Fatal(err)
+	for _, spill := range []bool{true, false} {
+		flowCtx.testingKnobs.MemoryLimitBytes = 0
+		if spill {
+			flowCtx.testingKnobs.MemoryLimitBytes = 1
+		}
+		b.Run(fmt.Sprintf("spill=%t", spill), func(b *testing.B) {
+			for _, numRows := range []int{0, 1 << 2, 1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+				if spill && numRows < 1<<8 {
+					// The benchmark takes a long time with a small number of rows and
+					// spilling, since the times change wildly. Disable for now.
+					continue
 				}
-				h.Run(nil)
-				leftInput.Reset()
-				rightInput.Reset()
+				b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
+					rows := makeIntRows(numRows, numCols)
+					leftInput := NewRepeatableRowSource(oneIntCol, rows)
+					rightInput := NewRepeatableRowSource(oneIntCol, rows)
+					b.SetBytes(int64(8 * numRows * numCols * 2))
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						// TODO(asubiotto): Get rid of uncleared state between
+						// hashJoiner Run()s to omit instantiation time from benchmarks.
+						h, err := newHashJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, &RowDisposer{})
+						if err != nil {
+							b.Fatal(err)
+						}
+						h.Run(context.Background(), nil /* wg */)
+						leftInput.Reset()
+						rightInput.Reset()
+					}
+				})
 			}
 		})
 	}

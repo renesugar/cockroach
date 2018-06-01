@@ -18,6 +18,8 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -28,31 +30,16 @@ import (
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
-func (b *Builder) buildJoin(
-	join *tree.JoinTableExpr, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
-	left, leftScope := b.buildTable(join.Left, inScope)
-	right, rightScope := b.buildTable(join.Right, inScope)
+func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope *scope) {
+	leftScope := b.buildTable(join.Left, inScope)
+	rightScope := b.buildTable(join.Right, inScope)
 
 	// Check that the same table name is not used on both sides.
-	leftTables := make(map[tree.TableName]struct{})
+	leftTables := make(map[string]struct{})
 	for _, leftCol := range leftScope.cols {
-		leftTables[leftCol.table] = exists
+		leftTables[leftCol.table.FQString()] = exists
 	}
-
-	for _, rightCol := range rightScope.cols {
-		t := rightCol.table
-		if t.TableName == "" {
-			// Allow joins of sources that define columns with no
-			// associated table name. At worst, the USING/NATURAL
-			// detection code or expression analysis for ON will detect an
-			// ambiguity later.
-			continue
-		}
-		if _, ok := leftTables[t]; ok {
-			panic(errorf("cannot join columns from the same source name %q (missing AS clause)", t.TableName))
-		}
-	}
+	b.validateJoinTableNames(leftTables, rightScope)
 
 	joinType := sqlbase.JoinTypeFromAstString(join.Join)
 
@@ -67,7 +54,7 @@ func (b *Builder) buildJoin(
 			usingColNames = t.Cols
 		}
 
-		return b.buildUsingJoin(joinType, usingColNames, left, right, leftScope, rightScope, inScope)
+		return b.buildUsingJoin(joinType, usingColNames, leftScope, rightScope, inScope)
 
 	case *tree.OnJoinCond, nil:
 		// Append columns added by the children, as they are visible to the filter.
@@ -75,17 +62,43 @@ func (b *Builder) buildJoin(
 		outScope.appendColumns(leftScope)
 		outScope.appendColumns(rightScope)
 
-		var filter opt.GroupID
+		var filter memo.GroupID
 		if on, ok := cond.(*tree.OnJoinCond); ok {
-			filter = b.buildScalar(outScope.resolveType(on.Expr, types.Bool), outScope)
+			filter = b.buildScalar(outScope.resolveAndRequireType(on.Expr, types.Bool, "ON"), outScope)
 		} else {
 			filter = b.factory.ConstructTrue()
 		}
 
-		return b.constructJoin(joinType, left, right, filter), outScope
+		outScope.group = b.constructJoin(joinType, leftScope.group, rightScope.group, filter)
+		return outScope
 
 	default:
 		panic(fmt.Sprintf("unsupported join condition %#v", cond))
+	}
+}
+
+// validateJoinTableNames checks that table names are not repeated between the
+// left and right sides of a join. leftTables contains a pre-built map of the
+// tables from the left side of the join, and rightScope contains the
+// scopeColumns (and corresponding table names) from the right side of the
+// join.
+func (b *Builder) validateJoinTableNames(leftTables map[string]struct{}, rightScope *scope) {
+	for _, rightCol := range rightScope.cols {
+		t := rightCol.table
+		if t.TableName == "" {
+			// Allow joins of sources that define columns with no
+			// associated table name. At worst, the USING/NATURAL
+			// detection code or expression analysis for ON will detect an
+			// ambiguity later.
+			continue
+		}
+		if _, ok := leftTables[t.FQString()]; ok {
+			panic(builderError{pgerror.NewErrorf(
+				pgerror.CodeDuplicateAliasError,
+				"source name %q specified more than once (missing AS clause)",
+				tree.ErrString(&t.TableName),
+			)})
+		}
 	}
 }
 
@@ -117,43 +130,37 @@ func commonColumns(leftScope, rightScope *scope) (common tree.NameList) {
 //
 // joinType    The join type (inner, left, right or outer)
 // names       The list of `USING` column names
-// left        The memo group ID of the left table
-// right       The memo group ID of the right table
 // leftScope   The outScope from the left table
 // rightScope  The outScope from the right table
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildUsingJoin(
-	joinType sqlbase.JoinType,
-	names tree.NameList,
-	left, right opt.GroupID,
-	leftScope, rightScope, inScope *scope,
-) (out opt.GroupID, outScope *scope) {
+	joinType sqlbase.JoinType, names tree.NameList, leftScope, rightScope, inScope *scope,
+) (outScope *scope) {
 	// Build the join predicate.
 	mergedCols, filter, outScope := b.buildUsingJoinPredicate(
 		joinType, leftScope.cols, rightScope.cols, names, inScope,
 	)
 
-	out = b.constructJoin(joinType, left, right, filter)
+	outScope.group = b.constructJoin(joinType, leftScope.group, rightScope.group, filter)
 
 	if len(mergedCols) > 0 {
-		// Wrap in a projection to include the merged columns.
-		projections := make([]opt.GroupID, 0, len(outScope.cols))
-		for _, col := range outScope.cols {
-			if mergedCol, ok := mergedCols[col.index]; ok {
-				projections = append(projections, mergedCol)
+		// Wrap in a projection to include the merged columns and ensure that all
+		// remaining columns are passed through unchanged.
+		for i, col := range outScope.cols {
+			if mergedCol, ok := mergedCols[col.id]; ok {
+				outScope.cols[i].group = mergedCol
 			} else {
-				v := b.factory.ConstructVariable(b.factory.InternPrivate(col.index))
-				projections = append(projections, v)
+				// Mark column as passthrough.
+				outScope.cols[i].group = 0
 			}
 		}
 
-		p := b.constructList(opt.ProjectionsOp, projections, outScope.cols)
-		out = b.factory.ConstructProject(out, p)
+		outScope.group = b.constructProject(outScope.group, outScope.cols)
 	}
 
-	return out, outScope
+	return outScope
 }
 
 // buildUsingJoinPredicate builds a set of memo groups that represent the join
@@ -218,26 +225,28 @@ func (b *Builder) buildUsingJoin(
 //    8: right.y             @6
 //
 // If new merged columns are created (as in the FULL OUTER JOIN example above),
-// the return value mergedCols contains a mapping from the column index to the
-// memo group ID of the IFNULL expression.
+// the return value mergedCols contains a mapping from the column id to the
+// memo group ID of the IFNULL expression. out contains the top-level memo
+// group ID of the join predicate.
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildUsingJoinPredicate(
 	joinType sqlbase.JoinType,
-	leftCols []columnProps,
-	rightCols []columnProps,
+	leftCols []scopeColumn,
+	rightCols []scopeColumn,
 	names tree.NameList,
 	inScope *scope,
-) (mergedCols map[opt.ColumnIndex]opt.GroupID, out opt.GroupID, outScope *scope) {
-	joined := make(map[tree.Name]*columnProps, len(names))
-	conditions := make([]opt.GroupID, 0, len(names))
-	mergedCols = make(map[opt.ColumnIndex]opt.GroupID)
+) (mergedCols map[opt.ColumnID]memo.GroupID, out memo.GroupID, outScope *scope) {
+	joined := make(map[tree.Name]*scopeColumn, len(names))
+	conditions := make([]memo.GroupID, 0, len(names))
+	mergedCols = make(map[opt.ColumnID]memo.GroupID)
 	outScope = inScope.push()
 
-	for _, name := range names {
+	for i, name := range names {
 		if _, ok := joined[name]; ok {
-			panic(errorf("column %q appears more than once in USING clause", name))
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
+				"column %q appears more than once in USING clause", tree.ErrString(&names[i]))})
 		}
 
 		// For every adjacent pair of tables, add an equality predicate.
@@ -247,16 +256,15 @@ func (b *Builder) buildUsingJoinPredicate(
 		if !leftCol.typ.Equivalent(rightCol.typ) {
 			// First, check if the comparison would even be valid.
 			if _, found := tree.FindEqualComparisonFunction(leftCol.typ, rightCol.typ); !found {
-				panic(errorf(
-					"JOIN/USING types %s for left and %s for right cannot be matched for column %s",
-					leftCol.typ, rightCol.typ, leftCol.name,
-				))
+				panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+					"JOIN/USING types %s for left and %s for right cannot be matched for column %q",
+					leftCol.typ, rightCol.typ, tree.ErrString(&leftCol.name))})
 			}
 		}
 
 		// Construct the predicate.
-		leftVar := b.factory.ConstructVariable(b.factory.InternPrivate(leftCol.index))
-		rightVar := b.factory.ConstructVariable(b.factory.InternPrivate(rightCol.index))
+		leftVar := b.factory.ConstructVariable(b.factory.InternColumnID(leftCol.id))
+		rightVar := b.factory.ConstructVariable(b.factory.InternColumnID(rightCol.id))
 		eq := b.factory.ConstructEq(leftVar, rightVar)
 		conditions = append(conditions, eq)
 
@@ -279,9 +287,9 @@ func (b *Builder) buildUsingJoinPredicate(
 				typ = rightCol.typ
 			}
 			texpr := tree.NewTypedCoalesceExpr(tree.TypedExprs{leftCol, rightCol}, typ)
-			col := b.synthesizeColumn(outScope, string(leftCol.name), typ, texpr)
-			merged := b.factory.ConstructCoalesce(b.factory.InternList([]opt.GroupID{leftVar, rightVar}))
-			mergedCols[col.index] = merged
+			merged := b.factory.ConstructCoalesce(b.factory.InternList([]memo.GroupID{leftVar, rightVar}))
+			col := b.synthesizeColumn(outScope, string(leftCol.name), typ, texpr, merged)
+			mergedCols[col.id] = merged
 		}
 
 		joined[name] = &outScope.cols[len(outScope.cols)-1]
@@ -301,7 +309,7 @@ func (b *Builder) buildUsingJoinPredicate(
 // (2) If the column has the same name as one of the columns in `joined` but is
 //     not equal, it is marked as hidden and added to the scope.
 // (3) All other columns are added to the scope without modification.
-func hideMatchingColumns(cols []columnProps, joined map[tree.Name]*columnProps, scope *scope) {
+func hideMatchingColumns(cols []scopeColumn, joined map[tree.Name]*scopeColumn, scope *scope) {
 	for _, col := range cols {
 		if foundCol, ok := joined[col.name]; ok {
 			// Hide other columns with the same name.
@@ -317,7 +325,7 @@ func hideMatchingColumns(cols []columnProps, joined map[tree.Name]*columnProps, 
 // constructFilter builds a set of memo groups that represent the given
 // list of filter conditions. It returns the top-level memo group ID for the
 // filter.
-func (b *Builder) constructFilter(conditions []opt.GroupID) opt.GroupID {
+func (b *Builder) constructFilter(conditions []memo.GroupID) memo.GroupID {
 	switch len(conditions) {
 	case 0:
 		return b.factory.ConstructTrue()
@@ -329,8 +337,10 @@ func (b *Builder) constructFilter(conditions []opt.GroupID) opt.GroupID {
 }
 
 func (b *Builder) constructJoin(
-	joinType sqlbase.JoinType, left, right, filter opt.GroupID,
-) opt.GroupID {
+	joinType sqlbase.JoinType, left, right, filter memo.GroupID,
+) memo.GroupID {
+	// Wrap the ON condition in a FiltersOp.
+	filter = b.factory.ConstructFilters(b.factory.InternList([]memo.GroupID{filter}))
 	switch joinType {
 	case sqlbase.InnerJoin:
 		return b.factory.ConstructInnerJoin(left, right, filter)
@@ -350,7 +360,7 @@ func (b *Builder) constructJoin(
 //
 // context is a string ("left" or "right") used to indicate in the error
 // message whether the name is missing from the left or right side of the join.
-func findUsingColumn(cols []columnProps, name tree.Name, context string) *columnProps {
+func findUsingColumn(cols []scopeColumn, name tree.Name, context string) *scopeColumn {
 	for i := range cols {
 		col := &cols[i]
 		if !col.hidden && col.name == name {
@@ -358,5 +368,6 @@ func findUsingColumn(cols []columnProps, name tree.Name, context string) *column
 		}
 	}
 
-	panic(errorf("column \"%s\" specified in USING clause does not exist in %s table", name, context))
+	panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+		"column \"%s\" specified in USING clause does not exist in %s table", name, context)})
 }

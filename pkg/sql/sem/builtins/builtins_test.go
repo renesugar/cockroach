@@ -59,7 +59,7 @@ func TestGenerateUniqueIDOrder(t *testing.T) {
 	}
 }
 
-func TestStringToArray(t *testing.T) {
+func TestStringToArrayAndBack(t *testing.T) {
 	// s allows us to have a string pointer literal.
 	s := func(x string) *string { return &x }
 	cases := []struct {
@@ -108,7 +108,22 @@ func TestStringToArray(t *testing.T) {
 
 			evalContext := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			if result.Compare(evalContext, expectedArray) != 0 {
-				t.Fatalf("expected %v, got %v", tc.expected, result)
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+
+			s, err := arrayToString(result.(*tree.DArray), tc.sep, tc.nullStr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.sep == nil {
+				if s != tree.DNull {
+					t.Errorf("expected null, found %s", s)
+				}
+				return
+			}
+			fmt.Println(s)
+			if string(*s.(*tree.DString)) != tc.input {
+				t.Errorf("original %s, roundtripped %s", tc.input, s)
 			}
 		})
 	}
@@ -162,6 +177,66 @@ func TestEscapeFormatRandom(t *testing.T) {
 		}
 		if !bytes.Equal(decodedResult, b) {
 			t.Fatalf("generated %#v, after round-tripping got %#v", b, decodedResult)
+		}
+	}
+}
+
+func TestLPadRPad(t *testing.T) {
+	testCases := []struct {
+		padFn    func(*tree.EvalContext, string, int, string) (string, error)
+		str      string
+		length   int
+		fill     string
+		expected string
+	}{
+		{lpad, "abc", 1, "xy", "a"},
+		{lpad, "abc", 2, "xy", "ab"},
+		{lpad, "abc", 3, "xy", "abc"},
+		{lpad, "abc", 5, "xy", "xyabc"},
+		{lpad, "abc", 6, "xy", "xyxabc"},
+		{lpad, "abc", 7, "xy", "xyxyabc"},
+		{lpad, "abc", 1, " ", "a"},
+		{lpad, "abc", 2, " ", "ab"},
+		{lpad, "abc", 3, " ", "abc"},
+		{lpad, "abc", 5, " ", "  abc"},
+		{lpad, "Hello, 世界", 9, " ", "Hello, 世界"},
+		{lpad, "Hello, 世界", 10, " ", " Hello, 世界"},
+		{lpad, "Hello", 8, "世界", "世界世Hello"},
+		{lpad, "foo", -1, "世界", ""},
+		{rpad, "abc", 1, "xy", "a"},
+		{rpad, "abc", 2, "xy", "ab"},
+		{rpad, "abc", 3, "xy", "abc"},
+		{rpad, "abc", 5, "xy", "abcxy"},
+		{rpad, "abc", 6, "xy", "abcxyx"},
+		{rpad, "abc", 7, "xy", "abcxyxy"},
+		{rpad, "abc", 1, " ", "a"},
+		{rpad, "abc", 2, " ", "ab"},
+		{rpad, "abc", 3, " ", "abc"},
+		{rpad, "abc", 5, " ", "abc  "},
+		{rpad, "abc", 5, " ", "abc  "},
+		{rpad, "Hello, 世界", 9, " ", "Hello, 世界"},
+		{rpad, "Hello, 世界", 10, " ", "Hello, 世界 "},
+		{rpad, "Hello", 8, "世界", "Hello世界世"},
+		{rpad, "foo", -1, "世界", ""},
+	}
+	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	for _, tc := range testCases {
+		out, err := tc.padFn(evalCtx, tc.str, tc.length, tc.fill)
+		if err != nil {
+			t.Errorf("Found err %v, expected nil", err)
+		}
+		if out != tc.expected {
+			t.Errorf("expected %s, found %s", tc.expected, out)
+		}
+	}
+}
+
+func TestAllTypesAsJSON(t *testing.T) {
+	for _, typ := range types.AnyNonArray {
+		d := tree.SampleDatum(typ)
+		_, err := AsJSON(d)
+		if err != nil {
+			t.Errorf("couldn't convert %s to JSON: %s", d, err)
 		}
 	}
 }

@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 )
 
-func init() {
+func registerVersion(r *registry) {
 	runVersion := func(ctx context.Context, t *test, c *cluster, version string) {
 		nodes := c.nodes - 1
 		goos := ifLocal(runtime.GOOS, "linux")
@@ -100,14 +100,14 @@ func init() {
 				if err != nil {
 					return err
 				}
-				return c.RunL(ctx, quietL, nodes+1, cmd)
+				return c.RunL(ctx, quietL, c.Node(nodes+1), cmd)
 			})
 		}
 
 		m.Go(func() error {
 			// NB: the number of calls to `sleep` needs to be reflected in `loadDuration`.
 			sleepAndCheck := func() error {
-				t.Status("sleeping")
+				t.WorkerStatus("sleeping")
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -115,7 +115,7 @@ func init() {
 				}
 				// Make sure everyone is still running.
 				for i := 1; i <= nodes; i++ {
-					t.Status("checking ", i)
+					t.WorkerStatus("checking ", i)
 					db := c.Conn(ctx, 1)
 					defer db.Close()
 					rows, err := db.Query(`SHOW DATABASES`)
@@ -139,7 +139,7 @@ func init() {
 
 			stop := func(node int) error {
 				port := fmt.Sprintf("{pgport:%d}", node)
-				if err := c.RunE(ctx, node, "./cockroach quit --insecure --port "+port); err != nil {
+				if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port "+port); err != nil {
 					return err
 				}
 				// NB: we still call Stop to make sure the process is dead when we try
@@ -155,9 +155,14 @@ func init() {
 				return nil
 			}
 
+			var oldVersion string
+			if err := db.QueryRowContext(ctx, `SHOW CLUSTER SETTING version`).Scan(&oldVersion); err != nil {
+				return err
+			}
+
 			// Now perform a rolling restart into the new binary.
-			for i := 1; i <= nodes; i++ {
-				t.Status("upgrading ", i)
+			for i := 1; i < nodes; i++ {
+				t.WorkerStatus("upgrading ", i)
 				if err := stop(i); err != nil {
 					return err
 				}
@@ -168,9 +173,29 @@ func init() {
 				}
 			}
 
+			// Stop the last node.
+			if err := stop(nodes); err != nil {
+				return err
+			}
+
+			// Set cluster.preserve_downgrade_option to be the old cluster version to
+			// prevent upgrade.
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf("SET CLUSTER SETTING cluster.preserve_downgrade_option = '%s';", oldVersion),
+			); err != nil {
+				return err
+			}
+
+			// Do upgrade for the last node.
+			c.Put(ctx, cockroach, "./cockroach", c.Node(nodes))
+			c.Start(ctx, c.Node(nodes))
+			if err := sleepAndCheck(); err != nil {
+				return err
+			}
+
 			// Changed our mind, let's roll that back.
 			for i := 1; i <= nodes; i++ {
-				t.Status("downgrading", i)
+				t.WorkerStatus("downgrading", i)
 				if err := stop(i); err != nil {
 					return err
 				}
@@ -183,7 +208,7 @@ func init() {
 
 			// OK, let's go forward again.
 			for i := 1; i <= nodes; i++ {
-				t.Status("upgrading", i, "(again)")
+				t.WorkerStatus("upgrading", i, "(again)")
 				if err := stop(i); err != nil {
 					return err
 				}
@@ -194,9 +219,10 @@ func init() {
 				}
 			}
 
-			// Finally, bump the cluster version (completing the upgrade).
-			t.Status("bumping cluster version")
-			if _, err := db.ExecContext(ctx, `SET CLUSTER SETTING version = crdb_internal.node_executable_version()`); err != nil {
+			// Reset cluster.preserve_downgrade_option to allow auto upgrade.
+			if _, err := db.ExecContext(ctx,
+				"RESET CLUSTER SETTING cluster.preserve_downgrade_option;",
+			); err != nil {
 				return err
 			}
 
@@ -207,11 +233,13 @@ func init() {
 		}
 	}
 
-	const version = "v1.1.5"
+	const version = "v2.0.0"
 	for _, n := range []int{3, 5} {
-		tests.Add(testSpec{
-			Name:  fmt.Sprintf("version/mixedWith=%s/nodes=%d", version, n),
-			Nodes: nodes(n + 1),
+		r.Add(testSpec{
+			Name:       fmt.Sprintf("version/mixedWith=%s/nodes=%d", version, n),
+			MinVersion: "v2.1.0",
+			Nodes:      nodes(n + 1),
+			Stable:     true, // DO NOT COPY to new tests
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runVersion(ctx, t, c, version)
 			},

@@ -1,4 +1,4 @@
-# LogicTest: default
+# LogicTest: default opt
 
 statement ok
 CREATE DATABASE "foo-bar"
@@ -6,7 +6,9 @@ CREATE DATABASE "foo-bar"
 query T
 SHOW DATABASES
 ----
+defaultdb
 foo-bar
+postgres
 system
 test
 
@@ -22,11 +24,13 @@ DROP DATABASE "foo-bar" CASCADE
 query TTT
 SELECT name, database_name, state FROM crdb_internal.tables WHERE name = 't'
 ----
-t  [51]  DROP
+t  [53]  DROP
 
 query T
 SHOW DATABASES
 ----
+defaultdb
+postgres
 system
 test
 
@@ -36,7 +40,9 @@ CREATE DATABASE "foo bar"
 query T
 SHOW DATABASES
 ----
+defaultdb
 foo bar
+postgres
 system
 test
 
@@ -46,6 +52,8 @@ DROP DATABASE "foo bar" CASCADE
 query T
 SHOW DATABASES
 ----
+defaultdb
+postgres
 system
 test
 
@@ -130,6 +138,8 @@ SHOW DATABASES
 ----
 d1
 d2
+defaultdb
+postgres
 system
 test
 
@@ -140,6 +150,8 @@ query T
 SHOW DATABASES
 ----
 d2
+defaultdb
+postgres
 system
 test
 
@@ -165,6 +177,8 @@ DROP DATABASE d2 CASCADE
 query T
 SHOW DATABASES
 ----
+defaultdb
+postgres
 system
 test
 
@@ -196,6 +210,8 @@ DROP DATABASE constraint_db CASCADE
 query T
 SHOW DATABASES
 ----
+defaultdb
+postgres
 system
 test
 
@@ -210,8 +226,18 @@ CREATE DATABASE foo; CREATE TABLE foo.bar(x INT);
 statement ok
 SET sql_safe_updates = TRUE;
 
+statement error DROP DATABASE on current database
+DROP DATABASE test
+
 statement error DROP DATABASE on non-empty database without explicit CASCADE
 DROP DATABASE foo
 
 statement ok
 SET sql_safe_updates = FALSE; DROP DATABASE foo
+
+# Check that the default databases can be dropped and re-created like any other.
+statement OK
+DROP DATABASE defaultdb; DROP DATABASE postgres
+
+statement ok
+CREATE DATABASE defaultdb; CREATE DATABASE postgres

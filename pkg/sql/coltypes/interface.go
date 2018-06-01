@@ -24,6 +24,12 @@ import (
 // ColTypeFormatter knows how to format a ColType to a bytes.Buffer.
 type ColTypeFormatter interface {
 	fmt.Stringer
+
+	// Format returns a non-lossy string representation of the coltype.
+	// NOTE: It is important that two coltypes that should be different print out
+	//       different string representations. The optimizer relies on unique
+	//       string representations in order to intern the coltypes during
+	//       memoization.
 	Format(buf *bytes.Buffer, flags lex.EncodeFlags)
 }
 
@@ -53,6 +59,7 @@ func (*TFloat) columnType()          {}
 func (*TDecimal) columnType()        {}
 func (*TDate) columnType()           {}
 func (*TTime) columnType()           {}
+func (*TTimeTZ) columnType()         {}
 func (*TTimestamp) columnType()      {}
 func (*TTimestampTZ) columnType()    {}
 func (*TInterval) columnType()       {}
@@ -65,6 +72,7 @@ func (*TBytes) columnType()          {}
 func (*TCollatedString) columnType() {}
 func (*TArray) columnType()          {}
 func (*TVector) columnType()         {}
+func (TTuple) columnType()           {}
 func (*TOid) columnType()            {}
 
 // All Ts also implement CastTargetType.
@@ -74,6 +82,7 @@ func (*TFloat) castTargetType()          {}
 func (*TDecimal) castTargetType()        {}
 func (*TDate) castTargetType()           {}
 func (*TTime) castTargetType()           {}
+func (*TTimeTZ) castTargetType()         {}
 func (*TTimestamp) castTargetType()      {}
 func (*TTimestampTZ) castTargetType()    {}
 func (*TInterval) castTargetType()       {}
@@ -86,6 +95,7 @@ func (*TBytes) castTargetType()          {}
 func (*TCollatedString) castTargetType() {}
 func (*TArray) castTargetType()          {}
 func (*TVector) castTargetType()         {}
+func (TTuple) castTargetType()           {}
 func (*TOid) castTargetType()            {}
 
 func (node *TBool) String() string           { return ColTypeAsString(node) }
@@ -94,6 +104,7 @@ func (node *TFloat) String() string          { return ColTypeAsString(node) }
 func (node *TDecimal) String() string        { return ColTypeAsString(node) }
 func (node *TDate) String() string           { return ColTypeAsString(node) }
 func (node *TTime) String() string           { return ColTypeAsString(node) }
+func (node *TTimeTZ) String() string         { return ColTypeAsString(node) }
 func (node *TTimestamp) String() string      { return ColTypeAsString(node) }
 func (node *TTimestampTZ) String() string    { return ColTypeAsString(node) }
 func (node *TInterval) String() string       { return ColTypeAsString(node) }
@@ -106,4 +117,5 @@ func (node *TBytes) String() string          { return ColTypeAsString(node) }
 func (node *TCollatedString) String() string { return ColTypeAsString(node) }
 func (node *TArray) String() string          { return ColTypeAsString(node) }
 func (node *TVector) String() string         { return ColTypeAsString(node) }
+func (node TTuple) String() string           { return ColTypeAsString(node) }
 func (node *TOid) String() string            { return ColTypeAsString(node) }

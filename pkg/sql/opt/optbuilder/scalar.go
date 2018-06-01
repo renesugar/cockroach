@@ -17,122 +17,192 @@ package optbuilder
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
-type unaryFactoryFunc func(f opt.Factory, input opt.GroupID) opt.GroupID
-type binaryFactoryFunc func(f opt.Factory, left, right opt.GroupID) opt.GroupID
+type unaryFactoryFunc func(f *norm.Factory, input memo.GroupID) memo.GroupID
+type binaryFactoryFunc func(f *norm.Factory, left, right memo.GroupID) memo.GroupID
 
 // Map from tree.ComparisonOperator to Factory constructor function.
 var comparisonOpMap = [tree.NumComparisonOperators]binaryFactoryFunc{
-	tree.EQ:                (opt.Factory).ConstructEq,
-	tree.LT:                (opt.Factory).ConstructLt,
-	tree.GT:                (opt.Factory).ConstructGt,
-	tree.LE:                (opt.Factory).ConstructLe,
-	tree.GE:                (opt.Factory).ConstructGe,
-	tree.NE:                (opt.Factory).ConstructNe,
-	tree.In:                (opt.Factory).ConstructIn,
-	tree.NotIn:             (opt.Factory).ConstructNotIn,
-	tree.Like:              (opt.Factory).ConstructLike,
-	tree.NotLike:           (opt.Factory).ConstructNotLike,
-	tree.ILike:             (opt.Factory).ConstructILike,
-	tree.NotILike:          (opt.Factory).ConstructNotILike,
-	tree.SimilarTo:         (opt.Factory).ConstructSimilarTo,
-	tree.NotSimilarTo:      (opt.Factory).ConstructNotSimilarTo,
-	tree.RegMatch:          (opt.Factory).ConstructRegMatch,
-	tree.NotRegMatch:       (opt.Factory).ConstructNotRegMatch,
-	tree.RegIMatch:         (opt.Factory).ConstructRegIMatch,
-	tree.NotRegIMatch:      (opt.Factory).ConstructNotRegIMatch,
-	tree.IsDistinctFrom:    (opt.Factory).ConstructIsNot,
-	tree.IsNotDistinctFrom: (opt.Factory).ConstructIs,
-	tree.Contains:          (opt.Factory).ConstructContains,
-	tree.ContainedBy: func(f opt.Factory, left, right opt.GroupID) opt.GroupID {
+	tree.EQ:                (*norm.Factory).ConstructEq,
+	tree.LT:                (*norm.Factory).ConstructLt,
+	tree.GT:                (*norm.Factory).ConstructGt,
+	tree.LE:                (*norm.Factory).ConstructLe,
+	tree.GE:                (*norm.Factory).ConstructGe,
+	tree.NE:                (*norm.Factory).ConstructNe,
+	tree.In:                (*norm.Factory).ConstructIn,
+	tree.NotIn:             (*norm.Factory).ConstructNotIn,
+	tree.Like:              (*norm.Factory).ConstructLike,
+	tree.NotLike:           (*norm.Factory).ConstructNotLike,
+	tree.ILike:             (*norm.Factory).ConstructILike,
+	tree.NotILike:          (*norm.Factory).ConstructNotILike,
+	tree.SimilarTo:         (*norm.Factory).ConstructSimilarTo,
+	tree.NotSimilarTo:      (*norm.Factory).ConstructNotSimilarTo,
+	tree.RegMatch:          (*norm.Factory).ConstructRegMatch,
+	tree.NotRegMatch:       (*norm.Factory).ConstructNotRegMatch,
+	tree.RegIMatch:         (*norm.Factory).ConstructRegIMatch,
+	tree.NotRegIMatch:      (*norm.Factory).ConstructNotRegIMatch,
+	tree.IsDistinctFrom:    (*norm.Factory).ConstructIsNot,
+	tree.IsNotDistinctFrom: (*norm.Factory).ConstructIs,
+	tree.Contains:          (*norm.Factory).ConstructContains,
+	tree.ContainedBy: func(f *norm.Factory, left, right memo.GroupID) memo.GroupID {
 		// This is just syntatic sugar that reverses the operands.
 		return f.ConstructContains(right, left)
 	},
+	tree.JSONExists:     (*norm.Factory).ConstructJsonExists,
+	tree.JSONAllExists:  (*norm.Factory).ConstructJsonAllExists,
+	tree.JSONSomeExists: (*norm.Factory).ConstructJsonSomeExists,
 }
 
 // Map from tree.BinaryOperator to Factory constructor function.
 var binaryOpMap = [tree.NumBinaryOperators]binaryFactoryFunc{
-	tree.Bitand:   (opt.Factory).ConstructBitand,
-	tree.Bitor:    (opt.Factory).ConstructBitor,
-	tree.Bitxor:   (opt.Factory).ConstructBitxor,
-	tree.Plus:     (opt.Factory).ConstructPlus,
-	tree.Minus:    (opt.Factory).ConstructMinus,
-	tree.Mult:     (opt.Factory).ConstructMult,
-	tree.Div:      (opt.Factory).ConstructDiv,
-	tree.FloorDiv: (opt.Factory).ConstructFloorDiv,
-	tree.Mod:      (opt.Factory).ConstructMod,
-	tree.Pow:      (opt.Factory).ConstructPow,
-	tree.Concat:   (opt.Factory).ConstructConcat,
-	tree.LShift:   (opt.Factory).ConstructLShift,
-	tree.RShift:   (opt.Factory).ConstructRShift,
+	tree.Bitand:            (*norm.Factory).ConstructBitand,
+	tree.Bitor:             (*norm.Factory).ConstructBitor,
+	tree.Bitxor:            (*norm.Factory).ConstructBitxor,
+	tree.Plus:              (*norm.Factory).ConstructPlus,
+	tree.Minus:             (*norm.Factory).ConstructMinus,
+	tree.Mult:              (*norm.Factory).ConstructMult,
+	tree.Div:               (*norm.Factory).ConstructDiv,
+	tree.FloorDiv:          (*norm.Factory).ConstructFloorDiv,
+	tree.Mod:               (*norm.Factory).ConstructMod,
+	tree.Pow:               (*norm.Factory).ConstructPow,
+	tree.Concat:            (*norm.Factory).ConstructConcat,
+	tree.LShift:            (*norm.Factory).ConstructLShift,
+	tree.RShift:            (*norm.Factory).ConstructRShift,
+	tree.JSONFetchText:     (*norm.Factory).ConstructFetchText,
+	tree.JSONFetchVal:      (*norm.Factory).ConstructFetchVal,
+	tree.JSONFetchValPath:  (*norm.Factory).ConstructFetchValPath,
+	tree.JSONFetchTextPath: (*norm.Factory).ConstructFetchTextPath,
 }
 
 // Map from tree.UnaryOperator to Factory constructor function.
 var unaryOpMap = [tree.NumUnaryOperators]unaryFactoryFunc{
-	tree.UnaryMinus:      (opt.Factory).ConstructUnaryMinus,
-	tree.UnaryComplement: (opt.Factory).ConstructUnaryComplement,
+	tree.UnaryMinus:      (*norm.Factory).ConstructUnaryMinus,
+	tree.UnaryComplement: (*norm.Factory).ConstructUnaryComplement,
 }
 
 // buildScalar builds a set of memo groups that represent the given scalar
 // expression.
 //
-// See Builder.buildStmt for a description of the remaining input and
-// return values.
-func (b *Builder) buildScalar(scalar tree.TypedExpr, inScope *scope) (out opt.GroupID) {
+// See Builder.buildStmt for a description of the remaining input and return
+// values.
+func (b *Builder) buildScalar(scalar tree.TypedExpr, inScope *scope) (out memo.GroupID) {
+	return b.buildScalarHelper(scalar, "", inScope, nil)
+}
+
+// buildScalarHelper builds a set of memo groups that represent the given scalar
+// expression. If outScope is not nil, then this is a projection context, and
+// the resulting memo group will be projected as an output column. Otherwise,
+// the memo group is part of a larger expression that is not bound to a column.
+//
+// See Builder.buildStmt for a description of the remaining input and return
+// values.
+func (b *Builder) buildScalarHelper(
+	scalar tree.TypedExpr, label string, inScope, outScope *scope,
+) (out memo.GroupID) {
+	// If we are in a grouping context and this expression corresponds to a
+	// GROUP BY expression, return a reference to the GROUP BY column.
 	inGroupingContext := inScope.inGroupingContext() && !inScope.groupby.inAgg
-	varsUsedIn := len(inScope.groupby.varsUsed)
-	switch t := scalar.(type) {
-	case *columnProps:
-		if inGroupingContext && !inScope.groupby.aggInScope.hasColumn(t.index) {
-			inScope.groupby.varsUsed = append(inScope.groupby.varsUsed, t.index)
+	if inGroupingContext {
+		// TODO(rytaft): This currently regenerates a string for each subexpression.
+		// Change this to generate the string once for the top-level expression and
+		// check the relevant slice for this subexpression.
+		if col, ok := inScope.groupby.groupStrs[symbolicExprStr(scalar)]; ok {
+			// We pass aggOutScope as the input scope because it contains all of
+			// the aggregates and grouping columns that are available for projection.
+			// finishBuildScalarRef wraps projected columns in a variable expression
+			// with a new column ID if they are not contained in the input scope, so
+			// passing in aggOutScope ensures we don't create new column IDs when not
+			// necessary.
+			return b.finishBuildScalarRef(col, label, inScope.groupby.aggOutScope, outScope)
 		}
-		return b.factory.ConstructVariable(b.factory.InternPrivate(t.index))
+	}
+
+	switch t := scalar.(type) {
+	case *scopeColumn:
+		if inGroupingContext {
+			// Non-grouping column was referenced. Note that a column that is part
+			// of a larger grouping expression would have been detected by the
+			// groupStrs checking code above.
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeGroupingError,
+				"column \"%s\" must appear in the GROUP BY clause or be used in an aggregate function",
+				tree.ErrString(&t.name),
+			)})
+		}
+		return b.finishBuildScalarRef(t, label, inScope, outScope)
 
 	case *tree.AndExpr:
-		left := b.buildScalar(t.TypedLeft(), inScope)
-		right := b.buildScalar(t.TypedRight(), inScope)
-		conditions := b.factory.InternList([]opt.GroupID{left, right})
+		left := b.buildScalarHelper(t.TypedLeft(), "", inScope, nil)
+		right := b.buildScalarHelper(t.TypedRight(), "", inScope, nil)
+		conditions := b.factory.InternList([]memo.GroupID{left, right})
 		out = b.factory.ConstructAnd(conditions)
 
-	case *tree.BinaryExpr:
-		fn := binaryOpMap[t.Operator]
-		if fn != nil {
-			out = fn(b.factory,
-				b.buildScalar(t.TypedLeft(), inScope),
-				b.buildScalar(t.TypedRight(), inScope),
-			)
-		} else if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(b.factory.InternPrivate(scalar))
-		} else {
-			panic(errorf("not yet implemented: operator %s", t.Operator.String()))
+	case *tree.Array:
+		els := make([]memo.GroupID, len(t.Exprs))
+		arrayType := t.ResolvedType()
+		elementType := arrayType.(types.TArray).Typ
+		if !types.IsValidArrayElementType(elementType) {
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+				"arrays of %s not allowed", elementType)})
 		}
+		for i := range t.Exprs {
+			texpr := inScope.resolveType(t.Exprs[i], elementType)
+			els[i] = b.buildScalarHelper(texpr, "", inScope, nil)
+		}
+		elements := b.factory.InternList(els)
+		out = b.factory.ConstructArray(elements, b.factory.InternType(arrayType))
+
+	case *tree.BinaryExpr:
+		// It's possible for an overload to be selected that expects different
+		// types than the TypedExpr arguments return:
+		//
+		//   ARRAY[1, 2] || NULL
+		//
+		// This is a tricky case, because the type checker selects []int as the
+		// type of the right argument, but then types it as unknown. This causes
+		// issues for the execbuilder, which doesn't have enough information to
+		// select the right overload. The solution is to wrap any mismatched
+		// arguments with a CastExpr that preserves the static type.
+		fn := binaryOpMap[t.Operator]
+		left, _ := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
+		right, _ := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
+		out = fn(b.factory,
+			b.buildScalarHelper(left, "", inScope, nil),
+			b.buildScalarHelper(right, "", inScope, nil),
+		)
 
 	case *tree.CaseExpr:
 		var condType types.T
-		var input opt.GroupID
+		var input memo.GroupID
 		if t.Expr != nil {
 			condType = types.Any
-			input = b.buildScalar(inScope.resolveType(t.Expr, types.Any), inScope)
+			texpr := inScope.resolveType(t.Expr, types.Any)
+			input = b.buildScalarHelper(texpr, "", inScope, nil)
 		} else {
 			condType = types.Bool
 			input = b.factory.ConstructTrue()
 		}
 
-		whens := make([]opt.GroupID, 0, len(t.Whens)+1)
+		whens := make([]memo.GroupID, 0, len(t.Whens)+1)
 		for i := range t.Whens {
-			cond := b.buildScalar(inScope.resolveType(t.Whens[i].Cond, condType), inScope)
-			val := b.buildScalar(inScope.resolveType(t.Whens[i].Val, types.Any), inScope)
+			texpr := inScope.resolveType(t.Whens[i].Cond, condType)
+			cond := b.buildScalarHelper(texpr, "", inScope, nil)
+			texpr = inScope.resolveType(t.Whens[i].Val, types.Any)
+			val := b.buildScalarHelper(texpr, "", inScope, nil)
 			whens = append(whens, b.factory.ConstructWhen(cond, val))
 		}
 		// Add the ELSE expression to the end of whens as a raw scalar expression.
 		if t.Else != nil {
-			elseExpr := b.buildScalar(inScope.resolveType(t.Else, types.Any), inScope)
+			texpr := inScope.resolveType(t.Else, types.Any)
+			elseExpr := b.buildScalarHelper(texpr, "", inScope, nil)
 			whens = append(whens, elseExpr)
 		} else {
 			whens = append(whens, b.buildDatum(tree.DNull))
@@ -140,66 +210,69 @@ func (b *Builder) buildScalar(scalar tree.TypedExpr, inScope *scope) (out opt.Gr
 		out = b.factory.ConstructCase(input, b.factory.InternList(whens))
 
 	case *tree.CastExpr:
-		arg := b.buildScalar(inScope.resolveType(t.Expr, types.Any), inScope)
-		typ := coltypes.CastTargetToDatumType(t.Type)
-		out = b.factory.ConstructCast(arg, b.factory.InternPrivate(typ))
+		texpr := inScope.resolveType(t.Expr, types.Any)
+		arg := b.buildScalarHelper(texpr, "", inScope, nil)
+		out = b.factory.ConstructCast(arg, b.factory.InternColType(t.Type.(coltypes.T)))
 
 	case *tree.CoalesceExpr:
-		args := make([]opt.GroupID, len(t.Exprs))
+		args := make([]memo.GroupID, len(t.Exprs))
 		for i := range args {
-			args[i] = b.buildScalar(t.TypedExprAt(i), inScope)
+			args[i] = b.buildScalarHelper(t.TypedExprAt(i), "", inScope, nil)
 		}
 		out = b.factory.ConstructCoalesce(b.factory.InternList(args))
 
 	case *tree.ComparisonExpr:
-		left := b.buildScalar(t.TypedLeft(), inScope)
-		right := b.buildScalar(t.TypedRight(), inScope)
-
-		// TODO(andyk): handle t.SubOperator. Do this by mapping Any, Some,
-		// and All to various formulations of the opt Exists operator. For now,
-		// avoid an 'unused' linter complaint.
-		_ = tree.NewTypedComparisonExprWithSubOp
-
-		fn := comparisonOpMap[t.Operator]
-		if fn != nil {
-			// Most comparison ops map directly to a factory method.
-			out = fn(b.factory, left, right)
-		} else if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(b.factory.InternPrivate(scalar))
+		if sub, ok := t.Right.(*subquery); ok && sub.multiRow {
+			out, _ = b.buildMultiRowSubquery(t, inScope)
 		} else {
-			// TODO(rytaft): remove this check when we are confident that
-			// all operators are included in comparisonOpMap.
-			panic(errorf("not yet implemented: operator %s", t.Operator.String()))
+			left := b.buildScalarHelper(t.TypedLeft(), "", inScope, nil)
+			right := b.buildScalarHelper(t.TypedRight(), "", inScope, nil)
+
+			// TODO(andyk): handle t.SubOperator. Do this by mapping Any, Some,
+			// and All to various formulations of the opt Exists operator.
+
+			fn := comparisonOpMap[t.Operator]
+			if fn != nil {
+				// Most comparison ops map directly to a factory method.
+				out = fn(b.factory, left, right)
+			} else if b.AllowUnsupportedExpr {
+				out = b.factory.ConstructUnsupportedExpr(b.factory.InternTypedExpr(scalar))
+			} else {
+				// TODO(rytaft): remove this check when we are confident that
+				// all operators are included in comparisonOpMap.
+				panic(unimplementedf("unsupported comparison operator: %s", t.Operator))
+			}
 		}
 
 	case *tree.DTuple:
-		list := make([]opt.GroupID, len(t.D))
+		list := make([]memo.GroupID, len(t.D))
 		for i := range t.D {
-			list[i] = b.buildScalar(t.D[i], inScope)
+			list[i] = b.buildScalarHelper(t.D[i], "", inScope, nil)
 		}
 		out = b.factory.ConstructTuple(b.factory.InternList(list))
 
 	case *tree.FuncExpr:
-		out, _ = b.buildFunction(t, "", inScope)
+		return b.buildFunction(t, label, inScope, outScope)
 
 	case *tree.IndexedVar:
 		if t.Idx < 0 || t.Idx >= len(inScope.cols) {
-			panic(errorf("invalid column ordinal @%d", t.Idx))
+			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+				"invalid column ordinal: @%d", t.Idx+1)})
 		}
-		out = b.factory.ConstructVariable(b.factory.InternPrivate(inScope.cols[t.Idx].index))
-		// TODO(rytaft): Do we need to update varsUsed here?
+		out = b.factory.ConstructVariable(b.factory.InternColumnID(inScope.cols[t.Idx].id))
 
 	case *tree.NotExpr:
-		out = b.factory.ConstructNot(b.buildScalar(t.TypedInnerExpr(), inScope))
+		out = b.factory.ConstructNot(b.buildScalarHelper(t.TypedInnerExpr(), "", inScope, nil))
 
 	case *tree.OrExpr:
-		left := b.buildScalar(t.TypedLeft(), inScope)
-		right := b.buildScalar(t.TypedRight(), inScope)
-		conditions := b.factory.InternList([]opt.GroupID{left, right})
+		left := b.buildScalarHelper(t.TypedLeft(), "", inScope, nil)
+		right := b.buildScalarHelper(t.TypedRight(), "", inScope, nil)
+		conditions := b.factory.InternList([]memo.GroupID{left, right})
 		out = b.factory.ConstructOr(conditions)
 
 	case *tree.ParenExpr:
-		out = b.buildScalar(t.TypedInnerExpr(), inScope)
+		// Treat ParenExpr as if it wasn't present.
+		return b.buildScalarHelper(t.TypedInnerExpr(), label, inScope, outScope)
 
 	case *tree.Placeholder:
 		if b.evalCtx.HasPlaceholders() {
@@ -210,25 +283,27 @@ func (b *Builder) buildScalar(scalar tree.TypedExpr, inScope *scope) (out opt.Gr
 			}
 			out = b.buildDatum(d)
 		} else {
-			out = b.factory.ConstructPlaceholder(b.factory.InternPrivate(t))
-			// TODO(rytaft): Do we need to update varsUsed here?
+			out = b.factory.ConstructPlaceholder(b.factory.InternTypedExpr(t))
 		}
 
 	case *tree.RangeCond:
-		input := b.buildScalar(t.TypedLeft(), inScope)
-		from := b.buildScalar(t.TypedFrom(), inScope)
-		to := b.buildScalar(t.TypedTo(), inScope)
+		input := b.buildScalarHelper(t.TypedLeft(), "", inScope, nil)
+		from := b.buildScalarHelper(t.TypedFrom(), "", inScope, nil)
+		to := b.buildScalarHelper(t.TypedTo(), "", inScope, nil)
 		out = b.buildRangeCond(t.Not, t.Symmetric, input, from, to)
 
+	case *subquery:
+		out, _ = b.buildSingleRowSubquery(t, inScope)
+
 	case *tree.Tuple:
-		list := make([]opt.GroupID, len(t.Exprs))
+		list := make([]memo.GroupID, len(t.Exprs))
 		for i := range t.Exprs {
-			list[i] = b.buildScalar(t.Exprs[i].(tree.TypedExpr), inScope)
+			list[i] = b.buildScalarHelper(t.Exprs[i].(tree.TypedExpr), "", inScope, nil)
 		}
 		out = b.factory.ConstructTuple(b.factory.InternList(list))
 
 	case *tree.UnaryExpr:
-		out = b.buildScalar(t.TypedInnerExpr(), inScope)
+		out = b.buildScalarHelper(t.TypedInnerExpr(), "", inScope, nil)
 
 		// Discard do-nothing unary plus operator.
 		if t.Operator != tree.UnaryPlus {
@@ -243,30 +318,19 @@ func (b *Builder) buildScalar(scalar tree.TypedExpr, inScope *scope) (out opt.Gr
 
 	default:
 		if b.AllowUnsupportedExpr {
-			out = b.factory.ConstructUnsupportedExpr(b.factory.InternPrivate(scalar))
+			out = b.factory.ConstructUnsupportedExpr(b.factory.InternTypedExpr(scalar))
 		} else {
-			panic(errorf("not yet implemented: scalar expr: %T", scalar))
+			panic(unimplementedf("not yet implemented: scalar expression: %T", scalar))
 		}
 	}
 
-	// If we are in a grouping context and this expression corresponds to
-	// a GROUP BY expression, truncate varsUsed.
-	if inGroupingContext {
-		// TODO(rytaft): This currently regenerates a string for each subexpression.
-		// Change this to generate the string once for the top-level expression and
-		// check the relevant slice for this subexpression.
-		if _, ok := inScope.groupby.groupStrs[symbolicExprStr(scalar)]; ok {
-			inScope.groupby.varsUsed = inScope.groupby.varsUsed[:varsUsedIn]
-		}
-	}
-
-	return out
+	return b.finishBuildScalar(scalar, out, label, inScope, outScope)
 }
 
 // buildDatum maps certain datums to separate operators, for easier matching.
-func (b *Builder) buildDatum(d tree.Datum) opt.GroupID {
+func (b *Builder) buildDatum(d tree.Datum) memo.GroupID {
 	if d == tree.DNull {
-		return b.factory.ConstructNull(b.factory.InternPrivate(types.Unknown))
+		return b.factory.ConstructNull(b.factory.InternType(types.Unknown))
 	}
 	if boolVal, ok := d.(*tree.DBool); ok {
 		// Map True/False datums to True/False operator.
@@ -275,7 +339,7 @@ func (b *Builder) buildDatum(d tree.Datum) opt.GroupID {
 		}
 		return b.factory.ConstructFalse()
 	}
-	return b.factory.ConstructConst(b.factory.InternPrivate(d))
+	return b.factory.ConstructConst(b.factory.InternDatum(d))
 }
 
 // buildFunction builds a set of memo groups that represent a function
@@ -290,28 +354,42 @@ func (b *Builder) buildDatum(d tree.Datum) opt.GroupID {
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildFunction(
-	f *tree.FuncExpr, label string, inScope *scope,
-) (out opt.GroupID, col *columnProps) {
+	f *tree.FuncExpr, label string, inScope, outScope *scope,
+) (out memo.GroupID) {
+	if f.WindowDef != nil {
+		if inScope.groupby.inAgg {
+			panic(builderError{sqlbase.NewWindowInAggError()})
+		}
+		panic(unimplementedf("window functions are not supported"))
+	}
+
 	def, err := f.Func.Resolve(b.semaCtx.SearchPath)
 	if err != nil {
 		panic(builderError{err})
 	}
 
-	funcDef := opt.FuncOpDef{Name: def.Name, Type: f.ResolvedType(), Overload: f.ResolvedBuiltin()}
+	funcDef := memo.FuncOpDef{Name: def.Name, Type: f.ResolvedType(), Overload: f.ResolvedBuiltin()}
 
 	if isAggregate(def) {
-		return b.buildAggregateFunction(f, funcDef, label, inScope)
+		return b.buildAggregateFunction(f, funcDef, label, inScope, outScope)
 	}
 
-	argList := make([]opt.GroupID, len(f.Exprs))
+	// TODO(andyk): Re-enable impure functions once we can properly handle them.
+	if funcDef.Overload.Impure && !b.AllowImpureFuncs {
+		panic(unimplementedf("impure functions are not supported"))
+	}
+
+	argList := make([]memo.GroupID, len(f.Exprs))
 	for i, pexpr := range f.Exprs {
 		argList[i] = b.buildScalar(pexpr.(tree.TypedExpr), inScope)
 	}
 
 	// Construct a private FuncOpDef that refers to a resolved function overload.
-	return b.factory.ConstructFunction(
-		b.factory.InternList(argList), b.factory.InternPrivate(funcDef),
-	), nil
+	out = b.factory.ConstructFunction(
+		b.factory.InternList(argList), b.factory.InternFuncOpDef(&funcDef),
+	)
+
+	return b.finishBuildScalar(f, out, label, inScope, outScope)
 }
 
 // buildRangeCond builds a RANGE clause as a simpler expression. Examples:
@@ -324,11 +402,11 @@ func (b *Builder) buildFunction(
 // push down the negation).
 // TODO(radu): this doesn't work when the expressions have side-effects.
 func (b *Builder) buildRangeCond(
-	not bool, symmetric bool, input, from, to opt.GroupID,
-) opt.GroupID {
+	not bool, symmetric bool, input, from, to memo.GroupID,
+) memo.GroupID {
 	// Build "input >= from AND input <= to".
 	out := b.factory.ConstructAnd(
-		b.factory.InternList([]opt.GroupID{
+		b.factory.InternList([]memo.GroupID{
 			b.factory.ConstructGe(input, from),
 			b.factory.ConstructLe(input, to),
 		}),
@@ -338,13 +416,13 @@ func (b *Builder) buildRangeCond(
 		// Build "(input >= from AND input <= to) OR (input >= to AND input <= from)".
 		lhs := out
 		rhs := b.factory.ConstructAnd(
-			b.factory.InternList([]opt.GroupID{
+			b.factory.InternList([]memo.GroupID{
 				b.factory.ConstructGe(input, to),
 				b.factory.ConstructLe(input, from),
 			}),
 		)
 		out = b.factory.ConstructOr(
-			b.factory.InternList([]opt.GroupID{lhs, rhs}),
+			b.factory.InternList([]memo.GroupID{lhs, rhs}),
 		)
 	}
 
@@ -366,36 +444,43 @@ type ScalarBuilder struct {
 	scope scope
 }
 
-// NewScalar creates a new ScalarBuilder. The provided columns are accessible
+// NewScalar creates a new ScalarBuilder. The columns in the metadata are accessible
 // from scalar expressions via IndexedVars.
-// columnNames and columnTypes must have the same length.
 func NewScalar(
-	ctx context.Context,
-	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
-	factory opt.Factory,
-	columnNames []string,
-	columnTypes []types.T,
+	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, factory *norm.Factory,
 ) *ScalarBuilder {
+	md := factory.Metadata()
 	sb := &ScalarBuilder{
 		Builder: Builder{
 			factory: factory,
-			colMap:  make([]columnProps, 1),
+			colMap:  make([]scopeColumn, 1, 1+md.NumColumns()),
 			ctx:     ctx,
 			semaCtx: semaCtx,
 			evalCtx: evalCtx,
 		},
 	}
 	sb.scope.builder = &sb.Builder
-	for i := range columnNames {
-		sb.synthesizeColumn(&sb.scope, columnNames[i], columnTypes[i], nil)
+
+	// Put all the columns in the current scope.
+	sb.scope.cols = make([]scopeColumn, 0, md.NumColumns())
+	for colID := opt.ColumnID(1); int(colID) <= md.NumColumns(); colID++ {
+		name := tree.Name(md.ColumnLabel(colID))
+		col := scopeColumn{
+			origName: name,
+			name:     name,
+			typ:      md.ColumnType(colID),
+			id:       colID,
+		}
+		sb.colMap = append(sb.colMap, col)
+		sb.scope.cols = append(sb.scope.cols, col)
 	}
+
 	return sb
 }
 
 // Build a memo structure from a TypedExpr: the root group represents a scalar
 // expression equivalent to expr.
-func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (root opt.GroupID, err error) {
+func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (root memo.GroupID, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate builder errors without adding

@@ -241,7 +241,8 @@ func (s *orderedSynchronizer) advanceRoot() error {
 			return err
 		} else if cmp > 0 {
 			return errors.Errorf(
-				"incorrectly ordered stream %s after %s", src.row.String(s.types), oldRow.String(s.types),
+				"incorrectly ordered stream %s after %s (ordering: %v)",
+				src.row.String(s.types), oldRow.String(s.types), s.ordering,
 			)
 		}
 	}
@@ -257,6 +258,14 @@ func (s *orderedSynchronizer) drainSources() {
 			log.Fatalf(context.TODO(), "unexpected draining error: %s", err)
 		}
 	}
+}
+
+// Start is part of the RowSource interface.
+func (s *orderedSynchronizer) Start(ctx context.Context) context.Context {
+	for _, src := range s.sources {
+		src.src.Start(ctx)
+	}
+	return ctx
 }
 
 // Next is part of the RowSource interface.

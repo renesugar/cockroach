@@ -75,6 +75,9 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   }
 
   mouseMove = (e: any) => {
+    // TODO(couchand): handle the following cases:
+    //   - first series is missing data points
+    //   - series are missing data points at different timestamps
     const datapoints = this.props.data.results[0].datapoints;
     const timeScale = this.chart.xAxis.scale();
 
@@ -111,7 +114,7 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
       result = moment(new Date(series[index]));
     }
 
-    if (!this.props.hoverState) {
+    if (!this.props.hoverState || !result) {
       return;
     }
 
@@ -178,10 +181,10 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   }
 
   render() {
-    const { title, subtitle, tooltip, data, hoverOn} = this.props;
+    const { title, subtitle, tooltip, data } = this.props;
 
     let hoverProps: Partial<React.SVGProps<SVGSVGElement>> = {};
-    if (hoverOn) {
+    if (this.props.hoverOn) {
       hoverProps = {
         onMouseMove: this.mouseMove,
         onMouseLeave: this.mouseLeave,

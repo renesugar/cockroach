@@ -68,9 +68,8 @@ const (
 	TempDirPrefix = "cockroach-temp"
 	// TempDirsRecordFilename is the filename for the record file
 	// that keeps track of the paths of the temporary directories created.
-	TempDirsRecordFilename                = "temp-dirs-record.txt"
-	defaultEventLogEnabled                = true
-	defaultEnableWebSessionAuthentication = false
+	TempDirsRecordFilename = "temp-dirs-record.txt"
+	defaultEventLogEnabled = true
 
 	maximumMaxClockOffset = 5 * time.Second
 
@@ -78,6 +77,8 @@ const (
 	recommendedNetworkFileDescriptors = 5000
 
 	defaultConnResultsBufferBytes = 16 << 10 // 16 KiB
+
+	defaultSQLTableStatCacheSize = 256
 )
 
 var productionSettingsWebpage = fmt.Sprintf(
@@ -168,6 +169,10 @@ type Config struct {
 	// SQLAuditLogDirName is the target directory name for SQL audit logs.
 	SQLAuditLogDirName *log.DirName
 
+	// SQLTableStatCacheSize is the size (number of tables) of the table
+	// statistics cache.
+	SQLTableStatCacheSize int
+
 	// Parsed values.
 
 	// NodeAttributes is the parsed representation of Attrs.
@@ -235,13 +240,6 @@ type Config struct {
 	// EnableWebSessionAuthentication enables session-based authentication for
 	// the Admin API's HTTP endpoints.
 	EnableWebSessionAuthentication bool
-
-	// UseLegacyConnHandling, if set, makes the Server use the old code for
-	// handling pgwire connections.
-	//
-	// TODO(andrei): remove this once the code for the old v3Conn and Executor is
-	// deleted.
-	UseLegacyConnHandling bool
 
 	// ConnResultsBufferBytes is the size of the buffer in which each connection
 	// accumulates results set. Results are flushed to the network when this
@@ -370,21 +368,24 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 		panic(err)
 	}
 
+	requireWebLogin := envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_REQUIRE_WEB_LOGIN", false)
+
 	cfg := Config{
 		Config:                         new(base.Config),
 		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
 		Settings:                       st,
 		CacheSize:                      DefaultCacheSize,
 		SQLMemoryPoolSize:              defaultSQLMemoryPoolSize,
+		SQLTableStatCacheSize:          defaultSQLTableStatCacheSize,
 		ScanInterval:                   defaultScanInterval,
 		ScanMaxIdleTime:                defaultScanMaxIdleTime,
 		EventLogEnabled:                defaultEventLogEnabled,
-		EnableWebSessionAuthentication: defaultEnableWebSessionAuthentication,
+		EnableWebSessionAuthentication: requireWebLogin,
 		Stores: base.StoreSpecList{
 			Specs: []base.StoreSpec{storeSpec},
 		},
 		TempStorageConfig: base.TempStorageConfigFromEnv(
-			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes),
+			ctx, st, storeSpec, "" /* parentDir */, base.DefaultTempStorageMaxSizeBytes, 0),
 		ConnResultsBufferBytes: defaultConnResultsBufferBytes,
 	}
 	cfg.AmbientCtx.Tracer = st.Tracer
@@ -484,33 +485,33 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		cfg.TestingKnobs.Store.(*storage.StoreTestingKnobs).SkipMinSizeCheck
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
-		var sizeInBytes = spec.SizeInBytes
+		var sizeInBytes = spec.Size.InBytes
 		if spec.InMemory {
-			if spec.SizePercent > 0 {
+			if spec.Size.Percent > 0 {
 				sysMem, err := GetTotalMemory(ctx)
 				if err != nil {
 					return Engines{}, errors.Errorf("could not retrieve system memory")
 				}
-				sizeInBytes = int64(float64(sysMem) * spec.SizePercent / 100)
+				sizeInBytes = int64(float64(sysMem) * spec.Size.Percent / 100)
 			}
 			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of memory is only %s bytes, which is below the minimum requirement of %s",
-					spec.SizePercent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
+					spec.Size.Percent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 			details = append(details, fmt.Sprintf("store %d: in-memory, size %s",
 				i, humanizeutil.IBytes(sizeInBytes)))
 			engines = append(engines, engine.NewInMem(spec.Attributes, sizeInBytes))
 		} else {
-			if spec.SizePercent > 0 {
+			if spec.Size.Percent > 0 {
 				fileSystemUsage := gosigar.FileSystemUsage{}
 				if err := fileSystemUsage.Get(spec.Path); err != nil {
 					return Engines{}, err
 				}
-				sizeInBytes = int64(float64(fileSystemUsage.Total) * spec.SizePercent / 100)
+				sizeInBytes = int64(float64(fileSystemUsage.Total) * spec.Size.Percent / 100)
 			}
 			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of %s's total free space is only %s bytes, which is below the minimum requirement of %s",
-					spec.SizePercent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
+					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
 
 			details = append(details, fmt.Sprintf("store %d: RocksDB, max size %s, max open file limit %d",
@@ -522,7 +523,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				MaxOpenFiles:            openFileLimitPerStore,
 				WarnLargeBatchThreshold: 500 * time.Millisecond,
 				Settings:                cfg.Settings,
-				UseSwitchingEnv:         spec.UseSwitchingEnv,
+				UseFileRegistry:         spec.UseFileRegistry,
 				RocksDBOptions:          spec.RocksDBOptions,
 				ExtraOptions:            spec.ExtraOptions,
 			}
@@ -605,8 +606,6 @@ func (cfg *Config) readEnvironmentVariables() {
 	cfg.Linearizable = envutil.EnvOrDefaultBool("COCKROACH_EXPERIMENTAL_LINEARIZABLE", cfg.Linearizable)
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
-	cfg.UseLegacyConnHandling = envutil.EnvOrDefaultBool(
-		"COCKROACH_USE_LEGACY_CONN_HANDLING", false)
 }
 
 // parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.

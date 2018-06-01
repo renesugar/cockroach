@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -124,6 +125,51 @@ func (e TagsExpr) Contains(tag string) bool {
 		}
 	}
 	return false
+}
+
+// WithTag returns the subset of defines in the set that have the given tag.
+func (e DefineSetExpr) WithTag(tag string) DefineSetExpr {
+	var defines DefineSetExpr
+	for _, define := range e {
+		if define.Tags.Contains(tag) {
+			defines = append(defines, define)
+		}
+	}
+	return defines
+}
+
+// WithoutTag returns the subset of defines in the set that do not have the
+// given tag.
+func (e DefineSetExpr) WithoutTag(tag string) DefineSetExpr {
+	var defines DefineSetExpr
+	for _, define := range e {
+		if !define.Tags.Contains(tag) {
+			defines = append(defines, define)
+		}
+	}
+	return defines
+}
+
+// WithTag returns the subset of rules in the set that have the given tag.
+func (e RuleSetExpr) WithTag(tag string) RuleSetExpr {
+	var rules RuleSetExpr
+	for _, rule := range e {
+		if rule.Tags.Contains(tag) {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+// Sort sorts the rules in the set, given a less function, while keeping the
+// original order of equal elements. A rule that is "less than" another rule is
+// stored stored earlier in the set.
+//
+// Note that the rule set is updated in place to reflect the sorted order.
+func (e RuleSetExpr) Sort(less func(left, right *RuleExpr) bool) {
+	sort.SliceStable(e, func(i, j int) bool {
+		return less(e[i], e[j])
+	})
 }
 
 // visitChildren is a helper function called by the Visit function on AST

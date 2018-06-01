@@ -25,35 +25,39 @@ values
 build
 VALUES (1), (2, 3)
 ----
-error: VALUES lists must all be the same length, expected 1 columns, found 2
+error (42601): VALUES lists must all be the same length, expected 1 columns, found 2
 
 build
-VALUES (1), (1), (2), (3) ORDER BY 1 DESC
+VALUES (1), (1), (2), (3) ORDER BY 1 DESC LIMIT 3
 ----
-sort
+limit
  ├── columns: column1:1(int)
  ├── ordering: -1
- └── values
-      ├── columns: column1:1(int)
-      ├── tuple [type=tuple{int}]
-      │    └── const: 1 [type=int]
-      ├── tuple [type=tuple{int}]
-      │    └── const: 1 [type=int]
-      ├── tuple [type=tuple{int}]
-      │    └── const: 2 [type=int]
-      └── tuple [type=tuple{int}]
-           └── const: 3 [type=int]
+ ├── sort
+ │    ├── columns: column1:1(int)
+ │    ├── ordering: -1
+ │    └── values
+ │         ├── columns: column1:1(int)
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 1 [type=int]
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 1 [type=int]
+ │         ├── tuple [type=tuple{int}]
+ │         │    └── const: 2 [type=int]
+ │         └── tuple [type=tuple{int}]
+ │              └── const: 3 [type=int]
+ └── const: 3 [type=int]
 
 # TODO(rytaft): Error message should be `pgcode 42703 column "z" does not exist`
 build
 VALUES (1), (1), (2), (3) ORDER BY z
 ----
-error: column name "z" not found
+error (42703): column "z" does not exist
 
 build
 VALUES ('this', 'is', 'a', 'test'), (1, 2, 3, 4)
 ----
-error: VALUES list type mismatch, int for string
+error (42804): VALUES types int and string cannot be matched
 
 build
 VALUES ('one', 1, 1.0), ('two', 2, 2.0)
@@ -125,13 +129,13 @@ values
 build
 VALUES (NULL, 1), (2, NULL), (NULL, 'a')
 ----
-error: VALUES list type mismatch, string for int
+error (42804): VALUES types string and int cannot be matched
 
 build
 SELECT COALESCE(a, b) FROM (VALUES (1, 2), (3, NULL), (NULL, 4), (NULL, NULL)) AS v(a, b)
 ----
 project
- ├── columns: column3:3(int)
+ ├── columns: "COALESCE(a, b)":3(int)
  ├── values
  │    ├── columns: column1:1(int) column2:2(int)
  │    ├── tuple [type=tuple{int, int}]
@@ -146,19 +150,52 @@ project
  │    └── tuple [type=tuple{unknown, unknown}]
  │         ├── null [type=unknown]
  │         └── null [type=unknown]
- └── projections [outer=(1,2)]
-      └── coalesce [type=int, outer=(1,2)]
-           ├── variable: column1 [type=int, outer=(1)]
-           └── variable: column2 [type=int, outer=(2)]
+ └── projections
+      └── coalesce [type=int]
+           ├── variable: column1 [type=int]
+           └── variable: column2 [type=int]
 
+# subqueries can be evaluated in VALUES
+build
+VALUES ((SELECT 1)), ((SELECT 2))
+----
+values
+ ├── columns: column1:3(int)
+ ├── tuple [type=tuple{int}]
+ │    └── subquery [type=int]
+ │         └── max1-row
+ │              ├── columns: "1":1(int!null)
+ │              └── project
+ │                   ├── columns: "1":1(int!null)
+ │                   ├── values
+ │                   │    └── tuple [type=tuple{}]
+ │                   └── projections
+ │                        └── const: 1 [type=int]
+ └── tuple [type=tuple{int}]
+      └── subquery [type=int]
+           └── max1-row
+                ├── columns: "2":2(int!null)
+                └── project
+                     ├── columns: "2":2(int!null)
+                     ├── values
+                     │    └── tuple [type=tuple{}]
+                     └── projections
+                          └── const: 2 [type=int]
 
-# TODO(rytaft): uncomment these tests once subqueries are supported
-## subqueries can be evaluated in VALUES
-#build
-#VALUES ((SELECT 1)), ((SELECT 2))
-#----
-#
-## the subquery's plan must be visible in EXPLAIN
-#build
-#VALUES (1), ((SELECT 2))
-#----
+build
+VALUES (1), ((SELECT 2))
+----
+values
+ ├── columns: column1:2(int)
+ ├── tuple [type=tuple{int}]
+ │    └── const: 1 [type=int]
+ └── tuple [type=tuple{int}]
+      └── subquery [type=int]
+           └── max1-row
+                ├── columns: "2":1(int!null)
+                └── project
+                     ├── columns: "2":1(int!null)
+                     ├── values
+                     │    └── tuple [type=tuple{}]
+                     └── projections
+                          └── const: 2 [type=int]

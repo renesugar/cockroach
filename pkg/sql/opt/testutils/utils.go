@@ -15,6 +15,7 @@
 package testutils
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
@@ -59,25 +60,16 @@ func ParseScalarExpr(sql string, ivc tree.IndexedVarContainer) (tree.TypedExpr, 
 	return expr.TypeCheck(&sema, types.Any)
 }
 
-// ExecuteTestDDL parses the given DDL SQL statement and creates objects in the
-// test catalog. This is used to test without spinning up a cluster.
-func ExecuteTestDDL(tb testing.TB, sql string, catalog *TestCatalog) string {
-	stmt, err := parser.ParseOne(sql)
+// GetTestFiles returns the set of test files that matches the Glob pattern.
+func GetTestFiles(tb testing.TB, testdataGlob string) []string {
+	paths, err := filepath.Glob(testdataGlob)
 	if err != nil {
-		tb.Fatalf("%v", err)
+		tb.Fatal(err)
 	}
-
-	if stmt.StatementType() != tree.DDL {
-		tb.Fatalf("statement type is not DDL: %v", stmt.StatementType())
+	if len(paths) == 0 {
+		tb.Fatalf("no testfiles found matching: %s", testdataGlob)
 	}
-
-	switch stmt := stmt.(type) {
-	case *tree.CreateTable:
-		tbl := catalog.CreateTable(stmt)
-		return tbl.String()
-
-	default:
-		tb.Fatalf("expected CREATE TABLE statement but found: %v", stmt)
-		return ""
-	}
+	return paths
 }
+
+var _ = GetTestFiles

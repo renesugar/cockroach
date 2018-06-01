@@ -28,12 +28,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/errgroup"
 )
 
 // Generator represents one or more sql query loads and associated initial data.
@@ -52,6 +54,9 @@ type FlagMeta struct {
 	// RuntimeOnly may be set to true only if the corresponding flag has no
 	// impact on the behavior of any Tables in this workload.
 	RuntimeOnly bool
+	// CheckConsistencyOnly is expected to be true only if the corresponding
+	// flag only has an effect on the CheckConsistency hook.
+	CheckConsistencyOnly bool
 }
 
 // Flags is a container for flags and associated metadata.
@@ -95,6 +100,13 @@ type Hooks struct {
 	// loaded. It called after restoring a fixture. This, for example, is where
 	// creating foreign keys should go.
 	PostLoad func(*gosql.DB) error
+	// PostRun is called after workload run has ended, with the start time of the
+	// run. This is where any post-run special printing or validation can be done.
+	PostRun func(time.Time) error
+	// CheckConsistency is called to run generator-specific consistency checks.
+	// These are expected to pass after the initial data load as well as after
+	// running queryload.
+	CheckConsistency func(context.Context, *gosql.DB) error
 }
 
 // Meta is used to register a Generator at init time and holds meta information
@@ -120,18 +132,40 @@ type Table struct {
 	// Schema is the SQL formatted schema for this table, with the `CREATE TABLE
 	// <name>` prefix omitted.
 	Schema string
-	// InitialRowCount is the initial number of rows that will be present in the
-	// table after setup is completed.
-	InitialRowCount int
-	// InitialRowFn is a function to deterministically compute the datums in a
-	// row of the table's initial data given its index.
-	InitialRowFn func(int) []interface{}
-	// SplitCount is the initial number of splits that will be present in the
-	// table after setup is completed.
-	SplitCount int
-	// SplitFn is a function to deterministically compute the datums in a tuple
-	// of the table's initial splits given its index.
-	SplitFn func(int) []interface{}
+	// InitialRows is the initial rows that will be present in the table after
+	// setup is completed.
+	InitialRows BatchedTuples
+	// Splits is the initial splits that will be present in the table after
+	// setup is completed.
+	Splits BatchedTuples
+}
+
+// BatchedTuples is a generic generator of tuples (SQL rows, PKs to split at,
+// etc). Tuples are generated in batches of arbitrary size. Each batch has an
+// index in `[0,NumBatches)` and a batch can be generated given only its index.
+type BatchedTuples struct {
+	// NumBatches is the number of batches of tuples.
+	NumBatches int
+	// NumTotal is the total number of tuples in all batches. Not all generators
+	// will know this, it's set to 0 when unknown.
+	NumTotal int
+	// Batch is a function to deterministically compute a batch of tuples given
+	// its index.
+	Batch func(int) [][]interface{}
+}
+
+// Tuples returns a BatchedTuples where each batch has size 1.
+func Tuples(count int, fn func(int) []interface{}) BatchedTuples {
+	t := BatchedTuples{
+		NumBatches: count,
+		NumTotal:   count,
+	}
+	if fn != nil {
+		t.Batch = func(batchIdx int) [][]interface{} {
+			return [][]interface{}{fn(batchIdx)}
+		}
+	}
+	return t
 }
 
 // QueryLoad represents some SQL query workload performable on a database
@@ -139,7 +173,7 @@ type Table struct {
 type QueryLoad struct {
 	SQLDatabase string
 
-	// WorkerFns one function per worker. It is to be called once per unit of
+	// WorkerFns is one function per worker. It is to be called once per unit of
 	// work to be done.
 	WorkerFns []func(context.Context) error
 
@@ -204,6 +238,8 @@ func ApproxDatumSize(x interface{}) int64 {
 		return int64(bits.Len64(math.Float64bits(t))+8) / 8
 	case string:
 		return int64(len(t))
+	case []byte:
+		return int64(len(t))
 	case time.Time:
 		return 12
 	default:
@@ -218,11 +254,15 @@ func ApproxDatumSize(x interface{}) int64 {
 // The size of the loaded data is returned in bytes, suitable for use with
 // SetBytes of benchmarks. The exact definition of this is deferred to the
 // ApproxDatumSize implementation.
-func Setup(db *gosql.DB, gen Generator, batchSize int) (int64, error) {
+func Setup(
+	ctx context.Context, db *gosql.DB, gen Generator, batchSize, concurrency int,
+) (int64, error) {
 	if batchSize <= 0 {
 		batchSize = 1000
 	}
-	var insertStmtBuf bytes.Buffer
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
 	tables := gen.Tables()
 	var hooks Hooks
@@ -230,10 +270,9 @@ func Setup(db *gosql.DB, gen Generator, batchSize int) (int64, error) {
 		hooks = h.Hooks()
 	}
 
-	var size int64
 	for _, table := range tables {
 		createStmt := fmt.Sprintf(`CREATE TABLE "%s" %s`, table.Name, table.Schema)
-		if _, err := db.Exec(createStmt); err != nil {
+		if _, err := db.ExecContext(ctx, createStmt); err != nil {
 			return 0, errors.Wrapf(err, "could not create table: %s", table.Name)
 		}
 	}
@@ -244,35 +283,69 @@ func Setup(db *gosql.DB, gen Generator, batchSize int) (int64, error) {
 		}
 	}
 
+	var size int64
 	for _, table := range tables {
-		for rowIdx := 0; rowIdx < table.InitialRowCount; {
-			insertStmtBuf.Reset()
-			fmt.Fprintf(&insertStmtBuf, `INSERT INTO "%s" VALUES `, table.Name)
-
-			var params []interface{}
-			for batchIdx := 0; batchIdx < batchSize && rowIdx < table.InitialRowCount; batchIdx++ {
-				if batchIdx != 0 {
-					insertStmtBuf.WriteString(`,`)
-				}
-				insertStmtBuf.WriteString(`(`)
-				row := table.InitialRowFn(rowIdx)
-				for i, datum := range row {
-					size += ApproxDatumSize(datum)
-					if i != 0 {
-						insertStmtBuf.WriteString(`,`)
+		if table.InitialRows.NumBatches == 0 {
+			continue
+		} else if table.InitialRows.Batch == nil {
+			return 0, errors.Errorf(
+				`initial data is not supported for workload %s`, gen.Meta().Name)
+		}
+		batchesPerWorker := table.InitialRows.NumBatches / concurrency
+		g, gCtx := errgroup.WithContext(ctx)
+		for i := 0; i < concurrency; i++ {
+			startIdx := i * batchesPerWorker
+			endIdx := startIdx + batchesPerWorker
+			if i == concurrency-1 {
+				// Account for any rounding error in batchesPerWorker.
+				endIdx = table.InitialRows.NumBatches
+			}
+			g.Go(func() error {
+				var insertStmtBuf bytes.Buffer
+				var params []interface{}
+				var numRows int
+				flush := func() error {
+					if len(params) > 0 {
+						insertStmt := insertStmtBuf.String()
+						if _, err := db.ExecContext(gCtx, insertStmt, params...); err != nil {
+							return errors.Wrapf(err, "failed insert into %s", table.Name)
+						}
 					}
-					fmt.Fprintf(&insertStmtBuf, `$%d`, len(params)+i+1)
+					insertStmtBuf.Reset()
+					fmt.Fprintf(&insertStmtBuf, `INSERT INTO "%s" VALUES `, table.Name)
+					params = params[:0]
+					numRows = 0
+					return nil
 				}
-				params = append(params, row...)
-				insertStmtBuf.WriteString(`)`)
-				rowIdx++
-			}
-			if len(params) > 0 {
-				insertStmt := insertStmtBuf.String()
-				if _, err := db.Exec(insertStmt, params...); err != nil {
-					return 0, errors.Wrapf(err, "failed insert into %s", table.Name)
+				_ = flush()
+
+				for rowBatchIdx := startIdx; rowBatchIdx < endIdx; rowBatchIdx++ {
+					for _, row := range table.InitialRows.Batch(rowBatchIdx) {
+						if len(params) != 0 {
+							insertStmtBuf.WriteString(`,`)
+						}
+						insertStmtBuf.WriteString(`(`)
+						for i, datum := range row {
+							atomic.AddInt64(&size, ApproxDatumSize(datum))
+							if i != 0 {
+								insertStmtBuf.WriteString(`,`)
+							}
+							fmt.Fprintf(&insertStmtBuf, `$%d`, len(params)+i+1)
+						}
+						params = append(params, row...)
+						insertStmtBuf.WriteString(`)`)
+						if numRows++; numRows >= batchSize {
+							if err := flush(); err != nil {
+								return err
+							}
+						}
+					}
 				}
-			}
+				return flush()
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return 0, err
 		}
 	}
 
@@ -287,12 +360,12 @@ func Setup(db *gosql.DB, gen Generator, batchSize int) (int64, error) {
 
 // Split creates the range splits defined by the given table.
 func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) error {
-	if table.SplitCount <= 0 {
+	if table.Splits.NumBatches <= 0 {
 		return nil
 	}
-	splitPoints := make([][]interface{}, table.SplitCount)
-	for splitIdx := 0; splitIdx < table.SplitCount; splitIdx++ {
-		splitPoints[splitIdx] = table.SplitFn(splitIdx)
+	splitPoints := make([][]interface{}, 0, table.Splits.NumBatches)
+	for splitIdx := 0; splitIdx < table.Splits.NumBatches; splitIdx++ {
+		splitPoints = append(splitPoints, table.Splits.Batch(splitIdx)...)
 	}
 	sort.Sort(sliceSliceInterface(splitPoints))
 
@@ -301,7 +374,8 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 	}
 	splitCh := make(chan pair, concurrency)
 	splitCh <- pair{0, len(splitPoints)}
-	doneCh := make(chan error)
+	doneCh := make(chan struct{})
+	errCh := make(chan error)
 
 	log.Infof(ctx, `starting %d splits`, len(splitPoints))
 	var wg sync.WaitGroup
@@ -312,9 +386,11 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 		go func() {
 			defer wg.Done()
 			for {
-				p, ok := <-splitCh
-				if !ok {
-					break
+				var p pair
+				select {
+				case p = <-splitCh:
+				case <-doneCh:
+					return
 				}
 				m := (p.lo + p.hi) / 2
 				split := strings.Join(StringTuple(splitPoints[m]), `,`)
@@ -322,7 +398,7 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 				buf.Reset()
 				fmt.Fprintf(&buf, `ALTER TABLE %s SPLIT AT VALUES (%s)`, table.Name, split)
 				if _, err := db.Exec(buf.String()); err != nil {
-					doneCh <- errors.Wrap(err, buf.String())
+					errCh <- errors.Wrap(err, buf.String())
 					return
 				}
 
@@ -336,7 +412,7 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 					log.Warningf(ctx, `%s: %s`, buf.String(), err)
 				}
 
-				doneCh <- nil
+				errCh <- nil
 				go func() {
 					if p.lo < m {
 						splitCh <- pair{p.lo, m}
@@ -350,11 +426,11 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 	}
 
 	defer func() {
-		close(splitCh)
+		close(doneCh)
 		wg.Wait()
 	}()
 	for finished := 1; finished <= len(splitPoints); finished++ {
-		if err := <-doneCh; err != nil {
+		if err := <-errCh; err != nil {
 			return err
 		}
 		if finished%1000 == 0 {
@@ -378,6 +454,8 @@ func StringTuple(datums []interface{}) []string {
 		switch x := datum.(type) {
 		case int:
 			s[i] = strconv.Itoa(x)
+		case uint64:
+			s[i] = strconv.FormatUint(x, 10)
 		case string:
 			s[i] = lex.EscapeSQLString(x)
 		case float64:
@@ -404,9 +482,16 @@ func (s sliceSliceInterface) Less(i, j int) bool {
 		var cmp int
 		switch x := s[i][offset].(type) {
 		case int:
-			if x < s[j][offset].(int) {
+			if y := s[j][offset].(int); x < y {
 				return true
-			} else if x > s[j][offset].(int) {
+			} else if x > y {
+				return false
+			}
+			continue
+		case uint64:
+			if y := s[j][offset].(uint64); x < y {
+				return true
+			} else if x > y {
 				return false
 			}
 			continue
